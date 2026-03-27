@@ -1,19 +1,18 @@
-export interface ASTNode {
-    type: string;
-}
+export type {
+    ASTNode, SimpleCommand, Pipeline, AndOr, List,
+    Subshell, BraceGroup, Redirection, Word, WordSegment,
+    LiteralSegment, SingleQuotedSegment, DoubleQuotedSegment,
+    VariableExpansion, CommandSubstitution, ArithmeticExpansion, GlobSegment,
+} from "./ast.js";
 
-export interface SimpleCommand extends ASTNode {
-    type: "SimpleCommand";
-    words: string[];
-}
+export { Lexer, TokenType, LexerError } from "./lexer.js";
+export type { Token } from "./lexer.js";
 
-export interface Pipeline extends ASTNode {
-    type: "Pipeline";
-    commands: ASTNode[];
-}
+export { Parser, ParseError } from "./parser.js";
 
-export function parse(input: string): ASTNode {
-    // TODO: recursive descent parser for POSIX shell grammar
-    const words = input.split(/\s+/).filter(Boolean);
-    return { type: "SimpleCommand", words } as SimpleCommand;
+import { Parser } from "./parser.js";
+import type { ASTNode } from "./ast.js";
+
+export function parse(input: string): ASTNode | null {
+    return new Parser(input).parse();
 }
