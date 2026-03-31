@@ -1,5 +1,8 @@
 import { createRequire } from "node:module";
-import type { ASTNode, SimpleCommand, Pipeline, AndOr, List } from "../parser/index.js";
+import type {
+    ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup,
+    IfClause, WhileClause, ForClause, FunctionDef,
+} from "../parser/index.js";
 import { expandWord } from "../expander/index.js";
 import { $ } from "../variables/index.js";
 
@@ -15,6 +18,9 @@ export interface ExecResult {
     exitCode: number;
 }
 
+// Shell function registry — populated by FunctionDef nodes at runtime.
+const shellFunctions = new Map<string, ASTNode>();
+
 export async function execute(node: ASTNode): Promise<ExecResult> {
     const result = await executeNode(node);
     $["?"] = result.exitCode;
@@ -23,14 +29,15 @@ export async function execute(node: ASTNode): Promise<ExecResult> {
 
 async function executeNode(node: ASTNode): Promise<ExecResult> {
     switch (node.type) {
-        case "SimpleCommand":
-            return executeSimple(node as SimpleCommand);
-        case "Pipeline":
-            return executePipeline(node as Pipeline);
-        case "AndOr":
-            return executeAndOr(node as AndOr);
-        case "List":
-            return executeList(node as List);
+        case "SimpleCommand":  return executeSimple(node as SimpleCommand);
+        case "Pipeline":       return executePipeline(node as Pipeline);
+        case "AndOr":          return executeAndOr(node as AndOr);
+        case "List":           return executeList(node as List);
+        case "BraceGroup":     return executeNode((node as BraceGroup).body);
+        case "IfClause":       return executeIf(node as IfClause);
+        case "WhileClause":    return executeWhile(node as WhileClause);
+        case "ForClause":      return executeFor(node as ForClause);
+        case "FunctionDef":    return executeFunctionDef(node as FunctionDef);
         default:
             process.stderr.write(`jsh: unimplemented: ${node.type}\n`);
             return { exitCode: 1 };
@@ -59,6 +66,12 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     const words = cmd.words.map(expandWord);
     const [command, ...args] = words as [string, ...string[]];
     const redirs = buildRedirs(cmd);
+
+    // Shell functions take priority over builtins and external commands.
+    const func = shellFunctions.get(command);
+    if (func) {
+        return executeNode(func);
+    }
 
     // Only run builtins in-process when there are no redirections.
     // With redirections, fall through to the external binary so the OS
@@ -117,6 +130,42 @@ async function executeList(node: List): Promise<ExecResult> {
         }
     }
     return last;
+}
+
+async function executeIf(node: IfClause): Promise<ExecResult> {
+    const cond = await executeNode(node.condition);
+    if (cond.exitCode === 0) {
+        return executeNode(node.consequent);
+    } else if (node.elseClause) {
+        return executeNode(node.elseClause);
+    }
+    return { exitCode: 0 };
+}
+
+async function executeWhile(node: WhileClause): Promise<ExecResult> {
+    let last: ExecResult = { exitCode: 0 };
+    while (true) {
+        const cond = await executeNode(node.condition);
+        const condMet = node.until ? cond.exitCode !== 0 : cond.exitCode === 0;
+        if (!condMet) break;
+        last = await executeNode(node.body);
+    }
+    return last;
+}
+
+async function executeFor(node: ForClause): Promise<ExecResult> {
+    const items = node.items?.map(w => expandWord(w)) ?? [];
+    let last: ExecResult = { exitCode: 0 };
+    for (const item of items) {
+        $[node.name] = item;
+        last = await executeNode(node.body);
+    }
+    return last;
+}
+
+function executeFunctionDef(node: FunctionDef): ExecResult {
+    shellFunctions.set(node.name, node.body);
+    return { exitCode: 0 };
 }
 
 function runBuiltin(name: string, args: string[]): ExecResult | null {

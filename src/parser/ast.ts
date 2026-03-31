@@ -101,3 +101,30 @@ export interface BraceGroup extends ASTNode {
     body: ASTNode;
     redirections: Redirection[];
 }
+
+export interface IfClause extends ASTNode {
+    type: "IfClause";
+    condition: ASTNode;
+    consequent: ASTNode;
+    elseClause: ASTNode | null; // another IfClause for elif, or a list for else
+}
+
+export interface WhileClause extends ASTNode {
+    type: "WhileClause";
+    condition: ASTNode;
+    body: ASTNode;
+    until: boolean;
+}
+
+export interface ForClause extends ASTNode {
+    type: "ForClause";
+    name: string;
+    items: Word[] | null; // null = iterate over positional params
+    body: ASTNode;
+}
+
+export interface FunctionDef extends ASTNode {
+    type: "FunctionDef";
+    name: string;
+    body: ASTNode;
+}

@@ -772,6 +772,10 @@ export class Lexer {
         return this.tokens[this.tokenIndex] ?? { type: TokenType.EOF, value: "" };
     }
 
+    peekAt(offset: number): Token {
+        return this.tokens[this.tokenIndex + offset] ?? { type: TokenType.EOF, value: "" };
+    }
+
     next(): Token {
         const token = this.tokens[this.tokenIndex] ?? { type: TokenType.EOF, value: "" };
         if (this.tokenIndex < this.tokens.length) {
