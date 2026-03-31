@@ -444,7 +444,7 @@ export class Lexer {
         }
 
         // $VAR simple variable
-        if (this.isNameStart(ch) || ch === "?" || ch === "$" || ch === "!" || ch === "#" || ch === "-" || ch === "@" || ch === "*" || ch === "0") {
+        if (this.isNameStart(ch) || ch === "?" || ch === "$" || ch === "!" || ch === "#" || ch === "-" || ch === "@" || ch === "*" || (ch >= "0" && ch <= "9")) {
             // Special single-char variables
             if (ch === "?" || ch === "$" || ch === "!" || ch === "#" || ch === "-" || ch === "@" || ch === "*") {
                 this.pos++;

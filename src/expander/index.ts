@@ -3,6 +3,7 @@ import type {
     LiteralSegment, SingleQuotedSegment, DoubleQuotedSegment,
 } from "../parser/index.js";
 import { $ } from "../variables/index.js";
+import { getParam, getAllParams, getParamCount } from "../variables/positional.js";
 import * as os from "node:os";
 
 export function expandWord(word: Word): string {
@@ -45,10 +46,18 @@ function expandSegment(seg: WordSegment): string {
 }
 
 function expandVariable(seg: VariableExpansion): string {
-    // Special single-char variables
+    // Positional parameters
+    if (/^\d+$/.test(seg.name)) {
+        const n = parseInt(seg.name, 10);
+        if (n === 0) return "jsh";
+        return getParam(n) ?? "";
+    }
+
+    // Special variables
     if (seg.name === "$") return String(process.pid);
     if (seg.name === "?") return String($["?"] ?? 0);
-    if (seg.name === "#") return "0"; // no positional params in interactive use
+    if (seg.name === "#") return String(getParamCount());
+    if (seg.name === "@" || seg.name === "*") return getAllParams().join(" ");
 
     const raw = $[seg.name];
     const val = raw !== undefined ? String(raw) : undefined;

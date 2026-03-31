@@ -5,6 +5,7 @@ import type {
 } from "../parser/index.js";
 import { expandWord } from "../expander/index.js";
 import { $ } from "../variables/index.js";
+import { pushParams, popParams } from "../variables/positional.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
@@ -70,7 +71,12 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     // Shell functions take priority over builtins and external commands.
     const func = shellFunctions.get(command);
     if (func) {
-        return executeNode(func);
+        pushParams(args);
+        try {
+            return await executeNode(func);
+        } finally {
+            popParams();
+        }
     }
 
     // Only run builtins in-process when there are no redirections.
