@@ -89,10 +89,13 @@ struct ExecutorState {
             sigemptyset(&empty);
             sigprocmask(SIG_SETMASK, &empty, nullptr);
 
-            // Reset SIGINT to default so Ctrl-C works in the child.
+            // Reset signals to default — child inherits SIG_IGN for SIGTTOU/SIGTTIN.
             struct sigaction sa = {};
             sa.sa_handler = SIG_DFL;
-            sigaction(SIGINT, &sa, nullptr);
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGINT,  &sa, nullptr);
+            sigaction(SIGTTOU, &sa, nullptr);
+            sigaction(SIGTTIN, &sa, nullptr);
 
             // Node.js sets O_CLOEXEC on stdin/stdout/stderr so they would be
             // closed on exec. Clear it so spawned commands inherit them normally.
@@ -160,6 +163,15 @@ static ExecutorState* g_executor = nullptr;
 static Napi::Value InitExecutor_(const Napi::CallbackInfo& info) {
     if (g_executor) return info.Env().Undefined();
 
+    // Ignore SIGTTOU and SIGTTIN — standard for interactive shells.
+    // Without this, tcsetpgrp() from a non-foreground process sends SIGTTOU
+    // to the shell, stopping it.
+    struct sigaction sa = {};
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTTOU, &sa, nullptr);
+    sigaction(SIGTTIN, &sa, nullptr);
+
     // Block SIGCHLD and SIGINT on the main thread so Node doesn't handle them.
     sigset_t mask;
     sigemptyset(&mask);
@@ -168,6 +180,15 @@ static Napi::Value InitExecutor_(const Napi::CallbackInfo& info) {
     sigprocmask(SIG_BLOCK, &mask, nullptr);
 
     g_interactive = isatty(STDIN_FILENO);
+
+    if (g_interactive) {
+        // Ensure jsh is in its own process group and has terminal control.
+        pid_t pid = getpid();
+        if (getpgrp() != pid) {
+            setpgid(pid, pid);
+        }
+        tcsetpgrp(STDIN_FILENO, pid);
+    }
 
     g_executor = new ExecutorState();
     g_executor->start();
