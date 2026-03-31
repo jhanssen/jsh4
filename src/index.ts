@@ -1,6 +1,6 @@
 import { parse } from "./parser/index.js";
 import { execute } from "./executor/index.js";
-import { expand } from "./expander/index.js";
+import { expandWord } from "./expander/index.js";
 import { startRepl } from "./repl/index.js";
 import { $ } from "./variables/index.js";
 
@@ -14,4 +14,4 @@ main().catch((err) => {
     process.exit(1);
 });
 
-export { parse, execute, expand, startRepl, $ };
+export { parse, execute, expandWord, startRepl, $ };
