@@ -6,12 +6,8 @@ import type {
 import { Lexer, TokenType } from "./lexer.js";
 import type { Token } from "./lexer.js";
 
-export class ParseError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = "ParseError";
-    }
-}
+export { ParseError, IncompleteInputError } from "./errors.js";
+import { ParseError, IncompleteInputError } from "./errors.js";
 
 // Keywords that terminate a compound command body.
 const COMPOUND_TERMINATORS = new Set(["then", "elif", "else", "fi", "do", "done", "esac"]);
@@ -57,10 +53,14 @@ export class Parser {
 
     private expectKeyword(kw: string): void {
         this.skipNewlines();
-        const v = this.literalValue(this.lexer.peek());
+        const tok = this.lexer.peek();
+        if (tok.type === TokenType.EOF) {
+            throw new IncompleteInputError(`Expected '${kw}'`);
+        }
+        const v = this.literalValue(tok);
         if (v !== kw) {
             throw new ParseError(
-                `Expected '${kw}', got '${this.lexer.peek().value}' (${this.lexer.peek().type})`
+                `Expected '${kw}', got '${tok.value}' (${tok.type})`
             );
         }
         this.lexer.next();
@@ -351,7 +351,10 @@ export class Parser {
         const body = this.parseList();
         this.skipNewlines();
         if (this.lexer.peek().type !== TokenType.RParen) {
-            throw new ParseError("Expected ')' to close subshell");
+            const tok = this.lexer.peek();
+            throw tok.type === TokenType.EOF
+                ? new IncompleteInputError("Expected ')'")
+                : new ParseError("Expected ')' to close subshell");
         }
         this.lexer.next();
         return { type: "Subshell", body, redirections: this.parseRedirections() };
@@ -364,7 +367,10 @@ export class Parser {
         const body = this.parseList();
         this.skipNewlines();
         if (this.lexer.peek().type !== TokenType.RBrace) {
-            throw new ParseError("Expected '}' to close brace group");
+            const tok = this.lexer.peek();
+            throw tok.type === TokenType.EOF
+                ? new IncompleteInputError("Expected '}'")
+                : new ParseError("Expected '}' to close brace group");
         }
         this.lexer.next();
         return { type: "BraceGroup", body, redirections: this.parseRedirections() };
@@ -396,8 +402,12 @@ export class Parser {
         }
 
         if (words.length === 0 && assignments.length === 0 && redirections.length === 0) {
+            const tok = this.lexer.peek();
+            if (tok.type === TokenType.EOF) {
+                throw new IncompleteInputError();
+            }
             throw new ParseError(
-                `Expected command, got ${this.lexer.peek().type} (${this.lexer.peek().value})`
+                `Expected command, got ${tok.type} (${tok.value})`
             );
         }
         return { type: "SimpleCommand", assignments, words, redirections };

@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { parse } from "../parser/index.js";
+import { parse, IncompleteInputError } from "../parser/index.js";
 import { execute } from "../executor/index.js";
 
 const require = createRequire(import.meta.url);
@@ -14,38 +14,49 @@ const EAGAIN = native.EAGAIN();
 
 export function startRepl(): void {
     native.initExecutor();
-    promptLoop();
+    promptLoop("");
 }
 
-function promptLoop(): void {
-    native.linenoiseStart("$ ", async (line, errno) => {
+function promptLoop(buffer: string): void {
+    const prompt = buffer ? "> " : "$ ";
+
+    native.linenoiseStart(prompt, async (line, errno) => {
         if (line === null) {
             if (errno === EAGAIN) {
-                // Ctrl-C: clear line and restart prompt
-                process.stdout.write("\n");
-                promptLoop();
+                // Ctrl-C: clear buffer, restart prompt
+                if (buffer) process.stdout.write("\n");
+                promptLoop("");
             } else {
-                // Ctrl-D or real EOF: exit
                 process.stdout.write("\n");
                 process.exit(0);
             }
             return;
         }
 
-        const trimmed = line.trim();
-        if (trimmed) {
-            native.linenoiseHistoryAdd(line);
-            try {
-                const ast = parse(trimmed);
-                if (ast) {
-                    await execute(ast);
-                }
-            } catch (e: unknown) {
-                const msg = e instanceof Error ? e.message : String(e);
-                process.stderr.write(`jsh: ${msg}\n`);
-            }
+        const input = buffer ? buffer + "\n" + line : line;
+        const trimmed = input.trim();
+
+        if (!trimmed) {
+            promptLoop("");
+            return;
         }
 
-        promptLoop();
+        try {
+            const ast = parse(trimmed);
+            if (ast) {
+                native.linenoiseHistoryAdd(input);
+                await execute(ast);
+            }
+            promptLoop("");
+        } catch (e: unknown) {
+            if (e instanceof IncompleteInputError) {
+                // Need more input — keep accumulating
+                promptLoop(input);
+                return;
+            }
+            const msg = e instanceof Error ? e.message : String(e);
+            process.stderr.write(`jsh: ${msg}\n`);
+            promptLoop("");
+        }
     });
 }

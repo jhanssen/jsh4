@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { Lexer, TokenType, LexerError } from "../src/parser/lexer.js";
+import { Lexer, TokenType, LexerError, IncompleteInputError } from "../src/parser/lexer.js";
 
 function tokenTypes(input: string): TokenType[] {
     const lexer = new Lexer(input);
@@ -39,7 +39,7 @@ describe("lexer", () => {
         });
 
         it("should throw on unclosed single quote", () => {
-            assert.throws(() => new Lexer("'unclosed"), LexerError);
+            assert.throws(() => new Lexer("'unclosed"), IncompleteInputError);
         });
     });
 
@@ -75,7 +75,7 @@ describe("lexer", () => {
         });
 
         it("should throw on unclosed double quote", () => {
-            assert.throws(() => new Lexer('"unclosed'), LexerError);
+            assert.throws(() => new Lexer('"unclosed'), IncompleteInputError);
         });
     });
 

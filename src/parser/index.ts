@@ -7,6 +7,7 @@ export type {
 } from "./ast.js";
 
 export { Lexer, TokenType, LexerError } from "./lexer.js";
+export { IncompleteInputError } from "./errors.js";
 export type { Token } from "./lexer.js";
 
 export { Parser, ParseError } from "./parser.js";

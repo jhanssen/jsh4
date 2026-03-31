@@ -25,12 +25,8 @@ export interface Token {
     fd?: number;          // for redirections: the fd number prefix
 }
 
-export class LexerError extends Error {
-    constructor(message: string, public position: number) {
-        super(message);
-        this.name = "LexerError";
-    }
-}
+import { LexerError, IncompleteInputError } from "./errors.js";
+export { LexerError, IncompleteInputError };
 
 export class Lexer {
     private input: string;
@@ -336,7 +332,7 @@ export class Lexer {
             value += this.input[this.pos];
             this.pos++;
         }
-        throw new LexerError("Unclosed single quote", this.pos);
+        throw new IncompleteInputError("Unclosed single quote");
     }
 
     private readDoubleQuoted(): WordSegment {
@@ -396,7 +392,7 @@ export class Lexer {
             this.pos++;
         }
 
-        throw new LexerError("Unclosed double quote", this.pos);
+        throw new IncompleteInputError("Unclosed double quote");
     }
 
     private readBackslashEscape(): WordSegment {
@@ -526,7 +522,7 @@ export class Lexer {
             this.pos++;
         }
 
-        throw new LexerError("Unclosed ${", this.pos);
+        throw new IncompleteInputError("Unclosed ${");
     }
 
     private readBraceOperand(): WordSegment[] {
@@ -586,7 +582,7 @@ export class Lexer {
             this.pos++;
         }
 
-        throw new LexerError("Unclosed ${", this.pos);
+        throw new IncompleteInputError("Unclosed ${");
     }
 
     private readCommandSubstitution(): WordSegment {
@@ -608,7 +604,7 @@ export class Lexer {
             this.pos++;
         }
 
-        throw new LexerError("Unclosed $(", this.pos);
+        throw new IncompleteInputError("Unclosed $(");
     }
 
     private readArithmeticExpansion(): WordSegment {
@@ -637,7 +633,7 @@ export class Lexer {
             this.pos++;
         }
 
-        throw new LexerError("Unclosed $((", this.pos);
+        throw new IncompleteInputError("Unclosed $((");
     }
 
     private readBacktickSubstitution(): WordSegment {
@@ -667,7 +663,7 @@ export class Lexer {
             this.pos++;
         }
 
-        throw new LexerError("Unclosed backtick", this.pos);
+        throw new IncompleteInputError("Unclosed backtick");
     }
 
     private readAnsiCQuoted(): WordSegment {
@@ -736,7 +732,7 @@ export class Lexer {
             this.pos++;
         }
 
-        throw new LexerError("Unclosed $' quote", this.pos);
+        throw new IncompleteInputError("Unclosed $' quote");
     }
 
     private tryGlobBracket(): WordSegment | null {

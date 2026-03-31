@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parse, ParseError, LexerError } from "../src/parser/index.js";
+import { parse, ParseError, LexerError, IncompleteInputError } from "../src/parser/index.js";
 import type { SimpleCommand, Pipeline, AndOr, List, Subshell, BraceGroup } from "../src/parser/index.js";
 
 function wordText(word: { segments: { type: string; value?: string }[] }): string {
@@ -247,7 +247,7 @@ describe("parser", () => {
 
     describe("error cases", () => {
         it("should throw on unclosed quotes", () => {
-            assert.throws(() => parse('"unclosed'), LexerError);
+            assert.throws(() => parse('"unclosed'), IncompleteInputError);
         });
 
         it("should throw on trailing pipe", () => {
