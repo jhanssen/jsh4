@@ -1,12 +1,18 @@
 import { createRequire } from "node:module";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { parse, IncompleteInputError } from "../parser/index.js";
 import { execute } from "../executor/index.js";
+import { $ } from "../variables/index.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
     initExecutor: () => void;
     linenoiseStart: (prompt: string, cb: (line: string | null, errno?: number) => void) => void;
     linenoiseHistoryAdd: (line: string) => void;
+    linenoiseHistorySetMaxLen: (len: number) => void;
+    linenoiseHistorySave: (path: string) => number;
+    linenoiseHistoryLoad: (path: string) => number;
     EAGAIN: () => number;
 };
 
@@ -14,6 +20,15 @@ const EAGAIN = native.EAGAIN();
 
 export function startRepl(): void {
     native.initExecutor();
+
+    const historyFile = join(String($["HOME"] ?? homedir()), ".jsh_history");
+    native.linenoiseHistorySetMaxLen(1000);
+    native.linenoiseHistoryLoad(historyFile);
+
+    process.on("exit", () => {
+        native.linenoiseHistorySave(historyFile);
+    });
+
     promptLoop("");
 }
 

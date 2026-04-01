@@ -65,7 +65,7 @@ async function expandSegment(seg: WordSegment): Promise<string> {
             )).join("");
         case "VariableExpansion":  return expandVariable(seg as VariableExpansion);
         case "CommandSubstitution": return captureImpl((seg as CommandSubstitution).body);
-        case "ArithmeticExpansion": return ""; // TODO
+        case "ArithmeticExpansion": return evalArithmetic(seg.expression);
         case "Glob":          return seg.pattern; // raw chars, assembled before glob expand
         default:              return "";
     }
@@ -105,6 +105,25 @@ function expandVariable(seg: VariableExpansion): string {
         }
         case "#": return String((val ?? "").length);
         default:  return val ?? "";
+    }
+}
+
+function evalArithmetic(expr: string): string {
+    // Substitute $var and bare variable names with their values.
+    let e = expr.replace(/\$([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name) =>
+        String($[name] ?? 0)
+    );
+    e = e.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_, name) =>
+        String($[name] ?? 0)
+    );
+    try {
+        // eslint-disable-next-line no-new-func
+        const result = new Function(`"use strict"; return (${e})`)();
+        const n = typeof result === "number" ? result : Number(result);
+        return String(Math.trunc(n));
+    } catch {
+        process.stderr.write(`jsh: arithmetic: ${expr}: syntax error\n`);
+        return "0";
     }
 }
 
