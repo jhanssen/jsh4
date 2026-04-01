@@ -167,6 +167,108 @@ describe("executor — shell functions", () => {
     });
 });
 
+describe("executor — test / [ builtin", () => {
+    // String tests
+    it("test with no args returns false", () => {
+        assert.strictEqual(ec("test"), 1);
+    });
+    it("test non-empty string is true", () => {
+        assert.strictEqual(ec("test hello"), 0);
+    });
+    it("test empty string is false", () => {
+        assert.strictEqual(ec('test ""'), 1);
+    });
+    it("-z empty string", () => {
+        assert.strictEqual(ec('test -z ""'), 0);
+    });
+    it("-z non-empty string", () => {
+        assert.strictEqual(ec("test -z hello"), 1);
+    });
+    it("-n non-empty string", () => {
+        assert.strictEqual(ec("test -n hello"), 0);
+    });
+    it("-n empty string", () => {
+        assert.strictEqual(ec('test -n ""'), 1);
+    });
+
+    // String comparison
+    it("string equality", () => {
+        assert.strictEqual(ec('test foo = foo'), 0);
+    });
+    it("string inequality", () => {
+        assert.strictEqual(ec('test foo = bar'), 1);
+    });
+    it("string !=", () => {
+        assert.strictEqual(ec('test foo != bar'), 0);
+    });
+
+    // Integer comparison
+    it("-eq", () => {
+        assert.strictEqual(ec("test 5 -eq 5"), 0);
+    });
+    it("-ne", () => {
+        assert.strictEqual(ec("test 5 -ne 3"), 0);
+    });
+    it("-lt", () => {
+        assert.strictEqual(ec("test 3 -lt 5"), 0);
+    });
+    it("-gt", () => {
+        assert.strictEqual(ec("test 5 -gt 3"), 0);
+    });
+    it("-le equal", () => {
+        assert.strictEqual(ec("test 5 -le 5"), 0);
+    });
+    it("-ge less", () => {
+        assert.strictEqual(ec("test 3 -ge 5"), 1);
+    });
+
+    // File tests
+    it("-f on existing file", () => {
+        assert.strictEqual(ec("test -f package.json"), 0);
+    });
+    it("-f on nonexistent file", () => {
+        assert.strictEqual(ec("test -f __nope__"), 1);
+    });
+    it("-d on directory", () => {
+        assert.strictEqual(ec("test -d src"), 0);
+    });
+    it("-d on file", () => {
+        assert.strictEqual(ec("test -d package.json"), 1);
+    });
+    it("-e on existing file", () => {
+        assert.strictEqual(ec("test -e package.json"), 0);
+    });
+
+    // Negation
+    it("! inverts result", () => {
+        assert.strictEqual(ec("test ! -f __nope__"), 0);
+    });
+
+    // [ ] syntax
+    it("[ ] syntax works", () => {
+        assert.strictEqual(ec('[ foo = foo ]'), 0);
+    });
+    it("[ ] missing ] is error", () => {
+        assert.strictEqual(ec('[ foo = foo'), 2);
+    });
+
+    // Used with if
+    it("if [ -f file ] works", () => {
+        assert.strictEqual(run('if [ -f package.json ]; then echo yes; else echo no; fi'), "yes");
+    });
+    it("if test string = string", () => {
+        assert.strictEqual(run('if test foo = foo; then echo match; fi'), "match");
+    });
+
+    // Logical operators
+    it("-a (and)", () => {
+        assert.strictEqual(ec('test -f package.json -a -d src'), 0);
+    });
+    it("-o (or)", () => {
+        assert.strictEqual(ec('test -f __nope__ -o -d src'), 0);
+    });
+});
+
 describe("executor — expansion", () => {
     it("variable expansion", () => {
         assert.strictEqual(run("X=hello; echo $X"), "hello");

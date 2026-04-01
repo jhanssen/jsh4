@@ -515,6 +515,150 @@ function expandHereDocVars(body: string): string {
     );
 }
 
+// ---- test / [ builtin -------------------------------------------------------
+
+function runTest(args: string[]): ExecResult {
+    try {
+        return { exitCode: evalTestExpr(args, 0, args.length)[0] ? 0 : 1 };
+    } catch (e) {
+        process.stderr.write(`test: ${e instanceof Error ? e.message : e}\n`);
+        return { exitCode: 2 };
+    }
+}
+
+type TestResult = [boolean, number]; // [value, nextIndex]
+
+function evalTestExpr(args: string[], pos: number, end: number): TestResult {
+    if (pos >= end) return [false, pos];
+    // Handle OR: expr1 -o expr2
+    let [val, next] = evalTestAnd(args, pos, end);
+    while (next < end && args[next] === "-o") {
+        const [rhs, rn] = evalTestAnd(args, next + 1, end);
+        val = val || rhs;
+        next = rn;
+    }
+    return [val, next];
+}
+
+function evalTestAnd(args: string[], pos: number, end: number): TestResult {
+    let [val, next] = evalTestNot(args, pos, end);
+    while (next < end && args[next] === "-a") {
+        const [rhs, rn] = evalTestNot(args, next + 1, end);
+        val = val && rhs;
+        next = rn;
+    }
+    return [val, next];
+}
+
+function evalTestNot(args: string[], pos: number, end: number): TestResult {
+    if (pos < end && args[pos] === "!") {
+        const [val, next] = evalTestNot(args, pos + 1, end);
+        return [!val, next];
+    }
+    return evalTestPrimary(args, pos, end);
+}
+
+function evalTestPrimary(args: string[], pos: number, end: number): TestResult {
+    if (pos >= end) return [false, pos];
+
+    const tok = args[pos]!;
+
+    // Parenthesized expression
+    if (tok === "(") {
+        const [val, next] = evalTestExpr(args, pos + 1, end);
+        if (next >= end || args[next] !== ")") throw new Error("missing ')'");
+        return [val, next + 1];
+    }
+
+    // Unary operators (must check before binary to handle -z, -n, -f, etc.)
+    if (pos + 1 < end) {
+        const unaryResult = evalUnaryTest(tok, args[pos + 1]!);
+        if (unaryResult !== null) return [unaryResult, pos + 2];
+    }
+
+    // Binary operators — check if next token is a binary op
+    if (pos + 2 < end) {
+        const binResult = evalBinaryOp(tok, args[pos + 1]!, args[pos + 2]!, pos);
+        if (binResult !== null) return [binResult, pos + 3];
+    }
+
+    // Single argument: true if non-empty string
+    return [tok.length > 0, pos + 1];
+}
+
+function evalUnaryTest(op: string, arg: string): boolean | null {
+    const fs = require("node:fs") as typeof import("node:fs");
+    switch (op) {
+        case "-z": return arg.length === 0;
+        case "-n": return arg.length > 0;
+        case "-e": case "-a": // -a as unary = file exists (POSIX)
+            try { fs.statSync(arg); return true; } catch { return false; }
+        case "-f":
+            try { return fs.statSync(arg).isFile(); } catch { return false; }
+        case "-d":
+            try { return fs.statSync(arg).isDirectory(); } catch { return false; }
+        case "-s":
+            try { return fs.statSync(arg).size > 0; } catch { return false; }
+        case "-r": case "-w": case "-x": {
+            const mode = op === "-r" ? fs.constants.R_OK : op === "-w" ? fs.constants.W_OK : fs.constants.X_OK;
+            try { fs.accessSync(arg, mode); return true; } catch { return false; }
+        }
+        case "-L": case "-h":
+            try { return fs.lstatSync(arg).isSymbolicLink(); } catch { return false; }
+        case "-p":
+            try { return fs.statSync(arg).isFIFO(); } catch { return false; }
+        case "-S":
+            try { return fs.statSync(arg).isSocket(); } catch { return false; }
+        case "-b":
+            try { return fs.statSync(arg).isBlockDevice(); } catch { return false; }
+        case "-c":
+            try { return fs.statSync(arg).isCharacterDevice(); } catch { return false; }
+        case "-t": {
+            const fd = parseInt(arg, 10);
+            if (isNaN(fd)) return false;
+            try { return require("node:tty").isatty(fd); } catch { return false; }
+        }
+        default: return null;
+    }
+}
+
+function evalBinaryOp(left: string, op: string, right: string | undefined, _pos: number): boolean | null {
+    if (right === undefined) return null;
+    switch (op) {
+        // String comparison
+        case "=": case "==": return left === right;
+        case "!=": return left !== right;
+        // Integer comparison
+        case "-eq": return toInt(left) === toInt(right);
+        case "-ne": return toInt(left) !== toInt(right);
+        case "-lt": return toInt(left) < toInt(right);
+        case "-le": return toInt(left) <= toInt(right);
+        case "-gt": return toInt(left) > toInt(right);
+        case "-ge": return toInt(left) >= toInt(right);
+        // File comparison
+        case "-nt": case "-ot": case "-ef": return evalFileCompare(left, op, right);
+        default: return null;
+    }
+}
+
+function evalFileCompare(left: string, op: string, right: string): boolean {
+    const fs = require("node:fs") as typeof import("node:fs");
+    try {
+        const ls = fs.statSync(left);
+        const rs = fs.statSync(right);
+        if (op === "-nt") return ls.mtimeMs > rs.mtimeMs;
+        if (op === "-ot") return ls.mtimeMs < rs.mtimeMs;
+        // -ef: same device and inode
+        return ls.dev === rs.dev && ls.ino === rs.ino;
+    } catch { return false; }
+}
+
+function toInt(s: string): number {
+    const n = parseInt(s, 10);
+    if (isNaN(n)) throw new Error(`integer expression expected: ${s}`);
+    return n;
+}
+
 function runBuiltin(name: string, args: string[]): ExecResult | null {
     switch (name) {
         case "cd": {
@@ -555,6 +699,15 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
         case "echo":
             process.stdout.write(args.join(" ") + "\n");
             return { exitCode: 0 };
+        case "test":
+            return runTest(args);
+        case "[": {
+            if (args.length === 0 || args[args.length - 1] !== "]") {
+                process.stderr.write("[: missing ']'\n");
+                return { exitCode: 2 };
+            }
+            return runTest(args.slice(0, -1));
+        }
         default:
             return null;
     }

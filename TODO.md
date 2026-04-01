@@ -106,19 +106,21 @@
 ### High priority (needed for real scripts)
 
 - [ ] **`test` / `[` / `[[`** — conditional expressions; `if [ -f foo ]`, `[ $x -eq 1 ]`, string/file tests
-- [ ] **Subshells `(...)`** — currently run in-process (variable mutations leak); needs clone-and-restore of variable store + cwd
-- [ ] **`$@` / `$*` proper word splitting** — currently joins with space; should produce separate words in `for i in "$@"`
 - [ ] **`source` / `.`** — execute a file in the current shell context
+- [ ] **`read` builtin** — read a line from stdin into a variable
+- [ ] **`set` builtin** — `set -e`, `set -o pipefail`, `set -x` (trace), `set -u` (unbound vars)
+- [ ] **`local` builtin** — function-scoped variables; without this, shell functions clobber globals
 
 ### Medium priority
 
+- [ ] **Subshells `(...)`** — currently run in-process (variable mutations leak); needs clone-and-restore of variable store + cwd
+- [ ] **`$@` / `$*` proper word splitting** — currently joins with space; should produce separate words in `for i in "$@"`
 - [ ] **Background `&` / job control** — job table, `jobs`, `fg`, `bg`, `SIGCHLD` tracking, `SIGTSTP`
-- [ ] **`test`/`[` builtins** — `-f`, `-d`, `-z`, `-n`, `-eq`, `-ne`, `-lt`, `-gt`, string comparison, `!`, `-a`, `-o`
-- [ ] **`read` builtin** — read a line from stdin into a variable
 - [ ] **`shift` builtin** — shift positional parameters
-- [ ] **`set` builtin** — `set -e`, `set -o pipefail`, `set -x` (trace), `set -u` (unbound vars)
-- [ ] **`$PIPESTATUS`** — exit codes of each pipeline stage
 - [ ] **`exec` builtin** — replace shell with command
+- [ ] **`$PIPESTATUS`** — exit codes of each pipeline stage
+- [ ] **Brace expansion** — `{a,b,c}`, `{1..5}`
+- [ ] **`type` / `which` builtins** — command lookup; common for checking if commands exist
 - [ ] **Arithmetic in `$((...))`: `++`/`--`** — currently only basic JS arithmetic; shell-specific operators
 
 ### Lower priority / quality of life
@@ -128,8 +130,6 @@
 - [ ] **Here-doc full expansion** — `$()` and `$((...))` inside here-doc bodies
 - [ ] **Glob in directory components** — `src/*/index.ts` (currently only last component)
 - [ ] **Recursive glob `**` in brace expansion** — e.g. `{src,test}/**/*.ts`
-- [ ] **Brace expansion** — `{a,b,c}`, `{1..5}`
-- [ ] **`type` / `which` builtins**
 - [ ] **`hash` builtin** — command hash table for PATH lookup caching
 - [ ] **`printf` builtin**
 - [ ] **`trap`** — signal trapping

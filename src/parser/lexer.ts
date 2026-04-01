@@ -804,7 +804,12 @@ export class Lexer {
         }
         let pattern = "";
         while (tmpPos < this.input.length) {
-            if (this.input[tmpPos] === "]") {
+            const c = this.input[tmpPos]!;
+            // Glob brackets cannot span whitespace or shell metacharacters
+            if (c === " " || c === "\t" || c === "\n" || c === "|" || c === "&" || c === ";" || c === "(" || c === ")") {
+                return null;
+            }
+            if (c === "]") {
                 pattern = this.input.slice(this.pos, tmpPos + 1);
                 this.pos = tmpPos + 1;
                 return { type: "Glob", pattern };
