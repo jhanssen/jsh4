@@ -675,6 +675,50 @@ static Napi::Value WaitForPids(const Napi::CallbackInfo& info) {
     return ctx->deferred.Promise();
 }
 
+// exec builtin: replace the current process with the given command.
+// Resets signals, then calls execvp.  Only returns on error.
+static Napi::Value Execvp(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
+        Napi::TypeError::New(env, "execvp(cmd, args)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    std::string cmd = info[0].As<Napi::String>().Utf8Value();
+    Napi::Array jsArgs = info[1].As<Napi::Array>();
+    std::vector<std::string> args;
+    for (uint32_t i = 0; i < jsArgs.Length(); i++)
+        args.push_back(jsArgs.Get(i).As<Napi::String>().Utf8Value());
+
+    std::vector<const char*> argv;
+    argv.push_back(cmd.c_str());
+    for (const auto& a : args) argv.push_back(a.c_str());
+    argv.push_back(nullptr);
+
+    // Reset all signals to default before exec.
+    sigset_t empty; sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, nullptr);
+    struct sigaction sa = {};
+    sa.sa_handler = SIG_DFL; sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTTOU, &sa, nullptr);
+    sigaction(SIGTTIN, &sa, nullptr);
+    sigaction(SIGPIPE, &sa, nullptr);
+
+    // Ensure stdio fds survive exec (clear CLOEXEC).
+    for (int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
+        int flags = fcntl(fd, F_GETFD);
+        if (flags != -1 && (flags & FD_CLOEXEC))
+            fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+    }
+
+    execvp(cmd.c_str(), const_cast<char* const*>(argv.data()));
+    // Only reached on error
+    int err = errno;
+    Napi::Error::New(env, std::string("exec: ") + cmd + ": " + strerror(err))
+        .ThrowAsJavaScriptException();
+    return Napi::Number::New(env, err == ENOENT ? 127 : 126);
+}
+
 Napi::Object InitExecutor(Napi::Env env, Napi::Object exports) {
     exports.Set("initExecutor",     Napi::Function::New(env, InitExecutor_));
     exports.Set("spawnPipeline",    Napi::Function::New(env, SpawnPipeline));
@@ -684,6 +728,7 @@ Napi::Object InitExecutor(Napi::Env env, Napi::Object exports) {
     exports.Set("forkExec",         Napi::Function::New(env, ForkExec));
     exports.Set("waitForPids",      Napi::Function::New(env, WaitForPids));
     exports.Set("EAGAIN",           Napi::Function::New(env, GetEAGAIN));
+    exports.Set("execvp",           Napi::Function::New(env, Execvp));
     return exports;
 }
 

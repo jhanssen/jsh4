@@ -322,10 +322,19 @@ export class Lexer {
                     segments.push({ type: "Literal", value: ch });
                     this.pos++;
                 }
-            } else if (ch === "{" || ch === "}") {
-                // In word context, braces that don't start a brace group are literals
-                // But we need to break if this is a top-level { or }
-                if (segments.length === 0) break;
+            } else if (ch === "{") {
+                // { is a brace group keyword only when it's the first token and
+                // followed by whitespace.  Otherwise it's a literal (brace expansion).
+                if (segments.length === 0) {
+                    const next = this.input[this.pos + 1];
+                    if (next === undefined || next === " " || next === "\t" || next === "\n" || next === ";") {
+                        break; // Let the post-loop handler emit LBrace
+                    }
+                }
+                segments.push({ type: "Literal", value: ch });
+                this.pos++;
+            } else if (ch === "}") {
+                if (segments.length === 0) break; // Let the post-loop handler emit RBrace
                 segments.push({ type: "Literal", value: ch });
                 this.pos++;
             } else if (ch === "#") {

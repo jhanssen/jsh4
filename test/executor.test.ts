@@ -343,6 +343,52 @@ describe("executor — source / . builtin", () => {
     });
 });
 
+describe("executor — shift builtin", () => {
+    it("should shift by 1 by default", () => {
+        assert.strictEqual(
+            run('f() { echo $1; shift; echo $1; }; f a b c'),
+            "a\nb"
+        );
+    });
+    it("should shift by n", () => {
+        assert.strictEqual(
+            run('f() { shift 2; echo $1; }; f a b c'),
+            "c"
+        );
+    });
+    it("should return 1 if shift count exceeds params", () => {
+        assert.strictEqual(ec('f() { shift 5; }; f a b'), 1);
+    });
+    it("should update $#", () => {
+        assert.strictEqual(
+            run('f() { echo $#; shift; echo $#; }; f a b c'),
+            "3\n2"
+        );
+    });
+});
+
+describe("executor — exec builtin", () => {
+    it("should replace shell with command", () => {
+        assert.strictEqual(run("exec echo hello"), "hello");
+    });
+    it("should exit with command exit code", () => {
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: "exec true\n",
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        assert.strictEqual(r.status, 0);
+    });
+    it("should exit 127 for missing command", () => {
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: "exec __no_such_cmd_jsh__\n",
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        assert.strictEqual(r.status, 127);
+    });
+});
+
 describe("executor — local builtin", () => {
     it("should scope variable to function", () => {
         assert.strictEqual(
@@ -407,6 +453,33 @@ describe("executor — set builtin", () => {
     });
     it("should combine short flags", () => {
         assert.strictEqual(run("set -eu\nset +eu\necho ok"), "ok");
+    });
+});
+
+describe("executor — brace expansion", () => {
+    it("should expand comma-separated braces", () => {
+        assert.strictEqual(run("echo {a,b,c}"), "a b c");
+    });
+    it("should expand with prefix and suffix", () => {
+        assert.strictEqual(run("echo file.{js,ts}"), "file.js file.ts");
+    });
+    it("should expand numeric sequence", () => {
+        assert.strictEqual(run("echo {1..5}"), "1 2 3 4 5");
+    });
+    it("should expand reverse numeric sequence", () => {
+        assert.strictEqual(run("echo {5..1}"), "5 4 3 2 1");
+    });
+    it("should expand numeric sequence with step", () => {
+        assert.strictEqual(run("echo {1..10..3}"), "1 4 7 10");
+    });
+    it("should expand character sequence", () => {
+        assert.strictEqual(run("echo {a..e}"), "a b c d e");
+    });
+    it("should expand nested braces", () => {
+        assert.strictEqual(run("echo {a,b{1,2},c}"), "a b1 b2 c");
+    });
+    it("should not interfere with brace groups", () => {
+        assert.strictEqual(run("{ echo ok; }"), "ok");
     });
 });
 

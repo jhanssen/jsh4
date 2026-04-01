@@ -23,3 +23,10 @@ export function getAllParams(): string[] {
 export function getParamCount(): number {
     return stack[stack.length - 1]!.length;
 }
+
+export function shiftParams(n: number): boolean {
+    const frame = stack[stack.length - 1]!;
+    if (n > frame.length) return false;
+    frame.splice(0, n);
+    return true;
+}

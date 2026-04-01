@@ -13,13 +13,23 @@ type CaptureFunc = (body: string) => Promise<string>;
 let captureImpl: CaptureFunc = async () => "";
 export function registerCaptureImpl(fn: CaptureFunc): void { captureImpl = fn; }
 
-// expandWord: returns potentially multiple strings after glob expansion.
+// expandWord: returns potentially multiple strings after brace + glob expansion.
 // Use this for command arguments.
 export async function expandWord(word: Word): Promise<string[]> {
     const hasGlob = word.segments.some(s => s.type === "Glob");
     const str = await expandWordToStr(word);
-    if (!hasGlob) return [str];
-    return expandGlob(str);
+    // Brace expansion first (produces multiple words), then glob each.
+    const braceExpanded = expandBraces(str);
+    if (!hasGlob && braceExpanded.length <= 1) return braceExpanded.length === 0 ? [str] : braceExpanded;
+    const results: string[] = [];
+    for (const w of braceExpanded) {
+        if (hasGlob) {
+            results.push(...await expandGlob(w));
+        } else {
+            results.push(w);
+        }
+    }
+    return results;
 }
 
 // expandWordToStr: returns a single string, no glob expansion.
@@ -37,6 +47,117 @@ export async function expandWordToStr(word: Word): Promise<string> {
     }
 
     return (await Promise.all(segs.map(expandSegment))).join("");
+}
+
+// ---- Brace expansion --------------------------------------------------------
+
+function expandBraces(str: string): string[] {
+    // Find the first top-level { ... } with a comma or .. inside.
+    const open = findBraceOpen(str);
+    if (open === -1) return [str];
+    const close = findBraceClose(str, open);
+    if (close === -1) return [str];
+
+    const prefix = str.slice(0, open);
+    const body = str.slice(open + 1, close);
+    const suffix = str.slice(close + 1);
+
+    // Sequence: {a..b} or {a..b..step}
+    const seqMatch = body.match(/^(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?$/);
+    if (seqMatch) {
+        const start = parseInt(seqMatch[1]!, 10);
+        const end = parseInt(seqMatch[2]!, 10);
+        const step = seqMatch[3] !== undefined ? Math.abs(parseInt(seqMatch[3]!, 10)) : 1;
+        if (step === 0) return [str];
+        const items: string[] = [];
+        if (start <= end) {
+            for (let i = start; i <= end; i += step) items.push(String(i));
+        } else {
+            for (let i = start; i >= end; i -= step) items.push(String(i));
+        }
+        // Recursively expand suffix for nested braces.
+        const results: string[] = [];
+        for (const item of items) {
+            results.push(...expandBraces(prefix + item + suffix));
+        }
+        return results;
+    }
+
+    // Character sequence: {a..z}
+    const charMatch = body.match(/^(.)\.\.(.)(\.\.(-?\d+))?$/);
+    if (charMatch && charMatch[1]!.length === 1 && charMatch[2]!.length === 1) {
+        const startCode = charMatch[1]!.charCodeAt(0);
+        const endCode = charMatch[2]!.charCodeAt(0);
+        const step = charMatch[4] !== undefined ? Math.abs(parseInt(charMatch[4]!, 10)) : 1;
+        if (step === 0) return [str];
+        const items: string[] = [];
+        if (startCode <= endCode) {
+            for (let i = startCode; i <= endCode; i += step) items.push(String.fromCharCode(i));
+        } else {
+            for (let i = startCode; i >= endCode; i -= step) items.push(String.fromCharCode(i));
+        }
+        const results: string[] = [];
+        for (const item of items) {
+            results.push(...expandBraces(prefix + item + suffix));
+        }
+        return results;
+    }
+
+    // Comma-separated: {a,b,c}
+    const parts = splitBraceBody(body);
+    if (parts.length <= 1) return [str]; // No comma found — not a brace expansion
+    const results: string[] = [];
+    for (const part of parts) {
+        results.push(...expandBraces(prefix + part + suffix));
+    }
+    return results;
+}
+
+function findBraceOpen(str: string): number {
+    for (let i = 0; i < str.length; i++) {
+        if (str[i] === "{") return i;
+        if (str[i] === "\\") i++; // skip escaped char
+    }
+    return -1;
+}
+
+function findBraceClose(str: string, open: number): number {
+    let depth = 0;
+    for (let i = open; i < str.length; i++) {
+        if (str[i] === "\\") { i++; continue; }
+        if (str[i] === "{") depth++;
+        else if (str[i] === "}") {
+            depth--;
+            if (depth === 0) return i;
+        }
+    }
+    return -1;
+}
+
+function splitBraceBody(body: string): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let current = "";
+    for (let i = 0; i < body.length; i++) {
+        const ch = body[i]!;
+        if (ch === "\\") {
+            current += ch + (body[i + 1] ?? "");
+            i++;
+        } else if (ch === "{") {
+            depth++;
+            current += ch;
+        } else if (ch === "}") {
+            depth--;
+            current += ch;
+        } else if (ch === "," && depth === 0) {
+            parts.push(current);
+            current = "";
+        } else {
+            current += ch;
+        }
+    }
+    parts.push(current);
+    return parts;
 }
 
 // ---- Glob expansion ---------------------------------------------------------

@@ -12,7 +12,7 @@ import type {
 import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl } from "../expander/index.js";
 import { $, pushScope, popScope, declareLocal } from "../variables/index.js";
-import { pushParams, popParams } from "../variables/positional.js";
+import { pushParams, popParams, shiftParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { getAlias } from "../api/index.js";
 import { shellOpts } from "../shellopts/index.js";
@@ -32,6 +32,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     closeFd: (fd: number) => void;
     forkExec: (cmd: string, args: string[], stdinFd?: number, stdoutFd?: number, stderrFd?: number, pgid?: number) => number;
     waitForPids: (pids: number[], pgid?: number) => Promise<number>;
+    execvp: (cmd: string, args: string[]) => number;
 };
 
 export interface ExecResult {
@@ -883,9 +884,36 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             }
             return { exitCode: 0 };
         }
+        case "shift": {
+            const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
+            if (isNaN(n) || n < 0) {
+                process.stderr.write(`shift: ${args[0]}: numeric argument required\n`);
+                return { exitCode: 1 };
+            }
+            return { exitCode: shiftParams(n) ? 0 : 1 };
+        }
+        case "exec":
+            // No args: exec with no command is a no-op (POSIX: redirections-only form not yet supported)
+            if (args.length === 0) return { exitCode: 0 };
+            return runExec(name, args);
         default:
             return null;
     }
+}
+
+// ---- exec builtin -----------------------------------------------------------
+
+function runExec(_name: string, args: string[]): ExecResult {
+    const [cmd, ...rest] = args as [string, ...string[]];
+    try {
+        native.execvp(cmd, rest);
+    } catch (e) {
+        // execvp failed — print error and exit
+        process.stderr.write(`exec: ${cmd}: ${e instanceof Error ? e.message : e}\n`);
+        process.exit(127);
+    }
+    // Unreachable on success (process replaced), but TypeScript needs a return.
+    process.exit(126);
 }
 
 // ---- set builtin ------------------------------------------------------------
