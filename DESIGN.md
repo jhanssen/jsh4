@@ -7,7 +7,7 @@ A POSIX-compatible interactive shell with JavaScript as the extension language.
 - Bourne-compatible syntax (POSIX sh base, selective bash/zsh extensions)
 - JS as the scripting and configuration language (replaces `.zshrc`/`.bashrc` with `.jshrc`)
 - JS functions callable inline in pipelines via `@` syntax
-- Job control (ctrl-z, bg, fg, &) *(job control partially implemented)*
+- Job control (ctrl-z, bg, fg, &)
 - Quality line editing with programmable completion
 - In-process: shell logic runs in the Node.js process, child commands fork/exec as usual
 
@@ -53,9 +53,9 @@ Supported syntax:
 - Redirections (`>`, `>>`, `<`, `>&`, `<&`, `&>`, `&>>`)
 - Here-docs (`<<`, `<<-`) and here-strings (`<<<`)
 - Quoting (single, double, backslash, `$'...'`)
-- Variable expansion (`$VAR`, `${VAR}`, `${VAR:-default}`, `${VAR%%pattern}`, etc.)
+- Variable expansion (`$VAR`, `${VAR}`, `${VAR:-default}`, `${VAR%%pattern}`, `${ARR[n]}`, etc.)
 - Command substitution (`$(...)`, backticks)
-- Arithmetic expansion (`$((...))`)
+- Arithmetic expansion (`$((...))`) with `++`/`--`, `+=`/`-=`/`*=`/`/=`/`%=`, `=`
 - Globbing (`*`, `?`, `[...]`, `**` recursive)
 - Brace expansion (`{a,b,c}`, `{1..5}`, `{a..z}`, nested)
 - Control flow: `for`/`do`/`done`, `while`/`until`, `if`/`then`/`elif`/`else`/`fi`, `case`/`esac`
@@ -78,15 +78,15 @@ The native `spawnPipeline` and `captureOutput` functions handle pure-external pi
 
 Handles word expansion before command execution:
 1. Tilde expansion (`~` → home dir)
-2. Parameter expansion (`$VAR`, `${VAR:-default}`, etc.)
-3. Command substitution (`$(...)` → fork + pipe capture)
-4. Arithmetic expansion (`$((...))` → JS `Function()` eval)
+2. Parameter expansion (`$VAR`, `${VAR:-default}`, `${ARR[n]}`, etc.)
+3. Command substitution (`$(...)` → fork + pipe capture, supports arbitrary ASTs)
+4. Arithmetic expansion (`$((...))` → JS `Function()` eval, with `++`/`--`/`+=`/etc.)
 5. Brace expansion (`{a,b,c}`, `{1..5}`, `{a..z}`, nested)
-6. Word splitting (on IFS — currently space/tab/newline)
+6. IFS word splitting (fragment-based: unquoted `$VAR`/`$()` are split; quoted forms preserved; `"$@"` produces separate words)
 7. Glob/pathname expansion (via Node.js `fs.glob`)
 8. Quote removal
 
-Returns `string[]` per word to support brace and glob expansion producing multiple results.
+Returns `string[]` per word to support brace, glob, and IFS expansion producing multiple results.
 
 **4. Line Editor (linenoise, N-API binding)**
 
@@ -256,10 +256,11 @@ Builtins execute in-process (no fork):
 | `exec` | ✅ | Replace shell with command (native `execvp`) |
 | `type` / `which` | ✅ | Command lookup (alias, builtin, function, PATH) |
 | `[[ ]]` | ✅ | Extended conditional (`=~` regex, `<`/`>`, `&&`/`||`) |
+| `jobs` | ✅ | List background/stopped jobs |
+| `fg` | ✅ | Resume job in foreground |
+| `bg` | ✅ | Resume stopped job in background |
+| `wait` | ✅ | Wait for background jobs |
 | `eval` | ❌ | Parse and execute string |
-| `jobs` | ❌ | List jobs |
-| `fg` | ❌ | Foreground a job |
-| `bg` | ❌ | Background a job |
 | `printf` | ❌ | Formatted output |
 | `hash` | ❌ | Command hash table |
 | `trap` | ❌ | Signal trapping |
@@ -331,7 +332,7 @@ jsh.$.items = ['a', 'b', 'c'];   // JS can store any type
 
 ### Subshells
 
-`(commands)` and `$(commands)` currently run in-process (variable mutations leak back to the parent shell). **TODO**: implement clone-and-restore of the variable store and cwd for proper subshell isolation.
+`(commands)` runs in-process with full isolation — the variable store, working directory, shell options, and positional parameters are snapshotted before execution and restored afterward. Subshells also support redirections: `(cmd) > file`.
 
 ### Function scoping
 
@@ -350,4 +351,6 @@ JS functions map to exit codes as follows:
 - `throw`/`reject` → exit 1, error stringified to stderr
 - `return { exitCode: N }` → exit N
 
-`set -e` (errexit), `set -u` (nounset), `set -x` (xtrace), and `set -o pipefail` are implemented. `pipefail` tracks whether any pipeline stage fails; `errexit` aborts on non-zero exit in list context.
+`set -e` (errexit), `set -u` (nounset), `set -x` (xtrace), and `set -o pipefail` are implemented. `pipefail` uses the rightmost non-zero exit code from `$PIPESTATUS`; `errexit` aborts on non-zero exit in list context.
+
+`$PIPESTATUS` is an array holding the exit code of each stage in the most recent pipeline. Access elements with `${PIPESTATUS[n]}` or all with `${PIPESTATUS[@]}`.

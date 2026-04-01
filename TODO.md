@@ -31,14 +31,21 @@
 - [x] Redirections (`>`, `>>`, `<`, `>&`, `2>&1`, `&>`, `<<`, `<<<`)
 - [x] `&&` / `||` short-circuit evaluation
 - [x] Command lists (`;`)
-- [x] Brace groups
+- [x] Brace groups (with redirections)
+- [x] Subshells `(...)` with full isolation (variables, cwd, shell options, positional params)
 - [x] `if`/`elif`/`else`
 - [x] `while`/`until` loops
 - [x] `for` loops with glob/word expansion
 - [x] `case`/`esac` with glob patterns and `|` alternation
 - [x] Shell function definitions and calls
 - [x] Positional parameters `$1`/`$2`/`$#`/`$@`/`$*` with scope stack
+- [x] `"$@"` produces separate words, `"$*"` joins with IFS
 - [x] `$?` exit code tracking
+- [x] `$PIPESTATUS` — per-stage exit codes for pipelines
+- [x] Background `&` — run pipelines in background without waiting
+- [x] Ctrl-Z (SIGTSTP) — stop foreground jobs, add to job table
+- [x] Job control: `fg`, `bg`, `jobs`, `wait` builtins
+- [x] `$!` — PID of last backgrounded job
 
 ### Builtins
 - [x] `cd`
@@ -57,14 +64,20 @@
 - [x] `exec` — replace shell process via native `execvp`
 - [x] `type` / `which` — command lookup (alias, builtin, function, PATH)
 - [x] `[[ ]]` — extended conditional: `=~` regex, `<`/`>` string comparison, `&&`/`||`/`!`/`()`
+- [x] `jobs` — list background/stopped jobs
+- [x] `fg` — resume job in foreground (SIGCONT + tcsetpgrp + wait)
+- [x] `bg` — resume stopped job in background (SIGCONT)
+- [x] `wait` — wait for background jobs
 
 ### Expansion
 - [x] Variable expansion with all operators (`:-`, `:+`, `:=`, `:?`, `#`, `##`, `%`, `%%`)
+- [x] Array subscript syntax `${VAR[n]}`, `${VAR[@]}`, `${VAR[*]}`
 - [x] Tilde expansion (`~`, `~/path`)
-- [x] Command substitution `$()` (fork + pipe capture)
-- [x] Arithmetic expansion `$((...))` via JS `Function()`
+- [x] Command substitution `$()` (fork + pipe capture, supports arbitrary ASTs including control flow)
+- [x] Arithmetic expansion `$((...))` via JS `Function()`, with `++`/`--`, `+=`/`-=`/`*=`/`/=`/`%=`, `=`
 - [x] Glob expansion via Node.js `fs.glob` (`*`, `**`, `?`, `[...]`)
 - [x] Brace expansion (`{a,b,c}`, `{1..5}`, `{a..z}`, step `{1..10..2}`, nested)
+- [x] IFS word splitting — fragment-based: unquoted `$VAR`/`$()` split on IFS; quoted forms preserved
 - [x] Here-doc body variable expansion (`$VAR`, `${VAR}`)
 
 ### JS Integration (`@` syntax)
@@ -109,18 +122,17 @@
 - [x] jsh API tests (alias, setPrompt, registerJsFunction)
 - [x] Tab completion tests
 - [x] `case`/`esac` and here-doc tests
+- [x] Subshell isolation tests
+- [x] Brace group and subshell redirection tests
+- [x] IFS word splitting tests
+- [x] `$@`/`$*` word splitting tests
+- [x] `$PIPESTATUS` and array subscript tests
+- [x] Arithmetic `++`/`--` and assignment operator tests
+- [x] Job control tests (background, jobs, wait, $!)
 
 ---
 
 ## Pending
-
-### Medium priority
-
-- [ ] **Subshells `(...)`** — currently run in-process (variable mutations leak); needs clone-and-restore of variable store + cwd
-- [ ] **`$@` / `$*` proper word splitting** — currently joins with space; should produce separate words in `for i in "$@"`
-- [ ] **Background `&` / job control** — job table, `jobs`, `fg`, `bg`, `SIGCHLD` tracking, `SIGTSTP`
-- [ ] **`$PIPESTATUS`** — exit codes of each pipeline stage
-- [ ] **Arithmetic in `$((...))`: `++`/`--`** — currently only basic JS arithmetic; shell-specific operators
 
 ### Lower priority / quality of life
 
