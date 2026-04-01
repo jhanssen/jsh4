@@ -131,15 +131,40 @@ static void clearCloexecStdio() {
     }
 }
 
-// ---- Executor state ------------------------------------------------------
-
 static bool g_interactive = false;
+
+// ---- Wait request (used by mixed-pipeline path) ---------------------------
+
+struct WaitRequest {
+    std::vector<pid_t> pids;
+    int pgid;
+    SpawnCtx* ctx;
+};
+
+static void processWait(WaitRequest* req) {
+    int lastCode = 0;
+    for (size_t i = 0; i < req->pids.size(); i++) {
+        int status = 0;
+        waitpid(req->pids[i], &status, 0);
+        int code = WIFEXITED(status)   ? WEXITSTATUS(status) :
+                   WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+        if (i == req->pids.size() - 1) lastCode = code;
+    }
+    if (g_interactive && req->pgid > 0)
+        tcsetpgrp(STDIN_FILENO, getpgrp());
+    req->ctx->exitCode = lastCode;
+    req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+    delete req;
+}
+
+// ---- Executor state ------------------------------------------------------
 
 struct ExecutorState {
     std::thread thread;
     std::mutex mutex;
     std::condition_variable cv;
     std::queue<PipelineRequest*> queue;
+    std::queue<WaitRequest*> waitQueue;
     bool running = true;
 
     void start() {
@@ -152,17 +177,30 @@ struct ExecutorState {
         cv.notify_one();
     }
 
+    void enqueueWait(WaitRequest* req) {
+        std::lock_guard<std::mutex> lock(mutex);
+        waitQueue.push(req);
+        cv.notify_one();
+    }
+
     void run() {
         while (true) {
             PipelineRequest* req = nullptr;
+            WaitRequest* wreq = nullptr;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [this] { return !queue.empty() || !running; });
-                if (!running && queue.empty()) break;
-                req = queue.front();
-                queue.pop();
+                cv.wait(lock, [this] {
+                    return !queue.empty() || !waitQueue.empty() || !running;
+                });
+                if (!running && queue.empty() && waitQueue.empty()) break;
+                if (!queue.empty()) {
+                    req = queue.front(); queue.pop();
+                } else if (!waitQueue.empty()) {
+                    wreq = waitQueue.front(); waitQueue.pop();
+                }
             }
-            processPipeline(req);
+            if (req) processPipeline(req);
+            if (wreq) processWait(wreq);
         }
     }
 
@@ -469,11 +507,139 @@ static Napi::Value GetEAGAIN(const Napi::CallbackInfo& info) {
     return Napi::Number::New(info.Env(), EAGAIN);
 }
 
+// ---- Mixed-pipeline helpers (JS function stages) ----------------------------
+
+// Create a pipe with FD_CLOEXEC on both ends so it doesn't leak to unintended
+// child processes.  The TS side selectively clears CLOEXEC before forking.
+static Napi::Value CreateCloexecPipe(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    int fds[2];
+    if (pipe(fds) != 0) {
+        Napi::Error::New(env, "pipe() failed").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    Napi::Array arr = Napi::Array::New(env, 2);
+    arr.Set(0u, Napi::Number::New(env, fds[0]));
+    arr.Set(1u, Napi::Number::New(env, fds[1]));
+    return arr;
+}
+
+// Clear FD_CLOEXEC on a specific fd so it survives exec in the next fork.
+static Napi::Value ClearCloexec(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "Expected fd").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int flags = fcntl(fd, F_GETFD);
+    if (flags != -1) fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+    return env.Undefined();
+}
+
+// Fork+exec a single command with the given stdio fds, returning the pid
+// immediately without waiting.  Runs on the calling thread (safe since exec
+// replaces the image before any V8 locking issues can arise in the child).
+static Napi::Value ForkExec(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
+        Napi::TypeError::New(env, "forkExec(cmd, args, stdinFd?, stdoutFd?, stderrFd?, pgid?)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::string cmd = info[0].As<Napi::String>().Utf8Value();
+    Napi::Array jsArgs = info[1].As<Napi::Array>();
+    std::vector<std::string> args;
+    for (uint32_t i = 0; i < jsArgs.Length(); i++)
+        args.push_back(jsArgs.Get(i).As<Napi::String>().Utf8Value());
+
+    int stdinFd  = info.Length() > 2 && info[2].IsNumber() ? info[2].As<Napi::Number>().Int32Value() : -1;
+    int stdoutFd = info.Length() > 3 && info[3].IsNumber() ? info[3].As<Napi::Number>().Int32Value() : -1;
+    int stderrFd = info.Length() > 4 && info[4].IsNumber() ? info[4].As<Napi::Number>().Int32Value() : -1;
+    int pgid     = info.Length() > 5 && info[5].IsNumber() ? info[5].As<Napi::Number>().Int32Value() : 0;
+
+    // Build argv before fork.
+    std::vector<const char*> argv;
+    argv.push_back(cmd.c_str());
+    for (const auto& a : args) argv.push_back(a.c_str());
+    argv.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, pgid);
+
+        sigset_t empty; sigemptyset(&empty);
+        sigprocmask(SIG_SETMASK, &empty, nullptr);
+        struct sigaction sa = {};
+        sa.sa_handler = SIG_DFL; sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT,  &sa, nullptr);
+        sigaction(SIGTTOU, &sa, nullptr);
+        sigaction(SIGTTIN, &sa, nullptr);
+        sigaction(SIGPIPE, &sa, nullptr);
+
+        if (stdinFd  != -1 && stdinFd  != STDIN_FILENO)  dup2(stdinFd,  STDIN_FILENO);
+        if (stdoutFd != -1 && stdoutFd != STDOUT_FILENO) dup2(stdoutFd, STDOUT_FILENO);
+        if (stderrFd != -1 && stderrFd != STDERR_FILENO) dup2(stderrFd, STDERR_FILENO);
+
+        // Clear CLOEXEC on stdio so exec'd command inherits them.
+        for (int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
+            int flags = fcntl(fd, F_GETFD);
+            if (flags != -1 && (flags & FD_CLOEXEC))
+                fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+        }
+
+        execvp(cmd.c_str(), const_cast<char* const*>(argv.data()));
+        writeErr("jsh: "); writeErr(cmd.c_str());
+        writeErr(": "); writeErr(strerror(errno)); writeErr("\n");
+        _exit(127);
+    } else if (pid < 0) {
+        Napi::Error::New(env, std::string("fork: ") + strerror(errno))
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    // Parent: race-free pgid setup.
+    setpgid(pid, pgid == 0 ? pid : pgid);
+    return Napi::Number::New(env, pid);
+}
+
+static Napi::Value WaitForPids(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (!g_executor) {
+        Napi::Error::New(env, "Executor not initialized").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (info.Length() < 1 || !info[0].IsArray()) {
+        Napi::TypeError::New(env, "waitForPids(pids: number[], pgid?: number)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Array jsPids = info[0].As<Napi::Array>();
+    std::vector<pid_t> pids;
+    for (uint32_t i = 0; i < jsPids.Length(); i++)
+        pids.push_back(static_cast<pid_t>(jsPids.Get(i).As<Napi::Number>().Int32Value()));
+
+    int pgid = info.Length() > 1 && info[1].IsNumber()
+                   ? info[1].As<Napi::Number>().Int32Value() : -1;
+
+    auto* ctx = makeCtx(env, false);
+    g_executor->enqueueWait(new WaitRequest { pids, pgid, ctx });
+    return ctx->deferred.Promise();
+}
+
 Napi::Object InitExecutor(Napi::Env env, Napi::Object exports) {
-    exports.Set("initExecutor",   Napi::Function::New(env, InitExecutor_));
-    exports.Set("spawnPipeline",  Napi::Function::New(env, SpawnPipeline));
-    exports.Set("captureOutput",  Napi::Function::New(env, CaptureOutput));
-    exports.Set("EAGAIN",         Napi::Function::New(env, GetEAGAIN));
+    exports.Set("initExecutor",     Napi::Function::New(env, InitExecutor_));
+    exports.Set("spawnPipeline",    Napi::Function::New(env, SpawnPipeline));
+    exports.Set("captureOutput",    Napi::Function::New(env, CaptureOutput));
+    exports.Set("createCloexecPipe",Napi::Function::New(env, CreateCloexecPipe));
+    exports.Set("clearCloexec",     Napi::Function::New(env, ClearCloexec));
+    exports.Set("forkExec",         Napi::Function::New(env, ForkExec));
+    exports.Set("waitForPids",      Napi::Function::New(env, WaitForPids));
+    exports.Set("EAGAIN",           Napi::Function::New(env, GetEAGAIN));
     return exports;
 }
 

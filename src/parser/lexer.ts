@@ -16,6 +16,7 @@ export enum TokenType {
     Redirect = "Redirect", // >, >>, <, etc.
     EOF = "EOF",
     Bang = "Bang",         // !
+    JsInline = "JsInline", // @{ expr } or @!{ expr }
 }
 
 export interface Token {
@@ -23,6 +24,7 @@ export interface Token {
     value: string;
     word?: Word;          // parsed word with segments (for Word tokens)
     fd?: number;          // for redirections: the fd number prefix
+    jsBuffered?: boolean; // for JsInline tokens: true if @!{ }
 }
 
 import { LexerError, IncompleteInputError } from "./errors.js";
@@ -106,6 +108,18 @@ export class Lexer {
 
     private tryOperator(): Token | null {
         const rest = this.input.slice(this.pos);
+
+        // @{ expr } and @!{ expr } — inline JS functions
+        if (rest.startsWith("@!{")) {
+            this.pos += 3;
+            const body = this.readJsExpression();
+            return { type: TokenType.JsInline, value: body, jsBuffered: true };
+        }
+        if (rest.startsWith("@{")) {
+            this.pos += 2;
+            const body = this.readJsExpression();
+            return { type: TokenType.JsInline, value: body, jsBuffered: false };
+        }
 
         // Two-char operators first
         if (rest.startsWith("&&")) {
@@ -767,6 +781,81 @@ export class Lexer {
     peek(): Token {
         return this.tokens[this.tokenIndex] ?? { type: TokenType.EOF, value: "" };
     }
+
+    // ---- JS expression scanner (for @{ } tokens) ---------------------------
+
+    private readJsExpression(): string {
+        let depth = 1;
+        let expr = "";
+
+        while (this.pos < this.input.length) {
+            const ch = this.input[this.pos]!;
+
+            if (ch === "'" || ch === '"') {
+                expr += this.readJsStringLiteral(ch);
+                continue;
+            }
+            if (ch === "`") {
+                expr += this.readJsTemplateLiteral();
+                continue;
+            }
+            if (ch === "{") { depth++; expr += ch; this.pos++; continue; }
+            if (ch === "}") {
+                depth--;
+                if (depth === 0) { this.pos++; return expr; }
+                expr += ch; this.pos++; continue;
+            }
+            expr += ch;
+            this.pos++;
+        }
+
+        throw new IncompleteInputError("Unclosed @{");
+    }
+
+    private readJsStringLiteral(quote: string): string {
+        let result = quote;
+        this.pos++;
+        while (this.pos < this.input.length) {
+            const ch = this.input[this.pos]!;
+            if (ch === "\\") {
+                result += ch + (this.input[this.pos + 1] ?? "");
+                this.pos += 2;
+                continue;
+            }
+            if (ch === quote) { result += ch; this.pos++; return result; }
+            result += ch; this.pos++;
+        }
+        throw new IncompleteInputError("Unclosed JS string in @{");
+    }
+
+    private readJsTemplateLiteral(): string {
+        let result = "`";
+        this.pos++;
+        while (this.pos < this.input.length) {
+            const ch = this.input[this.pos]!;
+            if (ch === "\\") {
+                result += ch + (this.input[this.pos + 1] ?? "");
+                this.pos += 2;
+                continue;
+            }
+            if (ch === "`") { result += ch; this.pos++; return result; }
+            if (ch === "$" && this.input[this.pos + 1] === "{") {
+                result += "${"; this.pos += 2;
+                let depth = 1;
+                while (this.pos < this.input.length && depth > 0) {
+                    const c = this.input[this.pos]!;
+                    if (c === "{") depth++;
+                    else if (c === "}") depth--;
+                    result += c; this.pos++;
+                }
+                continue;
+            }
+            result += ch; this.pos++;
+        }
+        throw new IncompleteInputError("Unclosed template literal in @{");
+    }
+
+    // ---- Public API ---------------------------------------------------------
 
     peekAt(offset: number): Token {
         return this.tokens[this.tokenIndex + offset] ?? { type: TokenType.EOF, value: "" };

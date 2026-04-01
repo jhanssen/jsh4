@@ -128,3 +128,12 @@ export interface FunctionDef extends ASTNode {
     name: string;
     body: ASTNode;
 }
+
+export interface JsFunction extends ASTNode {
+    type: "JsFunction";
+    name: string;           // function name (empty for inline @{ })
+    inlineBody?: string;    // raw JS expression for @{ expr }
+    args: Word[];
+    buffered: boolean;      // true for @! mode
+    redirections: Redirection[];
+}

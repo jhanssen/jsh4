@@ -1,12 +1,18 @@
 import { createRequire } from "node:module";
+import { createInterface } from "node:readline";
+import { createReadStream, createWriteStream, read as fsRead } from "node:fs";
+import { promisify } from "node:util";
+
+const fsReadAsync = promisify(fsRead);
 import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup,
-    IfClause, WhileClause, ForClause, FunctionDef,
+    IfClause, WhileClause, ForClause, FunctionDef, JsFunction,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl } from "../expander/index.js";
 import { $ } from "../variables/index.js";
 import { pushParams, popParams } from "../variables/positional.js";
+import { lookupJsFunction } from "../jsfunctions/index.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
@@ -18,6 +24,11 @@ const native = require("../../build/Release/jsh_native.node") as {
         stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
         pipeOps: string[]
     ) => Promise<{ exitCode: number; output: string }>;
+    createCloexecPipe: () => [number, number];
+    clearCloexec: (fd: number) => void;
+    closeFd: (fd: number) => void;
+    forkExec: (cmd: string, args: string[], stdinFd?: number, stdoutFd?: number, stderrFd?: number, pgid?: number) => number;
+    waitForPids: (pids: number[], pgid?: number) => Promise<number>;
 };
 
 export interface ExecResult {
@@ -53,6 +64,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         case "WhileClause":    return executeWhile(node as WhileClause);
         case "ForClause":      return executeFor(node as ForClause);
         case "FunctionDef":    return executeFunctionDef(node as FunctionDef);
+        case "JsFunction":     return executeJsStage(node as JsFunction, 0, 1);
         default:
             process.stderr.write(`jsh: unimplemented: ${node.type}\n`);
             return { exitCode: 1 };
@@ -139,6 +151,14 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
 }
 
 async function executePipeline(node: Pipeline): Promise<ExecResult> {
+    const hasJs = node.commands.some(c => c.type === "JsFunction");
+    if (hasJs) {
+        let exitCode = await executeMixedPipeline(node);
+        if (node.negated) exitCode = exitCode === 0 ? 1 : 0;
+        return { exitCode };
+    }
+
+    // Pure external pipeline — fast path via native spawnPipeline.
     const stages: Stage[] = [];
     for (const stageNode of node.commands) {
         if (stageNode.type !== "SimpleCommand") {
@@ -152,6 +172,192 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
     let exitCode = await native.spawnPipeline(stages, node.pipeOps);
     if (node.negated) exitCode = exitCode === 0 ? 1 : 0;
     return { exitCode };
+}
+
+// ---- Mixed pipeline (contains JS function stages) --------------------------
+
+async function executeMixedPipeline(node: Pipeline): Promise<number> {
+    const n = node.commands.length;
+
+    // Create cloexec pipes between all adjacent stages.
+    // pipes[i] = [readFd, writeFd] connecting stage i → stage i+1.
+    const pipes: Array<[number, number]> = [];
+    for (let i = 0; i < n - 1; i++) {
+        pipes.push(native.createCloexecPipe());
+    }
+
+    const stdinFd  = (i: number) => i === 0     ? 0 : pipes[i - 1]![0];
+    const stdoutFd = (i: number) => i === n - 1 ? 1 : pipes[i]![1];
+
+    const pids: number[] = [];
+    let pgid = 0;
+
+    // Fork all external stages first so they're running while JS stages process.
+    for (let i = 0; i < n; i++) {
+        const stageNode = node.commands[i]!;
+        if (stageNode.type !== "SimpleCommand") continue;
+
+        const stage = await buildStage(stageNode as SimpleCommand);
+        if (!stage) { process.stderr.write("jsh: empty stage\n"); continue; }
+
+        const sin  = stdinFd(i);
+        const sout = stdoutFd(i);
+
+        // Temporarily clear CLOEXEC on the fds this child will use.
+        if (sin  !== 0) native.clearCloexec(sin);
+        if (sout !== 1) native.clearCloexec(sout);
+
+        const pid = native.forkExec(stage.cmd, stage.args, sin, sout, -1, pgid);
+        if (pgid === 0) pgid = pid;
+        pids.push(pid);
+
+        // Re-seal after fork (parent won't exec, so CLOEXEC doesn't matter
+        // here, but it's tidy).
+        // (No need to re-set CLOEXEC — the parent won't exec these fds.)
+    }
+
+    // Close write ends that external stages are now writing into, and read ends
+    // that external stages are now reading from — the parent doesn't need them.
+    for (let i = 0; i < n - 1; i++) {
+        const [r, w] = pipes[i]!;
+        const prevIsJs = node.commands[i]!.type === "JsFunction";
+        const nextIsJs = node.commands[i + 1]!.type === "JsFunction";
+        // Close the read end if the next stage is external (it dup2'd it).
+        if (!nextIsJs) native.closeFd(r);
+        // Close the write end if the previous stage is external (it dup2'd it).
+        if (!prevIsJs) native.closeFd(w);
+    }
+
+    // Run JS function stages in-process.
+    let lastJsExit = 0;
+    for (let i = 0; i < n; i++) {
+        const stageNode = node.commands[i]!;
+        if (stageNode.type !== "JsFunction") continue;
+        const sin  = stdinFd(i);
+        const sout = stdoutFd(i);
+        lastJsExit = await executeJsStageRaw(stageNode as JsFunction, sin, sout);
+        // Close the write end after the JS function finishes so downstream sees EOF.
+        if (sout !== 1) native.closeFd(sout);
+        if (sin  !== 0) native.closeFd(sin);
+    }
+
+    // Wait for all external processes.
+    const lastExternalExit = pids.length > 0
+        ? await native.waitForPids(pids, pgid)
+        : 0;
+
+    // Use last stage's exit code.
+    const lastStage = node.commands[n - 1]!;
+    return lastStage.type === "JsFunction" ? lastJsExit : lastExternalExit;
+}
+
+// ---- JS stage execution -----------------------------------------------------
+
+async function executeJsStage(node: JsFunction, stdinFd: number, stdoutFd: number): Promise<ExecResult> {
+    const exitCode = await executeJsStageRaw(node, stdinFd, stdoutFd);
+    return { exitCode };
+}
+
+async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: number): Promise<number> {
+    // Resolve the function.
+    let fn: Function;
+    if (node.inlineBody !== undefined) {
+        try {
+            // eslint-disable-next-line no-new-func
+            fn = new Function(`"use strict"; return (${node.inlineBody})`)() as Function;
+        } catch (e) {
+            process.stderr.write(`jsh: @{}: ${e instanceof Error ? e.message : e}\n`);
+            return 1;
+        }
+    } else {
+        const found = lookupJsFunction(node.name);
+        if (!found) {
+            process.stderr.write(`jsh: @${node.name}: function not found\n`);
+            return 1;
+        }
+        fn = found;
+    }
+
+    const args = (await Promise.all(node.args.map(expandWord))).flat();
+
+    // Build stdin iterable — line-by-line reader from a raw fd.
+    const stdinIterable: AsyncIterable<string> | null = stdinFd === 0
+        ? null
+        : fdLineReader(stdinFd);
+
+    // Output writer.
+    const out = stdoutFd === 1
+        ? process.stdout
+        : createWriteStream("", { fd: stdoutFd, autoClose: false });
+
+    const writeOut = (chunk: unknown): void => {
+        if (chunk === null || chunk === undefined) return;
+        if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
+            out.write(chunk);
+        } else {
+            out.write(String(chunk));
+        }
+    };
+
+    try {
+        let result: unknown;
+        if (node.buffered && stdinIterable) {
+            let input = "";
+            for await (const line of stdinIterable) input += line + "\n";
+            result = await Promise.resolve(fn(args, input));
+        } else {
+            result = await Promise.resolve(fn(args, stdinIterable));
+        }
+
+        // Handle return types.
+        if (result === undefined || result === null) {
+            // void — nothing to write
+        } else if (typeof result === "object" && "exitCode" in (result as object)) {
+            return (result as { exitCode: number }).exitCode;
+        } else if (isAsyncGenerator(result) || isGenerator(result)) {
+            for await (const chunk of result as AsyncIterable<unknown>) writeOut(chunk);
+        } else if (Buffer.isBuffer(result) || result instanceof Uint8Array) {
+            out.write(result);
+        } else {
+            writeOut(result);
+        }
+        return 0;
+    } catch (e: unknown) {
+        if (e !== null && e !== undefined) {
+            process.stderr.write(`jsh: @${node.name || "{"}: ${e instanceof Error ? e.message : e}\n`);
+        }
+        return 1;
+    } finally {
+        if (out !== process.stdout) {
+            await new Promise<void>(res => (out as NodeJS.WritableStream).end(res));
+        }
+    }
+}
+
+function isAsyncGenerator(v: unknown): v is AsyncGenerator {
+    return v != null && typeof (v as AsyncGenerator)[Symbol.asyncIterator] === "function";
+}
+function isGenerator(v: unknown): v is Generator {
+    return v != null && typeof (v as Generator)[Symbol.iterator] === "function"
+        && typeof (v as Generator).next === "function";
+}
+
+// Async line reader from a raw file descriptor — avoids stream lifecycle issues.
+async function* fdLineReader(fd: number): AsyncGenerator<string> {
+    const buf = Buffer.alloc(4096);
+    let remainder = "";
+    while (true) {
+        const result = await fsReadAsync(fd, buf, 0, buf.length, null);
+        const bytesRead = typeof result === "number" ? result : (result as { bytesRead: number }).bytesRead;
+        if (bytesRead === 0) {
+            if (remainder) yield remainder;
+            return;
+        }
+        const text = remainder + buf.slice(0, bytesRead).toString("utf8");
+        const lines = text.split("\n");
+        remainder = lines.pop()!;
+        for (const line of lines) yield line + "\n";
+    }
 }
 
 async function executeAndOr(node: AndOr): Promise<ExecResult> {

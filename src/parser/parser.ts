@@ -8,6 +8,7 @@ import type { Token } from "./lexer.js";
 
 export { ParseError, IncompleteInputError } from "./errors.js";
 import { ParseError, IncompleteInputError } from "./errors.js";
+import type { JsFunction } from "./ast.js";
 
 // Keywords that terminate a compound command body.
 const COMPOUND_TERMINATORS = new Set(["then", "elif", "else", "fi", "do", "done", "esac"]);
@@ -165,12 +166,25 @@ export class Parser {
         return { type: "Pipeline", commands, negated, pipeOps } as Pipeline;
     }
 
-    // command : compound_command | simple_command
+    // command : compound_command | simple_command | js_function
     private parseCommand(): ASTNode {
         const tok = this.lexer.peek();
 
         if (tok.type === TokenType.LParen) return this.parseSubshell();
         if (tok.type === TokenType.LBrace) return this.parseBraceGroup();
+
+        // @{ expr } and @!{ expr } inline JS functions
+        if (tok.type === TokenType.JsInline) {
+            this.lexer.next();
+            return {
+                type: "JsFunction",
+                name: "",
+                inlineBody: tok.value,
+                args: [],
+                buffered: tok.jsBuffered ?? false,
+                redirections: this.parseRedirections(),
+            } as JsFunction;
+        }
 
         if (tok.type === TokenType.Word) {
             const kw = this.literalValue(tok);
@@ -185,9 +199,37 @@ export class Parser {
                                this.lexer.peekAt(2).type === TokenType.RParen) {
                 return this.parseFunctionDef(kw);
             }
+
+            // @name and @!name JS function calls
+            if (kw !== null && kw.startsWith("@") && kw.length > 1) {
+                return this.parseJsFunction(kw);
+            }
         }
 
         return this.parseSimpleCommand();
+    }
+
+    private parseJsFunction(nameWithAt: string): JsFunction {
+        this.lexer.next(); // consume @name token
+
+        const buffered = nameWithAt.startsWith("@!");
+        const name = buffered ? nameWithAt.slice(2) : nameWithAt.slice(1);
+
+        const args: Word[] = [];
+        const redirections: Redirection[] = [];
+
+        while (true) {
+            const tok = this.lexer.peek();
+            if (tok.type === TokenType.Redirect) {
+                redirections.push(this.parseOneRedirection());
+                continue;
+            }
+            if (tok.type !== TokenType.Word) break;
+            args.push(tok.word!);
+            this.lexer.next();
+        }
+
+        return { type: "JsFunction", name, args, buffered, redirections };
     }
 
     // if list; then list [elif list; then list]* [else list] fi
