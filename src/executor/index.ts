@@ -447,6 +447,7 @@ async function executeList(node: List): Promise<ExecResult> {
             process.stderr.write("jsh: background jobs not yet implemented\n");
         }
         last = await executeNode(entry.node);
+        $["?"] = last.exitCode;
     }
     return last;
 }

@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
 import { parse, IncompleteInputError } from "../parser/index.js";
 import { execute } from "../executor/index.js";
 import { $ } from "../variables/index.js";
@@ -25,19 +26,24 @@ const EAGAIN = native.EAGAIN();
 export async function startRepl(): Promise<void> {
     native.initExecutor();
 
-    const historyFile = join(String($["HOME"] ?? homedir()), ".jsh_history");
-    native.linenoiseHistorySetMaxLen(1000);
-    native.linenoiseHistoryLoad(historyFile);
-
-    process.on("exit", () => {
-        native.linenoiseHistorySave(historyFile);
-    });
-
     await loadRc();
 
-    native.linenoiseSetCompletion((input: string) => getCompletions(input));
+    if (process.stdin.isTTY) {
+        const historyFile = join(String($["HOME"] ?? homedir()), ".jsh_history");
+        native.linenoiseHistorySetMaxLen(1000);
+        native.linenoiseHistoryLoad(historyFile);
 
-    promptLoop("");
+        process.on("exit", () => {
+            native.linenoiseHistorySave(historyFile);
+        });
+
+        native.linenoiseSetCompletion((input: string) => getCompletions(input));
+
+        promptLoop("");
+    } else {
+        const input = readFileSync(0, "utf8");
+        await executeScript(input);
+    }
 }
 
 async function loadRc(): Promise<void> {
@@ -60,6 +66,17 @@ async function loadRc(): Promise<void> {
         if ((e as NodeJS.ErrnoException)?.code !== "ERR_MODULE_NOT_FOUND") {
             process.stderr.write(`jsh: .jshrc: ${e instanceof Error ? e.message : e}\n`);
         }
+    }
+}
+
+async function executeScript(input: string): Promise<void> {
+    const trimmed = input.trim();
+    if (!trimmed) return;
+    try {
+        const ast = parse(trimmed);
+        if (ast) await execute(ast);
+    } catch (e: unknown) {
+        process.stderr.write(`jsh: ${e instanceof Error ? e.message : String(e)}\n`);
     }
 }
 

@@ -508,6 +508,13 @@ export class Parser {
                 redirections.push(this.parseOneRedirection());
                 continue;
             }
+            // `!` is only special at the start of a pipeline; inside a command's
+            // argument list it is a plain word (e.g. `test ! -f foo`).
+            if (tok.type === TokenType.Bang && seenCommandWord) {
+                words.push({ segments: [{ type: "Literal", value: "!" }] });
+                this.lexer.next();
+                continue;
+            }
             if (tok.type !== TokenType.Word) break;
             if (!seenCommandWord && this.isAssignment(tok)) {
                 assignments.push(this.parseAssignment(tok));
