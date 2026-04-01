@@ -1,0 +1,101 @@
+// Terminal renderer: assembles frames from regions and writes to stdout.
+
+export interface Frame {
+    headerLines: string[];
+    inputLine: string;
+    cursorCol: number;
+    footerLines: string[];
+}
+
+export class Renderer {
+    private lastTotalRows = 0;
+    private lastCursorRow = 0;
+    private writeRaw: (data: string) => void;
+
+    constructor(writeRaw: (data: string) => void) {
+        this.writeRaw = writeRaw;
+    }
+
+    render(frame: Frame): void {
+        const lines = [
+            ...frame.headerLines,
+            frame.inputLine,
+            ...frame.footerLines,
+        ];
+        const totalRows = lines.length;
+        const cursorRow = frame.headerLines.length;
+
+        let buf = "";
+
+        // Begin synchronized rendering.
+        buf += "\x1b[?2026h";
+
+        // Move to top of previous frame.
+        if (this.lastTotalRows > 0 && this.lastCursorRow > 0) {
+            buf += `\x1b[${this.lastCursorRow}A`;
+        }
+        buf += "\r";
+
+        // Write each line, clearing to end of line.
+        for (let i = 0; i < totalRows; i++) {
+            buf += lines[i]! + "\x1b[0K";
+            if (i < totalRows - 1) buf += "\n";
+        }
+
+        // Clear any leftover lines from previous (taller) frame.
+        if (this.lastTotalRows > totalRows) {
+            for (let i = 0; i < this.lastTotalRows - totalRows; i++) {
+                buf += "\n\x1b[0K";
+            }
+            // Move back up to where we should be.
+            const extra = this.lastTotalRows - totalRows;
+            buf += `\x1b[${extra}A`;
+        }
+
+        // Position cursor at the input line.
+        const linesFromBottom = totalRows - 1 - cursorRow;
+        if (linesFromBottom > 0) {
+            buf += `\x1b[${linesFromBottom}A`;
+        }
+        buf += "\r";
+        if (frame.cursorCol > 0) {
+            buf += `\x1b[${frame.cursorCol}C`;
+        }
+
+        // End synchronized rendering.
+        buf += "\x1b[?2026l";
+
+        this.writeRaw(buf);
+
+        this.lastTotalRows = totalRows;
+        this.lastCursorRow = cursorRow;
+    }
+
+    /** Erase the entire frame (for hide / before async output). */
+    clear(): void {
+        if (this.lastTotalRows === 0) return;
+        let buf = "";
+        // Move to top of frame.
+        if (this.lastCursorRow > 0) {
+            buf += `\x1b[${this.lastCursorRow}A`;
+        }
+        buf += "\r";
+        // Clear each line.
+        for (let i = 0; i < this.lastTotalRows; i++) {
+            buf += "\x1b[0K";
+            if (i < this.lastTotalRows - 1) buf += "\n";
+        }
+        // Move back to top.
+        if (this.lastTotalRows > 1) {
+            buf += `\x1b[${this.lastTotalRows - 1}A`;
+        }
+        buf += "\r";
+        this.writeRaw(buf);
+    }
+
+    /** Reset state (after line accepted, before next prompt). */
+    reset(): void {
+        this.lastTotalRows = 0;
+        this.lastCursorRow = 0;
+    }
+}

@@ -2,7 +2,7 @@ export type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List,
     Subshell, BraceGroup, Redirection, Word, WordSegment,
     LiteralSegment, SingleQuotedSegment, DoubleQuotedSegment,
-    VariableExpansion, CommandSubstitution, ArithmeticExpansion, GlobSegment,
+    VariableExpansion, CommandSubstitution, ArithmeticExpansion, GlobSegment, ProcessSubstitution,
     IfClause, WhileClause, ForClause, FunctionDef, JsFunction, CaseClause,
     ConditionalExpr,
 } from "./ast.js";

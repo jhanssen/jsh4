@@ -44,6 +44,12 @@ export interface HereDocSegment {
     quoted: boolean;  // true if delimiter was quoted (no expansion)
 }
 
+export interface ProcessSubstitution {
+    type: "ProcessSubstitution";
+    body: string;     // command string inside <(...) or >(...)
+    direction: "<" | ">";  // < = readable, > = writable
+}
+
 export type WordSegment =
     | LiteralSegment
     | SingleQuotedSegment
@@ -52,7 +58,8 @@ export type WordSegment =
     | CommandSubstitution
     | ArithmeticExpansion
     | GlobSegment
-    | HereDocSegment;
+    | HereDocSegment
+    | ProcessSubstitution;
 
 export interface Word {
     segments: WordSegment[];

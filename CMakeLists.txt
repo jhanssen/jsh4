@@ -19,23 +19,15 @@ execute_process(
 string(REPLACE "\"" "" NODE_ADDON_API_DIR ${NODE_ADDON_API_DIR})
 include_directories(${NODE_ADDON_API_DIR})
 
-# linenoise (compiled as C)
-set(LINENOISE_SRC
-  ${CMAKE_SOURCE_DIR}/3rdparty/linenoise/linenoise.c
-)
-set_source_files_properties(${LINENOISE_SRC} PROPERTIES LANGUAGE C)
-include_directories(${CMAKE_SOURCE_DIR}/3rdparty/linenoise)
-
 # native addon sources
 set(ADDON_SRC
   ${CMAKE_SOURCE_DIR}/src/native/addon.cc
   ${CMAKE_SOURCE_DIR}/src/native/executor.cc
-  ${CMAKE_SOURCE_DIR}/src/native/linenoise.cc
+  ${CMAKE_SOURCE_DIR}/src/native/input-engine.cc
 )
 
 add_library(${PROJECT_NAME} SHARED
   ${ADDON_SRC}
-  ${LINENOISE_SRC}
   ${CMAKE_JS_SRC}
 )
 

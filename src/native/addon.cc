@@ -1,10 +1,10 @@
 #include <napi.h>
 #include "executor.h"
-#include "linenoise.h"
+#include "input-engine.h"
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
     jsh::InitExecutor(env, exports);
-    jsh::InitLinenoise(env, exports);
+    jsh::InitInputEngine(env, exports);
     return exports;
 }
 

@@ -1,5 +1,5 @@
 import type {
-    Word, WordSegment, VariableExpansion, CommandSubstitution,
+    Word, WordSegment, VariableExpansion, CommandSubstitution, ProcessSubstitution,
     LiteralSegment, SingleQuotedSegment, DoubleQuotedSegment,
 } from "../parser/index.js";
 import { $ } from "../variables/index.js";
@@ -12,6 +12,11 @@ import * as os from "node:os";
 type CaptureFunc = (body: string) => Promise<string>;
 let captureImpl: CaptureFunc = async () => "";
 export function registerCaptureImpl(fn: CaptureFunc): void { captureImpl = fn; }
+
+// Registered by the executor for process substitution.
+type ProcessSubstFunc = (body: string, direction: "<" | ">") => string;
+let processSubstImpl: ProcessSubstFunc = () => "/dev/null";
+export function registerProcessSubstImpl(fn: ProcessSubstFunc): void { processSubstImpl = fn; }
 
 // ---- Fragment-based expansion for IFS word splitting ------------------------
 
@@ -165,6 +170,10 @@ async function expandSegmentToFragments(seg: WordSegment, quoted: boolean): Prom
             return [{ type: "literal", text: seg.pattern }];
         case "HereDoc":
             return [{ type: "literal", text: seg.body }];
+        case "ProcessSubstitution": {
+            const text = processSubstImpl((seg as ProcessSubstitution).body, (seg as ProcessSubstitution).direction);
+            return [{ type: "literal", text }];
+        }
         default:
             return [];
     }
@@ -386,6 +395,7 @@ async function expandSegment(seg: WordSegment): Promise<string> {
         case "ArithmeticExpansion": return evalArithmetic(seg.expression);
         case "Glob":          return seg.pattern; // raw chars, assembled before glob expand
         case "HereDoc":       return seg.body;    // body already collected; expand later
+        case "ProcessSubstitution": return processSubstImpl((seg as ProcessSubstitution).body, (seg as ProcessSubstitution).direction);
         default:              return "";
     }
 }

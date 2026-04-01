@@ -254,6 +254,12 @@ export class Lexer {
             return null;
         }
 
+        // Process substitution <(...) or >(...) — not a redirect.
+        if (fd === undefined && this.pos + 1 < this.input.length && this.input[this.pos + 1] === "(") {
+            this.pos = startPos;
+            return null;
+        }
+
         let op = ch;
         this.pos++;
 
@@ -309,6 +315,12 @@ export class Lexer {
             // Break on whitespace or operator chars
             if (ch === " " || ch === "\t" || ch === "\n") break;
             if (ch === "|" || ch === "&" || ch === ";" || ch === "(" || ch === ")") break;
+
+            // Process substitution: <(...) or >(...)
+            if ((ch === "<" || ch === ">") && this.pos + 1 < this.input.length && this.input[this.pos + 1] === "(") {
+                segments.push(this.readProcessSubstitution(ch as "<" | ">"));
+                continue;
+            }
 
             // Break on redirect operators (but not if we're mid-word and it's not a digit>)
             if ((ch === ">" || ch === "<") && segments.length === 0 && startPos === this.pos) break;
@@ -764,6 +776,23 @@ export class Lexer {
         }
 
         throw new IncompleteInputError("Unclosed backtick");
+    }
+
+    private readProcessSubstitution(direction: "<" | ">"): WordSegment {
+        this.pos += 2; // skip <( or >(
+        let body = "";
+        let depth = 1;
+        while (this.pos < this.input.length && depth > 0) {
+            if (this.input[this.pos] === "(") depth++;
+            else if (this.input[this.pos] === ")") {
+                depth--;
+                if (depth === 0) { this.pos++; break; }
+            }
+            body += this.input[this.pos];
+            this.pos++;
+        }
+        if (depth > 0) throw new IncompleteInputError("Unclosed process substitution");
+        return { type: "ProcessSubstitution", body, direction };
     }
 
     private readAnsiCQuoted(): WordSegment {

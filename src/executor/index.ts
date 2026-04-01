@@ -11,7 +11,7 @@ import type {
     ConditionalExpr,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
-import { expandWord, expandWordToStr, registerCaptureImpl } from "../expander/index.js";
+import { expandWord, expandWordToStr, registerCaptureImpl, registerProcessSubstImpl } from "../expander/index.js";
 import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot } from "../variables/index.js";
 import { pushParams, popParams, shiftParams, snapshotParams, restoreParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
@@ -95,9 +95,53 @@ registerCaptureImpl(async (body: string): Promise<string> => {
     return result.replace(/\n+$/, "");
 });
 
+// Track fds opened by process substitution for cleanup after command execution.
+const processSubstFds: number[] = [];
+
+// Register process substitution handler with the expander.
+registerProcessSubstImpl((body: string, direction: "<" | ">"): string => {
+    const [readFd, writeFd] = native.createCloexecPipe();
+    if (direction === "<") {
+        // <(cmd): command writes to pipe, caller reads from pipe.
+        // Fork command with stdout → writeFd.
+        const ast = parse(body.trim());
+        if (ast && ast.type === "SimpleCommand") {
+            // Use forkExec for simple commands.
+            const sc = ast as SimpleCommand;
+            const words = sc.words.map(w => w.segments.map(s => "value" in s ? (s as { value: string }).value : "").join("")).filter(Boolean);
+            if (words.length > 0) {
+                native.forkExec(words[0]!, words.slice(1), -1, writeFd, -1, 0);
+            }
+        }
+        native.closeFd(writeFd);
+        native.clearCloexec(readFd);
+        processSubstFds.push(readFd);
+        return `/dev/fd/${readFd}`;
+    } else {
+        // >(cmd): caller writes to pipe, command reads from pipe.
+        const ast = parse(body.trim());
+        if (ast && ast.type === "SimpleCommand") {
+            const sc = ast as SimpleCommand;
+            const words = sc.words.map(w => w.segments.map(s => "value" in s ? (s as { value: string }).value : "").join("")).filter(Boolean);
+            if (words.length > 0) {
+                native.forkExec(words[0]!, words.slice(1), readFd, -1, -1, 0);
+            }
+        }
+        native.closeFd(readFd);
+        native.clearCloexec(writeFd);
+        processSubstFds.push(writeFd);
+        return `/dev/fd/${writeFd}`;
+    }
+});
+
 export async function execute(node: ASTNode): Promise<ExecResult> {
     const result = await executeNode(node);
     $["?"] = result.exitCode;
+    // Clean up process substitution fds.
+    for (const fd of processSubstFds) {
+        try { native.closeFd(fd); } catch {}
+    }
+    processSubstFds.length = 0;
     return result;
 }
 
@@ -161,7 +205,7 @@ async function withRedirections(redirs: Redirection[], body: () => Promise<ExecR
             if (isHereDoc) {
                 // Here-doc: create a pipe, write body into it, redirect stdin from it.
                 const hd = seg as { type: "HereDoc"; body: string; quoted: boolean };
-                const bodyText = hd.quoted ? hd.body : expandHereDocVars(hd.body);
+                const bodyText = hd.quoted ? hd.body : await expandHereDocBody(hd.body);
                 const [readEnd, writeEnd] = native.createCloexecPipe();
                 native.clearCloexec(readEnd);
                 native.clearCloexec(writeEnd);
@@ -283,7 +327,7 @@ async function buildStage(cmd: SimpleCommand): Promise<Stage | null> {
         if (isHereDoc) {
             const hd = seg as { type: "HereDoc"; body: string; quoted: boolean };
             // Expand $VAR in non-quoted here-docs.
-            const body = hd.quoted ? hd.body : expandHereDocVars(hd.body);
+            const body = hd.quoted ? hd.body : await expandHereDocBody(hd.body);
             return { op: r.op, fd: r.fd ?? -1, target: body, isHereDoc: true };
         }
         return { op: r.op, fd: r.fd ?? -1, target: await expandWordToStr(r.target), isHereDoc: false };
@@ -908,6 +952,106 @@ function executeFunctionDef(node: FunctionDef): ExecResult {
     return { exitCode: 0 };
 }
 
+async function expandHereDocBody(body: string): Promise<string> {
+    let result = "";
+    let i = 0;
+    while (i < body.length) {
+        if (body[i] === "\\") {
+            // Backslash escapes $ in here-docs
+            if (i + 1 < body.length && body[i + 1] === "$") {
+                result += "$";
+                i += 2;
+                continue;
+            }
+            result += body[i];
+            i++;
+            continue;
+        }
+        if (body[i] === "$") {
+            // $((...)) arithmetic expansion
+            if (i + 2 < body.length && body[i + 1] === "(" && body[i + 2] === "(") {
+                const start = i + 3;
+                let depth = 2;
+                let j = start;
+                while (j < body.length && depth > 0) {
+                    if (body[j] === "(") depth++;
+                    else if (body[j] === ")") depth--;
+                    if (depth > 0) j++;
+                }
+                if (depth === 0) {
+                    const expr = body.slice(start, j - 1);
+                    let evalResult: string;
+                    try {
+                        let e = expr.replace(/\$([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name: string) =>
+                            String($[name] ?? 0));
+                        e = e.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_, name: string) =>
+                            String($[name] ?? 0));
+                        const r = new Function(`"use strict"; return (${e})`)();
+                        evalResult = String(Math.trunc(typeof r === "number" ? r : Number(r)));
+                    } catch { evalResult = "0"; }
+                    result += evalResult;
+                    i = j + 1;
+                    continue;
+                }
+            }
+            // $(...) command substitution
+            if (i + 1 < body.length && body[i + 1] === "(") {
+                const start = i + 2;
+                let depth = 1;
+                let j = start;
+                while (j < body.length && depth > 0) {
+                    if (body[j] === "(") depth++;
+                    else if (body[j] === ")") depth--;
+                    j++;
+                }
+                const cmd = body.slice(start, j - 1);
+                const ast = parse(cmd);
+                if (ast) {
+                    const captured = await captureAst(ast);
+                    result += captured.replace(/\n+$/, "");
+                }
+                i = j;
+                continue;
+            }
+            // ${VAR} or $VAR
+            if (body[i + 1] === "{") {
+                const end = body.indexOf("}", i + 2);
+                if (end !== -1) {
+                    const name = body.slice(i + 2, end);
+                    const val = $[name];
+                    result += val !== undefined ? String(val) : "";
+                    i = end + 1;
+                    continue;
+                }
+            }
+            // $VAR
+            let name = "";
+            let j = i + 1;
+            while (j < body.length && /[a-zA-Z0-9_]/.test(body[j]!)) {
+                name += body[j]; j++;
+            }
+            if (name) {
+                // Handle special vars
+                if (name === "?") {
+                    result += String($["?"] ?? 0);
+                } else {
+                    const val = $[name];
+                    result += val !== undefined ? String(val) : "";
+                }
+                i = j;
+                continue;
+            }
+            result += body[i];
+            i++;
+            continue;
+        }
+        result += body[i];
+        i++;
+    }
+    return result;
+}
+
+// Legacy sync version for simple cases (kept for backward compat in withRedirections)
 function expandHereDocVars(body: string): string {
     return body.replace(/\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}|\$([a-zA-Z_][a-zA-Z0-9_]*)/g,
         (_, braced, bare) => {
