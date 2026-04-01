@@ -1,7 +1,7 @@
 import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List,
     Subshell, BraceGroup, Redirection, Word, WordSegment,
-    IfClause, WhileClause, ForClause, FunctionDef,
+    IfClause, WhileClause, ForClause, FunctionDef, CaseClause, CaseItem,
 } from "./ast.js";
 import { Lexer, TokenType } from "./lexer.js";
 import type { Token } from "./lexer.js";
@@ -11,7 +11,7 @@ import { ParseError, IncompleteInputError } from "./errors.js";
 import type { JsFunction } from "./ast.js";
 
 // Keywords that terminate a compound command body.
-const COMPOUND_TERMINATORS = new Set(["then", "elif", "else", "fi", "do", "done", "esac"]);
+const COMPOUND_TERMINATORS = new Set(["then", "elif", "else", "fi", "do", "done", "esac", "in"]);
 
 export class Parser {
     private lexer: Lexer;
@@ -48,7 +48,9 @@ export class Parser {
     }
 
     private isCompoundTerminator(): boolean {
-        const v = this.literalValue(this.lexer.peek());
+        const tok = this.lexer.peek();
+        if (tok.type === TokenType.CaseSemi) return true;
+        const v = this.literalValue(tok);
         return v !== null && COMPOUND_TERMINATORS.has(v);
     }
 
@@ -193,6 +195,7 @@ export class Parser {
             if (kw === "while") return this.parseWhile(false);
             if (kw === "until") return this.parseWhile(true);
             if (kw === "for")   return this.parseFor();
+            if (kw === "case")  return this.parseCase();
 
             // Function definition: NAME ( )
             if (kw !== null && this.lexer.peekAt(1).type === TokenType.LParen &&
@@ -366,6 +369,79 @@ export class Parser {
         return { type: "ForClause", name, items, body };
     }
 
+    // case word in [pattern) list ;;]* esac
+    private parseCase(): CaseClause {
+        this.lexer.next(); // consume 'case'
+        this.skipNewlines();
+
+        const wordTok = this.lexer.peek();
+        if (wordTok.type !== TokenType.Word) {
+            throw new ParseError("Expected word after 'case'");
+        }
+        const word = wordTok.word!;
+        this.lexer.next();
+
+        this.skipNewlines();
+        this.expectKeyword("in");
+        this.skipNewlines();
+
+        const items: CaseItem[] = [];
+
+        while (true) {
+            // Check for esac
+            if (this.literalValue(this.lexer.peek()) === "esac") {
+                this.lexer.next();
+                break;
+            }
+            if (this.lexer.peek().type === TokenType.EOF) {
+                throw new IncompleteInputError("Expected 'esac'");
+            }
+
+            // Optional leading (
+            if (this.lexer.peek().type === TokenType.LParen) this.lexer.next();
+
+            // Pattern list: word | word | ...
+            const patterns: Word[] = [];
+            while (true) {
+                const tok = this.lexer.peek();
+                if (tok.type !== TokenType.Word) break;
+                patterns.push(tok.word!);
+                this.lexer.next();
+                if (this.lexer.peek().type === TokenType.Pipe) {
+                    this.lexer.next(); // consume |
+                    this.skipNewlines();
+                } else {
+                    break;
+                }
+            }
+
+            // )
+            if (this.lexer.peek().type !== TokenType.RParen) {
+                throw new ParseError("Expected ')' in case pattern");
+            }
+            this.lexer.next();
+            this.skipNewlines();
+
+            // Body (may be empty before ;;)
+            let body: ASTNode | null = null;
+            if (this.lexer.peek().type !== TokenType.CaseSemi &&
+                this.literalValue(this.lexer.peek()) !== "esac") {
+                body = this.parseList();
+                this.skipNewlines();
+            }
+
+            // ;; or esac
+            if (this.lexer.peek().type === TokenType.CaseSemi) {
+                this.lexer.next();
+                this.skipNewlines();
+            }
+
+            items.push({ patterns, body });
+        }
+
+        return { type: "CaseClause", word, items };
+    }
+
     // name() compound-command
     private parseFunctionDef(name: string): FunctionDef {
         this.lexer.next(); // consume name
@@ -465,6 +541,22 @@ export class Parser {
 
     private parseOneRedirection(): Redirection {
         const tok = this.lexer.next();
+
+        // Here-doc: body is embedded in the token.
+        if (tok.hereDoc) {
+            const { body, quoted } = tok.hereDoc;
+            const word: Word = { segments: [{ type: "HereDoc", body, quoted }] };
+            return { op: tok.value, fd: tok.fd, target: word };
+        }
+
+        // Here-string <<<
+        if (tok.value === "<<<") {
+            const target = this.lexer.peek();
+            if (target.type !== TokenType.Word) throw new ParseError("Expected word after <<<");
+            this.lexer.next();
+            return { op: tok.value, fd: tok.fd, target: target.word! };
+        }
+
         const target = this.lexer.peek();
         if (target.type !== TokenType.Word) {
             throw new ParseError(`Expected redirection target after ${tok.value}`);

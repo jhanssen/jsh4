@@ -37,6 +37,12 @@ export interface GlobSegment {
     pattern: string;  // *, ?, or [...] content
 }
 
+export interface HereDocSegment {
+    type: "HereDoc";
+    body: string;     // literal body of the here-doc (already collected)
+    quoted: boolean;  // true if delimiter was quoted (no expansion)
+}
+
 export type WordSegment =
     | LiteralSegment
     | SingleQuotedSegment
@@ -44,7 +50,8 @@ export type WordSegment =
     | VariableExpansion
     | CommandSubstitution
     | ArithmeticExpansion
-    | GlobSegment;
+    | GlobSegment
+    | HereDocSegment;
 
 export interface Word {
     segments: WordSegment[];
@@ -127,6 +134,17 @@ export interface FunctionDef extends ASTNode {
     type: "FunctionDef";
     name: string;
     body: ASTNode;
+}
+
+export interface CaseItem {
+    patterns: Word[];
+    body: ASTNode | null; // null for empty body (;;)
+}
+
+export interface CaseClause extends ASTNode {
+    type: "CaseClause";
+    word: Word;
+    items: CaseItem[];
 }
 
 export interface JsFunction extends ASTNode {

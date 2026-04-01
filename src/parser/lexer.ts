@@ -17,6 +17,7 @@ export enum TokenType {
     EOF = "EOF",
     Bang = "Bang",         // !
     JsInline = "JsInline", // @{ expr } or @!{ expr }
+    CaseSemi = "CaseSemi", // ;;
 }
 
 export interface Token {
@@ -25,6 +26,7 @@ export interface Token {
     word?: Word;          // parsed word with segments (for Word tokens)
     fd?: number;          // for redirections: the fd number prefix
     jsBuffered?: boolean; // for JsInline tokens: true if @!{ }
+    hereDoc?: { delim: string; body: string; quoted: boolean }; // for << tokens
 }
 
 import { LexerError, IncompleteInputError } from "./errors.js";
@@ -35,6 +37,8 @@ export class Lexer {
     private pos: number;
     private tokens: Token[] = [];
     private tokenIndex: number = 0;
+    // Pending here-doc tokens awaiting body scan after end of current line.
+    private pendingHereDocs: Array<{ token: Token; delim: string; quoted: boolean; stripTabs: boolean }> = [];
 
     constructor(input: string) {
         this.input = input;
@@ -55,10 +59,17 @@ export class Lexer {
                 continue;
             }
 
-            // Newline
+            // Newline — process any pending here-doc bodies first.
             if (ch === "\n") {
-                this.tokens.push({ type: TokenType.Newline, value: "\n" });
                 this.pos++;
+                if (this.pendingHereDocs.length > 0) {
+                    for (const hd of this.pendingHereDocs) {
+                        const body = this.readHeredocBodyAtPos(hd.delim, hd.quoted, hd.stripTabs);
+                        hd.token.hereDoc = { delim: hd.delim, body, quoted: hd.quoted };
+                    }
+                    this.pendingHereDocs = [];
+                }
+                this.tokens.push({ type: TokenType.Newline, value: "\n" });
                 continue;
             }
 
@@ -84,6 +95,13 @@ export class Lexer {
             }
 
             throw new LexerError(`Unexpected character: ${ch}`, this.pos);
+        }
+
+        // Unterminated here-doc — need more input.
+        if (this.pendingHereDocs.length > 0) {
+            throw new IncompleteInputError(
+                `Unclosed here-doc (<<${this.pendingHereDocs[0]!.delim})`
+            );
         }
 
         this.tokens.push({ type: TokenType.EOF, value: "" });
@@ -119,6 +137,12 @@ export class Lexer {
             this.pos += 2;
             const body = this.readJsExpression();
             return { type: TokenType.JsInline, value: body, jsBuffered: false };
+        }
+
+        // ;; case terminator (must come before single ;)
+        if (rest.startsWith(";;")) {
+            this.pos += 2;
+            return { type: TokenType.CaseSemi, value: ";;" };
         }
 
         // Two-char operators first
@@ -228,9 +252,31 @@ export class Lexer {
                 }
             }
         } else if (ch === "<") {
-            if (this.pos < this.input.length && this.input[this.pos] === "&") {
-                op = "<&";
-                this.pos++;
+            if (this.pos < this.input.length) {
+                if (this.input[this.pos] === "&") {
+                    op = "<&";
+                    this.pos++;
+                } else if (this.input[this.pos] === "<") {
+                    this.pos++;
+                    if (this.pos < this.input.length && this.input[this.pos] === "<") {
+                        // <<<  here-string
+                        op = "<<<";
+                        this.pos++;
+                    } else {
+                        // << here-doc — read delimiter, defer body scan to after newline.
+                        const stripTabs = this.pos < this.input.length && this.input[this.pos] === "-";
+                        if (stripTabs) this.pos++;
+                        op = stripTabs ? "<<-" : "<<";
+
+                        while (this.pos < this.input.length && this.input[this.pos] === " ") this.pos++;
+
+                        const { delim, quoted } = this.readHeredocDelim();
+                        // Create token with empty body; body is filled after line ends.
+                        const tok: Token = { type: TokenType.Redirect, value: op, fd, hereDoc: { delim, body: "", quoted } };
+                        this.pendingHereDocs.push({ token: tok, delim, quoted, stripTabs });
+                        return tok;
+                    }
+                }
             }
         }
 
@@ -780,6 +826,52 @@ export class Lexer {
 
     peek(): Token {
         return this.tokens[this.tokenIndex] ?? { type: TokenType.EOF, value: "" };
+    }
+
+    // ---- Here-doc scanner ---------------------------------------------------
+
+    private readHeredocDelim(): { delim: string; quoted: boolean } {
+        let delim = "";
+        let quoted = false;
+
+        if (this.pos < this.input.length) {
+            const q = this.input[this.pos]!;
+            if (q === "'" || q === '"') {
+                quoted = true;
+                this.pos++;
+                while (this.pos < this.input.length && this.input[this.pos] !== q) {
+                    delim += this.input[this.pos++];
+                }
+                if (this.pos < this.input.length) this.pos++; // closing quote
+            } else {
+                while (this.pos < this.input.length) {
+                    const c = this.input[this.pos]!;
+                    if (c === "\n" || c === " " || c === "\t" || c === ";" || c === "|" || c === "&") break;
+                    delim += c;
+                    this.pos++;
+                }
+            }
+        }
+
+        return { delim, quoted };
+    }
+
+    // Reads here-doc body starting at current this.pos (called after newline consumed).
+    private readHeredocBodyAtPos(delim: string, _quoted: boolean, stripTabs: boolean): string {
+        const lines: string[] = [];
+        while (this.pos < this.input.length) {
+            const lineStart = this.pos;
+            while (this.pos < this.input.length && this.input[this.pos] !== "\n") this.pos++;
+            const line = this.input.slice(lineStart, this.pos);
+            if (this.pos < this.input.length) this.pos++; // consume \n
+
+            const checkLine = stripTabs ? line.replace(/^\t+/, "") : line;
+            if (checkLine === delim) {
+                return lines.join("\n") + (lines.length > 0 ? "\n" : "");
+            }
+            lines.push(stripTabs ? line.replace(/^\t+/, "") : line);
+        }
+        throw new IncompleteInputError(`Unclosed here-doc (<<${delim})`);
     }
 
     // ---- JS expression scanner (for @{ } tokens) ---------------------------

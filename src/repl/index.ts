@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { parse, IncompleteInputError } from "../parser/index.js";
 import { execute } from "../executor/index.js";
 import { $ } from "../variables/index.js";
-import { getPrompt, setPrompt, alias, unalias, registerJsFunction, exec } from "../api/index.js";
+import { getPrompt, setPrompt, alias, unalias, registerJsFunction, exec, registerCompletion } from "../api/index.js";
+import { getCompletions } from "../completion/index.js";
 import type { JsPipelineFunction } from "../jsfunctions/index.js";
 
 const require = createRequire(import.meta.url);
@@ -15,6 +16,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     linenoiseHistorySetMaxLen: (len: number) => void;
     linenoiseHistorySave: (path: string) => number;
     linenoiseHistoryLoad: (path: string) => number;
+    linenoiseSetCompletion: (cb: (input: string) => string[]) => void;
     EAGAIN: () => number;
 };
 
@@ -32,6 +34,9 @@ export async function startRepl(): Promise<void> {
     });
 
     await loadRc();
+
+    native.linenoiseSetCompletion((input: string) => getCompletions(input));
+
     promptLoop("");
 }
 
@@ -39,7 +44,7 @@ async function loadRc(): Promise<void> {
     const rcPath = join(String($["HOME"] ?? homedir()), ".jshrc");
 
     // Expose the jsh API as a single global object.
-    const jshApi = { $, setPrompt, alias, unalias, registerJsFunction, exec };
+    const jshApi = { $, setPrompt, alias, unalias, registerJsFunction, exec, complete: registerCompletion };
     (globalThis as Record<string, unknown>)["jsh"] = jshApi;
 
     try {

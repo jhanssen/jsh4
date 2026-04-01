@@ -1,0 +1,161 @@
+import { readdirSync, statSync } from "node:fs";
+import { join, dirname, basename } from "node:path";
+import { homedir } from "node:os";
+import { $ } from "../variables/index.js";
+import { getAlias } from "../api/index.js";
+import { listJsFunctions } from "../jsfunctions/index.js";
+
+// ---- User-defined completion handlers ---------------------------------------
+
+type CompletionCtx = { words: string[]; current: string };
+type CompletionFn = (ctx: CompletionCtx) => string[];
+
+const handlers = new Map<string, CompletionFn>();
+
+export function registerCompletion(cmd: string, fn: CompletionFn): void {
+    handlers.set(cmd, fn);
+}
+
+// ---- Built-in completions ---------------------------------------------------
+
+const BUILTINS = [
+    "cd", "exit", "export", "unset", "source", "eval", "exec",
+    "jobs", "fg", "bg", "alias", "unalias", "set", "shift",
+    "read", "echo", "printf", "test", "true", "false", "type",
+];
+
+// Cached PATH command list — rebuilt when PATH changes.
+let pathCache: string[] | null = null;
+let lastPath: string | undefined;
+
+function getPathCommands(): string[] {
+    const path = String($["PATH"] ?? process.env["PATH"] ?? "");
+    if (pathCache && lastPath === path) return pathCache;
+    lastPath = path;
+    const cmds = new Set<string>();
+    for (const dir of path.split(":")) {
+        try {
+            for (const f of readdirSync(dir)) cmds.add(f);
+        } catch { /* skip unreadable dirs */ }
+    }
+    pathCache = [...cmds].sort();
+    return pathCache;
+}
+
+function expandTilde(s: string): string {
+    if (s === "~" || s.startsWith("~/")) {
+        return String($["HOME"] ?? homedir()) + s.slice(1);
+    }
+    return s;
+}
+
+function completeFile(prefix: string): string[] {
+    const expanded = expandTilde(prefix);
+    let dir: string, base: string;
+    if (expanded.endsWith("/")) {
+        // Trailing slash — list contents of that directory.
+        dir  = expanded.slice(0, -1) || "/";
+        base = "";
+    } else if (expanded.includes("/")) {
+        dir  = dirname(expanded) || "/";
+        base = basename(expanded);
+    } else {
+        dir  = ".";
+        base = expanded;
+    }
+    const hasSlash = expanded.includes("/");
+    const showDotFiles = base.startsWith(".");
+
+    try {
+        const entries = readdirSync(dir);
+        return entries
+            .filter(e => e.startsWith(base) && (showDotFiles || !e.startsWith(".")))
+            .map(e => {
+                const full = dir === "." ? e : join(dir, e);
+                try {
+                    const isDir = statSync(full).isDirectory();
+                    const result = expanded.endsWith("/")
+                        ? prefix + e                    // trailing slash: keep full prefix
+                        : hasSlash
+                        ? join(dirname(prefix), e)      // has slash but no trailing
+                        : e;
+                    return isDir ? result + "/" : result;
+                } catch {
+                    return expanded.endsWith("/") ? prefix + e
+                         : hasSlash ? join(dirname(prefix), e) : e;
+                }
+            })
+            .sort();
+    } catch { return []; }
+}
+
+function completeCommand(prefix: string): string[] {
+    const candidates = [
+        ...BUILTINS,
+        ...getPathCommands(),
+        ...listJsFunctions().map(f => "@" + f),
+        ...[...handlers.keys()],
+    ];
+    // Include aliases too.
+    // (aliasMap is private; getAlias checks one at a time — skip for perf)
+
+    return [...new Set(candidates)]
+        .filter(c => c.startsWith(prefix))
+        .sort();
+}
+
+// ---- Main completion entry point --------------------------------------------
+
+// Splits the input into words, handling simple quoting.
+function splitWords(input: string): string[] {
+    const words: string[] = [];
+    let current = "";
+    let inSingle = false;
+    let inDouble = false;
+
+    for (const ch of input) {
+        if (ch === "'" && !inDouble) { inSingle = !inSingle; continue; }
+        if (ch === '"' && !inSingle) { inDouble = !inDouble; continue; }
+        if ((ch === " " || ch === "\t") && !inSingle && !inDouble) {
+            if (current) { words.push(current); current = ""; }
+            continue;
+        }
+        current += ch;
+    }
+    if (current || input.endsWith(" ") || input.endsWith("\t")) words.push(current);
+    return words;
+}
+
+export function getCompletions(input: string): string[] {
+    const words = splitWords(input);
+    const isFirstWord = words.length === 0 || (words.length === 1 && !input.endsWith(" ") && !input.endsWith("\t"));
+    const current = isFirstWord ? (words[0] ?? "") : (input.endsWith(" ") || input.endsWith("\t") ? "" : (words[words.length - 1] ?? ""));
+
+    // Prefix of the input before the current word.
+    const prefixLen = input.length - current.length;
+    const inputPrefix = input.slice(0, prefixLen);
+
+    let candidates: string[];
+
+    if (isFirstWord) {
+        // Complete as a command name.
+        if (current.startsWith("@")) {
+            candidates = listJsFunctions()
+                .map(f => "@" + f)
+                .filter(f => f.startsWith(current));
+        } else {
+            candidates = completeCommand(current);
+        }
+    } else {
+        const cmd = words[0] ?? "";
+        const handler = handlers.get(cmd);
+        if (handler) {
+            candidates = handler({ words, current });
+        } else {
+            // Default: file completion.
+            candidates = completeFile(current);
+        }
+    }
+
+    return candidates.map(c => inputPrefix + c);
+}

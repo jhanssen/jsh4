@@ -3,7 +3,7 @@ export type {
     Subshell, BraceGroup, Redirection, Word, WordSegment,
     LiteralSegment, SingleQuotedSegment, DoubleQuotedSegment,
     VariableExpansion, CommandSubstitution, ArithmeticExpansion, GlobSegment,
-    IfClause, WhileClause, ForClause, FunctionDef, JsFunction,
+    IfClause, WhileClause, ForClause, FunctionDef, JsFunction, CaseClause,
 } from "./ast.js";
 
 export { Lexer, TokenType, LexerError } from "./lexer.js";

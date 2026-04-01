@@ -43,7 +43,8 @@ static void OnSpawnDone(Napi::Env env, Napi::Function, SpawnCtx* ctx) {
 struct RedirSpec {
     std::string op;
     int fd = -1;        // explicit fd prefix (-1 = use default)
-    std::string target; // filename or fd number as string
+    std::string target; // filename, fd number as string, or here-doc body
+    bool isHereDoc = false;
 };
 
 struct StageSpec {
@@ -68,6 +69,24 @@ static void writeErr(const char* s) {
 
 // Apply a list of redirections in the child after pipe fds are set up.
 // Returns false and writes to stderr if a file cannot be opened.
+// Write here-doc body to a pipe and return the read end; caller must close it.
+// Returns -1 on failure.
+static int makeHereDocPipe(const std::string& body) {
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    // Write body to write end — if body is larger than PIPE_BUF this could
+    // block, but here-docs in practice are small.
+    const char* p = body.c_str();
+    size_t left = body.size();
+    while (left > 0) {
+        ssize_t n = write(fds[1], p, left);
+        if (n <= 0) break;
+        p += n; left -= static_cast<size_t>(n);
+    }
+    close(fds[1]);
+    return fds[0];
+}
+
 static bool applyRedirections(const std::vector<RedirSpec>& redirs) {
     for (const auto& r : redirs) {
         const std::string& op = r.op;
@@ -90,6 +109,29 @@ static bool applyRedirections(const std::vector<RedirSpec>& redirs) {
                 dup2(newfd, STDERR_FILENO);
             }
             close(newfd);
+
+        } else if (op == "<<" || op == "<<-") {
+            // Here-doc: body is in target, create a pipe.
+            int readFd = makeHereDocPipe(r.target);
+            if (readFd < 0) {
+                writeErr("jsh: here-doc pipe failed\n");
+                return false;
+            }
+            int dst = (r.fd >= 0) ? r.fd : STDIN_FILENO;
+            dup2(readFd, dst);
+            close(readFd);
+
+        } else if (op == "<<<") {
+            // Here-string: body is in target + newline.
+            std::string body = r.target + "\n";
+            int readFd = makeHereDocPipe(body);
+            if (readFd < 0) {
+                writeErr("jsh: here-string pipe failed\n");
+                return false;
+            }
+            int dst = (r.fd >= 0) ? r.fd : STDIN_FILENO;
+            dup2(readFd, dst);
+            close(readFd);
 
         } else if (op == "<") {
             int newfd = open(r.target.c_str(), O_RDONLY);
@@ -442,10 +484,12 @@ static bool parseStages(Napi::Env env, Napi::Array jsStages, Napi::Array jsPipeO
         for (uint32_t j = 0; j < jsRedirs.Length(); j++) {
             Napi::Object r = jsRedirs.Get(j).As<Napi::Object>();
             RedirSpec redir;
-            redir.op     = r.Get("op").As<Napi::String>().Utf8Value();
+            redir.op       = r.Get("op").As<Napi::String>().Utf8Value();
             Napi::Value fdVal = r.Get("fd");
-            redir.fd     = fdVal.IsNumber() ? fdVal.As<Napi::Number>().Int32Value() : -1;
-            redir.target = r.Get("target").As<Napi::String>().Utf8Value();
+            redir.fd       = fdVal.IsNumber() ? fdVal.As<Napi::Number>().Int32Value() : -1;
+            redir.target   = r.Get("target").As<Napi::String>().Utf8Value();
+            Napi::Value hdVal = r.Get("isHereDoc");
+            redir.isHereDoc = hdVal.IsBoolean() && hdVal.As<Napi::Boolean>().Value();
             stage.redirs.push_back(std::move(redir));
         }
         stages.push_back(std::move(stage));

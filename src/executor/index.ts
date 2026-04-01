@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 const fsReadAsync = promisify(fsRead);
 import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup,
-    IfClause, WhileClause, ForClause, FunctionDef, JsFunction,
+    IfClause, WhileClause, ForClause, FunctionDef, JsFunction, CaseClause,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl } from "../expander/index.js";
@@ -85,6 +85,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         case "WhileClause":    return executeWhile(node as WhileClause);
         case "ForClause":      return executeFor(node as ForClause);
         case "FunctionDef":    return executeFunctionDef(node as FunctionDef);
+        case "CaseClause":     return executeCase(node as CaseClause);
         case "JsFunction":     return executeJsStage(node as JsFunction, 0, 1);
         default:
             process.stderr.write(`jsh: unimplemented: ${node.type}\n`);
@@ -94,7 +95,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
 
 // ---- Helpers ----------------------------------------------------------------
 
-type Stage = { cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> };
+type Stage = { cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string; isHereDoc?: boolean }> };
 
 async function buildStage(cmd: SimpleCommand): Promise<Stage | null> {
     // expandWord returns string[] (glob expansion may produce multiple words)
@@ -102,12 +103,18 @@ async function buildStage(cmd: SimpleCommand): Promise<Stage | null> {
     const words = wordArrays.flat();
     if (words.length === 0) return null;
     const [command, ...args] = words as [string, ...string[]];
-    // Redirections use expandWordToStr — no glob expansion on redirect targets
-    const redirs = await Promise.all(cmd.redirections.map(async r => ({
-        op: r.op,
-        fd: r.fd ?? -1,
-        target: await expandWordToStr(r.target),
-    })));
+    // Redirections — here-docs pass body as target, others expand to filename.
+    const redirs = await Promise.all(cmd.redirections.map(async r => {
+        const seg = r.target.segments[0];
+        const isHereDoc = seg?.type === "HereDoc";
+        if (isHereDoc) {
+            const hd = seg as { type: "HereDoc"; body: string; quoted: boolean };
+            // Expand $VAR in non-quoted here-docs.
+            const body = hd.quoted ? hd.body : expandHereDocVars(hd.body);
+            return { op: r.op, fd: r.fd ?? -1, target: body, isHereDoc: true };
+        }
+        return { op: r.op, fd: r.fd ?? -1, target: await expandWordToStr(r.target), isHereDoc: false };
+    }));
     return { cmd: command, args, redirs };
 }
 
@@ -458,9 +465,54 @@ async function executeFor(node: ForClause): Promise<ExecResult> {
     return last;
 }
 
+async function executeCase(node: CaseClause): Promise<ExecResult> {
+    const word = await expandWordToStr(node.word);
+    for (const item of node.items) {
+        for (const pattern of item.patterns) {
+            const pat = await expandWordToStr(pattern);
+            if (matchGlob(word, pat)) {
+                if (item.body) return executeNode(item.body);
+                return { exitCode: 0 };
+            }
+        }
+    }
+    return { exitCode: 0 };
+}
+
+// Simple glob pattern match for case patterns (* ? and character classes).
+function matchGlob(str: string, pattern: string): boolean {
+    // Convert shell glob to regex.
+    let re = "^";
+    let i = 0;
+    while (i < pattern.length) {
+        const ch = pattern[i]!;
+        if (ch === "*")      { re += ".*"; i++; }
+        else if (ch === "?") { re += ".";  i++; }
+        else if (ch === "[") {
+            const end = pattern.indexOf("]", i + 1);
+            if (end === -1) { re += "\\["; i++; }
+            else { re += pattern.slice(i, end + 1); i = end + 1; }
+        } else {
+            re += ch.replace(/[.+^${}()|\\]/g, "\\$&");
+            i++;
+        }
+    }
+    return new RegExp(re + "$").test(str);
+}
+
 function executeFunctionDef(node: FunctionDef): ExecResult {
     shellFunctions.set(node.name, node.body);
     return { exitCode: 0 };
+}
+
+function expandHereDocVars(body: string): string {
+    return body.replace(/\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}|\$([a-zA-Z_][a-zA-Z0-9_]*)/g,
+        (_, braced, bare) => {
+            const name = braced ?? bare;
+            const val = $[name];
+            return val !== undefined ? String(val) : "";
+        }
+    );
 }
 
 function runBuiltin(name: string, args: string[]): ExecResult | null {

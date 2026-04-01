@@ -67,6 +67,7 @@ async function expandSegment(seg: WordSegment): Promise<string> {
         case "CommandSubstitution": return captureImpl((seg as CommandSubstitution).body);
         case "ArithmeticExpansion": return evalArithmetic(seg.expression);
         case "Glob":          return seg.pattern; // raw chars, assembled before glob expand
+        case "HereDoc":       return seg.body;    // body already collected; expand later
         default:              return "";
     }
 }
