@@ -20,8 +20,20 @@ export class WidgetManager {
 
     add(widget: WidgetDef): void {
         this.widgets.set(widget.id, widget);
-        // Render immediately and cache.
-        this.updateWidget(widget.id);
+        // Render immediately and cache. Try sync first.
+        try {
+            const result = widget.render();
+            if (result instanceof Promise) {
+                result.then(r => {
+                    const lines = Array.isArray(r) ? r : [r];
+                    this.cache.set(widget.id, lines);
+                    if (this.repaintFn) this.repaintFn();
+                }).catch(() => {});
+            } else {
+                const lines = Array.isArray(result) ? result : [result];
+                this.cache.set(widget.id, lines);
+            }
+        } catch {}
         // Start timer if interval set.
         if (widget.interval && widget.interval > 0) {
             this.startTimer(widget.id, widget.interval);

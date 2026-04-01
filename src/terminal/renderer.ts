@@ -30,6 +30,24 @@ export class Renderer {
         // Begin synchronized rendering.
         buf += "\x1b[?2026h";
 
+        // Ensure enough room for the frame by scrolling the terminal.
+        // Emit \n to create space, then move back up.
+        if (this.lastTotalRows === 0 && totalRows > 1) {
+            // First render with multi-row frame: reserve space.
+            const extra = totalRows - 1;
+            for (let i = 0; i < extra; i++) buf += "\n";
+            buf += `\x1b[${extra}A`;
+        } else if (totalRows > this.lastTotalRows && this.lastTotalRows > 0) {
+            // Frame grew: reserve additional space.
+            const extra = totalRows - this.lastTotalRows;
+            // Move to bottom of current frame first.
+            const toBottom = this.lastTotalRows - 1 - this.lastCursorRow;
+            if (toBottom > 0) buf += `\x1b[${toBottom}B`;
+            for (let i = 0; i < extra; i++) buf += "\n";
+            // Move back to cursor row.
+            buf += `\x1b[${extra + toBottom}A`;
+        }
+
         // Move to top of previous frame.
         if (this.lastTotalRows > 0 && this.lastCursorRow > 0) {
             buf += `\x1b[${this.lastCursorRow}A`;
@@ -92,6 +110,14 @@ export class Renderer {
         }
         buf += "\r";
         this.writeRaw(buf);
+    }
+
+    getLastHeaderRows(): number {
+        return this.lastCursorRow;
+    }
+
+    getLastFooterRows(): number {
+        return this.lastTotalRows - 1 - this.lastCursorRow;
     }
 
     /** Reset state (after line accepted, before next prompt). */

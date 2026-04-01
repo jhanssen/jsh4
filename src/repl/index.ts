@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { readFileSync } from "node:fs";
 import { parse, IncompleteInputError } from "../parser/index.js";
@@ -46,25 +46,28 @@ export interface ReplOptions {
 export async function startRepl(opts?: ReplOptions): Promise<void> {
     native.initExecutor();
 
+    if (process.stdin.isTTY) {
+        // Create TerminalUI before loading rc so jshrc can register widgets.
+        ui = new TerminalUI(native);
+    }
+
     await loadRc(opts?.jshrc);
 
     if (process.stdin.isTTY) {
         const historyFile = join(String($["HOME"] ?? homedir()), ".jsh_history");
 
-        // Create TerminalUI.
-        ui = new TerminalUI(native);
-        ui.historySetMaxLen(1000);
-        ui.historyLoad(historyFile);
+        ui!.historySetMaxLen(1000);
+        ui!.historyLoad(historyFile);
 
         // Set up syntax highlighting.
-        ui.setColorize((input: string): string => {
+        ui!.setColorize((input: string): string => {
             const userFn = getColorize();
             if (userFn) return userFn(input);
             return colorize(input, getCurrentTheme());
         });
 
         // Set up tab completion.
-        ui.setCompletion((input: string) => getCompletions(input));
+        ui!.setCompletion((input: string) => getCompletions(input));
 
         process.on("beforeExit", async () => {
             await runTrap("EXIT", executeString);
@@ -84,7 +87,9 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
 }
 
 async function loadRc(customPath?: string): Promise<void> {
-    const rcPath = customPath ?? join(String($["HOME"] ?? homedir()), ".jshrc");
+    const rcPath = customPath
+        ? resolve(customPath)
+        : join(String($["HOME"] ?? homedir()), ".jshrc");
 
     const jshApi = {
         $, setPrompt, setRightPrompt, setColorize, setTheme,

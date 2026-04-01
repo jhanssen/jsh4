@@ -999,3 +999,29 @@ describe("executor — process substitution", () => {
         assert.strictEqual(run("cat <(echo line1) <(echo line2)"), "line1\nline2");
     });
 });
+
+describe("executor — echo flags", () => {
+    it("should suppress newline with -n", () => {
+        assert.strictEqual(run("echo -n hello; echo world"), "helloworld");
+    });
+
+    it("should handle -e for escape sequences", () => {
+        assert.strictEqual(run('echo -e "a\\tb"'), "a\tb");
+    });
+
+    it("should handle -ne combined", () => {
+        assert.strictEqual(run('echo -ne "hello\\n"; echo world'), "hello\nworld");
+    });
+
+    it("should treat -E as default (no escapes)", () => {
+        assert.strictEqual(run('echo -E "a\\tb"'), "a\\tb");
+    });
+
+    it("should handle -- as end of flags", () => {
+        assert.strictEqual(run("echo -n"), "");
+    });
+
+    it("should output plain text without flags", () => {
+        assert.strictEqual(run("echo hello world"), "hello world");
+    });
+});

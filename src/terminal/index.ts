@@ -12,6 +12,8 @@ interface InputState {
     pos: number;
     len: number;
     cols: number;
+    searchQuery?: string;
+    searchMatch?: boolean;
 }
 
 interface RenderLineResult {
@@ -142,6 +144,33 @@ export class TerminalUI {
 
     private onLine(line: string | null, errno?: number): void {
         this.widgets.stopTimers();
+        const headerRows = this.renderer.getLastHeaderRows();
+        const footerRows = this.renderer.getLastFooterRows();
+
+        if (headerRows > 0 || footerRows > 0) {
+            let buf = "";
+            // Move up to top of frame (header start).
+            if (headerRows > 0) {
+                buf += `\x1b[${headerRows}A`;
+            }
+            // Clear from here to end of screen (wipes header + input + footer).
+            buf += "\r\x1b[J";
+            // Rewrite just the input line.
+            if (this.lastState) {
+                const colorized = this.colorizeFn ? this.colorizeFn(this.lastState.buf) : this.lastState.buf;
+                const { line: inputLine } = this.native.inputRenderLine(
+                    this.prompt, colorized, "", this.lastState.cols
+                );
+                buf += inputLine;
+            }
+            // Move to new line, reset column for correct tab alignment.
+            buf += "\r\n\x1b[G";
+            process.stdout.write(buf);
+        } else {
+            // No header/footer — just move to new line.
+            process.stdout.write("\r\n\x1b[G");
+        }
+
         this.renderer.reset();
         if (this.lineCallback) {
             this.lineCallback(line, errno);
@@ -149,12 +178,21 @@ export class TerminalUI {
     }
 
     private renderFrame(state: InputState): void {
+        // In search mode, show the search prompt instead of the normal prompt.
+        let displayPrompt = this.prompt;
+        let displayRightPrompt = this.rightPrompt;
+        if (state.searchQuery !== undefined) {
+            const failMark = state.searchMatch === false && state.searchQuery.length > 0 ? "failing " : "";
+            displayPrompt = `(${failMark}reverse-i-search)\`${state.searchQuery}': `;
+            displayRightPrompt = "";
+        }
+
         // Colorize buffer.
         const colorized = this.colorizeFn ? this.colorizeFn(state.buf) : state.buf;
 
         // Get input line from engine (handles scroll + cursor math).
         const { line, cursorCol } = this.native.inputRenderLine(
-            this.prompt, colorized, this.rightPrompt, state.cols
+            displayPrompt, colorized, displayRightPrompt, state.cols
         );
 
         // Get header/footer from widgets and/or direct functions.

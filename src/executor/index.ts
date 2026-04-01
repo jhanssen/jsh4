@@ -1340,6 +1340,46 @@ function toInt(s: string): number {
     return n;
 }
 
+// ---- echo escape processing -------------------------------------------------
+
+function echoEscape(s: string): string {
+    let result = "";
+    for (let i = 0; i < s.length; i++) {
+        if (s[i] === "\\" && i + 1 < s.length) {
+            switch (s[i + 1]) {
+                case "n": result += "\n"; i++; break;
+                case "t": result += "\t"; i++; break;
+                case "r": result += "\r"; i++; break;
+                case "\\": result += "\\"; i++; break;
+                case "a": result += "\x07"; i++; break;
+                case "b": result += "\b"; i++; break;
+                case "f": result += "\f"; i++; break;
+                case "v": result += "\v"; i++; break;
+                case "0": {
+                    let oct = "";
+                    let j = i + 2;
+                    while (j < s.length && j < i + 5 && s[j]! >= "0" && s[j]! <= "7") { oct += s[j]; j++; }
+                    result += String.fromCharCode(parseInt(oct || "0", 8));
+                    i = j - 1;
+                    break;
+                }
+                case "x": {
+                    let hex = "";
+                    let j = i + 2;
+                    while (j < s.length && j < i + 4 && /[0-9a-fA-F]/.test(s[j]!)) { hex += s[j]; j++; }
+                    if (hex) { result += String.fromCharCode(parseInt(hex, 16)); i = j - 1; }
+                    else { result += "\\x"; i++; }
+                    break;
+                }
+                default: result += "\\" + s[i + 1]; i++; break;
+            }
+        } else {
+            result += s[i];
+        }
+    }
+    return result;
+}
+
 // ---- trap builtin -----------------------------------------------------------
 
 function runTrapBuiltin(args: string[]): ExecResult {
@@ -1561,9 +1601,25 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             return { exitCode: 0 };
         case "true":  return { exitCode: 0 };
         case "false": return { exitCode: 1 };
-        case "echo":
-            process.stdout.write(args.join(" ") + "\n");
+        case "echo": {
+            let newline = true;
+            let escapes = false;
+            let startIdx = 0;
+            // Parse flags: -n (no newline), -e (enable escapes), -E (disable escapes)
+            while (startIdx < args.length) {
+                const a = args[startIdx]!;
+                if (a === "-n") { newline = false; startIdx++; }
+                else if (a === "-e") { escapes = true; startIdx++; }
+                else if (a === "-E") { escapes = false; startIdx++; }
+                else if (a === "-ne" || a === "-en") { newline = false; escapes = true; startIdx++; }
+                else if (a === "-nE" || a === "-En") { newline = false; escapes = false; startIdx++; }
+                else break;
+            }
+            let out = args.slice(startIdx).join(" ");
+            if (escapes) out = echoEscape(out);
+            process.stdout.write(out + (newline ? "\n" : ""));
             return { exitCode: 0 };
+        }
         case "test":
             return runTest(args);
         case "[": {

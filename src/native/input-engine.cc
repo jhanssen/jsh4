@@ -223,6 +223,11 @@ struct InputState {
     bool active = false;
     int in_completion = 0;
     size_t completion_idx = 0;
+    // Reverse search (Ctrl-R)
+    bool in_search = false;
+    char search_query[256];
+    size_t search_query_len = 0;
+    int search_match_index = -1;  // history index of current match
 };
 
 static InputState g_state;
@@ -301,6 +306,37 @@ static void editHistoryNav(InputState *s, int dir) {
 
 // ---- Control key constants -------------------------------------------------
 
+// ---- Reverse history search ------------------------------------------------
+
+static void searchHistoryReverse(InputState *s) {
+    // Search backward from current match position (or end of history).
+    int start = s->search_match_index >= 0 ? s->search_match_index - 1 : history_len - 2;
+    if (s->search_query_len == 0) { s->search_match_index = -1; return; }
+    for (int i = start; i >= 0; i--) {
+        if (strstr(history[i], s->search_query) != nullptr) {
+            s->search_match_index = i;
+            // Copy match to edit buffer.
+            strncpy(s->buf, history[i], s->buflen);
+            s->buf[s->buflen] = '\0';
+            s->len = s->pos = strlen(s->buf);
+            return;
+        }
+    }
+    // No match found — keep current state.
+}
+
+static void enterSearchMode(InputState *s) {
+    s->in_search = true;
+    s->search_query[0] = '\0';
+    s->search_query_len = 0;
+    s->search_match_index = -1;
+}
+
+static void exitSearchMode(InputState *s) {
+    s->in_search = false;
+    s->search_query_len = 0;
+}
+
 #define CTRL_A 1
 #define CTRL_B 2
 #define CTRL_C 3
@@ -309,6 +345,7 @@ static void editHistoryNav(InputState *s, int dir) {
 #define CTRL_F 6
 #define CTRL_H 8
 #define CTRL_K 11
+#define CTRL_R 18
 #define CTRL_L 12
 #define CTRL_N 14
 #define CTRL_P 16
@@ -345,6 +382,10 @@ static void notifyRender() {
     state.Set("pos", Napi::Number::New(env, static_cast<double>(g_state.pos)));
     state.Set("len", Napi::Number::New(env, static_cast<double>(g_state.len)));
     state.Set("cols", Napi::Number::New(env, static_cast<double>(getColumns())));
+    if (g_state.in_search) {
+        state.Set("searchQuery", Napi::String::New(env, g_state.search_query, g_state.search_query_len));
+        state.Set("searchMatch", Napi::Boolean::New(env, g_state.search_match_index >= 0));
+    }
     g_ctx->onRender.Call({state});
 }
 
@@ -413,6 +454,56 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         return -1;
     }
     if (nread == 0) { *out_errno = 0; return -1; } // EOF
+
+    // Reverse search mode handling.
+    if (s->in_search) {
+        if (c == CTRL_R) {
+            // Search for next older match.
+            searchHistoryReverse(s);
+            notifyRender();
+            return 0;
+        }
+        if (c == ENTER) {
+            // Accept the current match and execute it.
+            exitSearchMode(s);
+            if (history_len > 0) { history_len--; free(history[history_len]); }
+            *out_line = strdup(s->buf);
+            return 1;
+        }
+        if (c == CTRL_C || c == ESC) {
+            // Cancel search, restore empty buffer.
+            exitSearchMode(s);
+            s->buf[0] = '\0';
+            s->pos = s->len = 0;
+            notifyRender();
+            return 0;
+        }
+        if (c == BACKSPACE || c == CTRL_H) {
+            // Delete last char from search query.
+            if (s->search_query_len > 0) {
+                s->search_query_len--;
+                s->search_query[s->search_query_len] = '\0';
+                s->search_match_index = -1; // Reset search position.
+                searchHistoryReverse(s);
+            }
+            notifyRender();
+            return 0;
+        }
+        if (c >= 32 && c < 127) {
+            // Add to search query and search.
+            if (s->search_query_len < sizeof(s->search_query) - 1) {
+                s->search_query[s->search_query_len++] = c;
+                s->search_query[s->search_query_len] = '\0';
+                searchHistoryReverse(s);
+            }
+            notifyRender();
+            return 0;
+        }
+        // Any other key: accept match, exit search, and process the key normally.
+        exitSearchMode(s);
+        notifyRender();
+        // Fall through to normal handling of this key.
+    }
 
     // Completion handling
     if ((s->in_completion || c == 9) && !g_ctx->onCompletion.IsEmpty()) {
@@ -495,6 +586,11 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         notifyRender();
         break;
 
+    case CTRL_R:
+        enterSearchMode(s);
+        notifyRender();
+        break;
+
     case CTRL_W:
         editDeletePrevWord(s);
         notifyRender();
@@ -571,9 +667,6 @@ static void pollCallback(uv_poll_t *handle, int status, int events) {
     g_ctx->poll = nullptr;
     g_state.active = false;
     disableRawMode(g_state.ifd);
-    // \r\n moves to new line. \x1b[G resets column to 1 (leftmost) to fix
-    // tab alignment after OSC sequences that may confuse column tracking.
-    write(g_state.ofd, "\r\n\x1b[G", 5);
 
     Napi::Env env = g_ctx->onLine.Env();
     Napi::HandleScope scope(env);
