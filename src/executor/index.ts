@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
-import { createReadStream, createWriteStream, read as fsRead } from "node:fs";
+import { createReadStream, createWriteStream, read as fsRead, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { promisify } from "node:util";
 
 const fsReadAsync = promisify(fsRead);
@@ -168,6 +169,15 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         pushParams(args);
         try { return await executeNode(func); }
         finally { popParams(); }
+    }
+
+    // source / . — read file, parse, execute in current context
+    if (command === "source" || command === ".") {
+        if (args.length === 0) {
+            process.stderr.write(`${command}: filename argument required\n`);
+            return { exitCode: 2 };
+        }
+        return runSource(args[0]!, args.slice(1));
     }
 
     // Builtins only run in-process when there are no redirections.
@@ -513,6 +523,33 @@ function expandHereDocVars(body: string): string {
             return val !== undefined ? String(val) : "";
         }
     );
+}
+
+// ---- source / . builtin -----------------------------------------------------
+
+async function runSource(file: string, extraArgs: string[]): Promise<ExecResult> {
+    const path = resolve(file);
+    let content: string;
+    try {
+        content = readFileSync(path, "utf8");
+    } catch (e) {
+        process.stderr.write(`source: ${e instanceof Error ? e.message : e}\n`);
+        return { exitCode: 1 };
+    }
+    let ast;
+    try {
+        ast = parse(content);
+    } catch (e) {
+        process.stderr.write(`source: ${path}: ${e instanceof Error ? e.message : e}\n`);
+        return { exitCode: 1 };
+    }
+    if (!ast) return { exitCode: 0 };
+    if (extraArgs.length > 0) pushParams(extraArgs);
+    try {
+        return await executeNode(ast);
+    } finally {
+        if (extraArgs.length > 0) popParams();
+    }
 }
 
 // ---- test / [ builtin -------------------------------------------------------

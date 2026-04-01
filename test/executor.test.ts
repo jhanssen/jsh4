@@ -269,6 +269,56 @@ describe("executor — test / [ builtin", () => {
     });
 });
 
+describe("executor — source / . builtin", () => {
+    let tmp: string;
+    before(() => { tmp = mkdtempSync(join(tmpdir(), "jsh-source-")); });
+    after(() => { rmSync(tmp, { recursive: true }); });
+
+    it("source executes file in current context", () => {
+        const f = join(tmp, "vars.sh");
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: `echo 'MYVAR=hello' > ${f}\nsource ${f}\necho $MYVAR\nexit\n`,
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        assert.ok(r.stdout.includes("hello"), `expected hello, got: ${r.stdout}`);
+    });
+
+    it(". is alias for source", () => {
+        const f = join(tmp, "dot.sh");
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: `echo 'DOTVAR=world' > ${f}\n. ${f}\necho $DOTVAR\nexit\n`,
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        assert.ok(r.stdout.includes("world"), `expected world, got: ${r.stdout}`);
+    });
+
+    it("source with missing file returns error", () => {
+        assert.strictEqual(ec("source /tmp/__no_such_file_jsh__"), 1);
+    });
+
+    it("source executes functions defined in file", () => {
+        const f = join(tmp, "func.sh");
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: `echo 'greet() { echo hi $1; }' > ${f}\nsource ${f}\ngreet world\nexit\n`,
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        assert.ok(r.stdout.includes("hi world"), `expected "hi world", got: ${r.stdout}`);
+    });
+
+    it("source with extra args sets positional params", () => {
+        const f = join(tmp, "params.sh");
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: `echo 'echo $1 $2' > ${f}\nsource ${f} foo bar\nexit\n`,
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        assert.ok(r.stdout.includes("foo bar"), `expected "foo bar", got: ${r.stdout}`);
+    });
+});
+
 describe("executor — expansion", () => {
     it("variable expansion", () => {
         assert.strictEqual(run("X=hello; echo $X"), "hello");
