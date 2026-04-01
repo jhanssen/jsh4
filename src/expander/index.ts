@@ -13,20 +13,216 @@ type CaptureFunc = (body: string) => Promise<string>;
 let captureImpl: CaptureFunc = async () => "";
 export function registerCaptureImpl(fn: CaptureFunc): void { captureImpl = fn; }
 
-// expandWord: returns potentially multiple strings after brace + glob expansion.
-// Use this for command arguments.
+// ---- Fragment-based expansion for IFS word splitting ------------------------
+
+type Fragment =
+    | { type: "literal"; text: string }     // no IFS splitting
+    | { type: "splittable"; text: string }   // subject to IFS splitting
+    | { type: "break" };                     // word boundary (from "$@")
+
+function getIFS(): string {
+    const ifs = $["IFS"];
+    if (ifs === undefined) return " \t\n";
+    return String(ifs);
+}
+
+// Split a string on IFS characters, returning the parts.
+// Adjacent IFS whitespace chars are collapsed; non-whitespace IFS chars each
+// delimit a field (POSIX rules).
+function ifsSplit(text: string, ifs: string): string[] {
+    if (text === "") return [];
+    if (ifs === "") return [text]; // empty IFS → no splitting
+
+    const isIfsWs = (ch: string) => (ch === " " || ch === "\t" || ch === "\n") && ifs.includes(ch);
+    const isIfs = (ch: string) => ifs.includes(ch);
+
+    const fields: string[] = [];
+    let current = "";
+    let i = 0;
+
+    // Skip leading IFS whitespace.
+    while (i < text.length && isIfsWs(text[i]!)) i++;
+
+    while (i < text.length) {
+        const ch = text[i]!;
+        if (isIfs(ch)) {
+            fields.push(current);
+            current = "";
+            if (isIfsWs(ch)) {
+                // Consume all adjacent IFS whitespace.
+                while (i < text.length && isIfsWs(text[i]!)) i++;
+                // If a non-whitespace IFS char follows, it's another delimiter.
+                if (i < text.length && isIfs(text[i]!) && !isIfsWs(text[i]!)) {
+                    i++;
+                    // Consume trailing IFS whitespace after non-ws delimiter.
+                    while (i < text.length && isIfsWs(text[i]!)) i++;
+                }
+            } else {
+                i++;
+                // Consume IFS whitespace after non-ws delimiter.
+                while (i < text.length && isIfsWs(text[i]!)) i++;
+            }
+        } else {
+            current += ch;
+            i++;
+        }
+    }
+    // Add last field if non-empty (trailing IFS whitespace already consumed).
+    if (current !== "") fields.push(current);
+
+    return fields;
+}
+
+// Convert fragments into words by applying IFS splitting on splittable parts.
+function fragmentsToWords(fragments: Fragment[]): string[] {
+    const ifs = getIFS();
+    const words: string[] = [];
+    let current = "";
+
+    for (const frag of fragments) {
+        if (frag.type === "break") {
+            words.push(current);
+            current = "";
+            continue;
+        }
+        if (frag.type === "literal") {
+            current += frag.text;
+            continue;
+        }
+        // splittable
+        const parts = ifsSplit(frag.text, ifs);
+        if (parts.length === 0) {
+            // Entirely IFS chars — produces no fields but doesn't break the word.
+            // Actually in POSIX: an unquoted expansion that expands to nothing
+            // after splitting should be removed entirely.  We handle this by
+            // not appending anything.
+            continue;
+        }
+        // First part joins with current word being built.
+        current += parts[0]!;
+        if (parts.length > 1) {
+            // Remaining parts each start a new word.
+            words.push(current);
+            for (let i = 1; i < parts.length - 1; i++) {
+                words.push(parts[i]!);
+            }
+            current = parts[parts.length - 1]!;
+        }
+    }
+    words.push(current);
+
+    // Remove completely empty words that resulted from empty expansions,
+    // but keep words that are explicitly empty from quoting (those would be
+    // literal fragments with "").
+    return words.filter(w => w !== "" || fragments.some(f => f.type === "literal" && f.text === ""));
+}
+
+// Expand a segment into fragments, tracking quoted context.
+async function expandSegmentToFragments(seg: WordSegment, quoted: boolean): Promise<Fragment[]> {
+    switch (seg.type) {
+        case "Literal":
+            return [{ type: "literal", text: (seg as LiteralSegment).value }];
+        case "SingleQuoted":
+            return [{ type: "literal", text: (seg as SingleQuotedSegment).value }];
+        case "DoubleQuoted": {
+            const result: Fragment[] = [];
+            for (const inner of (seg as DoubleQuotedSegment).segments) {
+                result.push(...await expandSegmentToFragments(inner, true));
+            }
+            return result;
+        }
+        case "VariableExpansion": {
+            const vexp = seg as VariableExpansion;
+            // "$@" → separate words (one per param)
+            if (vexp.name === "@" && quoted && !vexp.operator) {
+                const params = getAllParams();
+                if (params.length === 0) return [];
+                const frags: Fragment[] = [{ type: "literal", text: params[0]! }];
+                for (let i = 1; i < params.length; i++) {
+                    frags.push({ type: "break" });
+                    frags.push({ type: "literal", text: params[i]! });
+                }
+                return frags;
+            }
+            // "$*" → join with first IFS char
+            if (vexp.name === "*" && quoted && !vexp.operator) {
+                const ifs = getIFS();
+                const sep = ifs.length > 0 ? ifs[0]! : "";
+                return [{ type: "literal", text: getAllParams().join(sep) }];
+            }
+            const text = expandVariable(vexp);
+            return [quoted ? { type: "literal", text } : { type: "splittable", text }];
+        }
+        case "CommandSubstitution": {
+            const text = await captureImpl((seg as CommandSubstitution).body);
+            return [quoted ? { type: "literal", text } : { type: "splittable", text }];
+        }
+        case "ArithmeticExpansion": {
+            const text = evalArithmetic(seg.expression);
+            return [quoted ? { type: "literal", text } : { type: "splittable", text }];
+        }
+        case "Glob":
+            return [{ type: "literal", text: seg.pattern }];
+        case "HereDoc":
+            return [{ type: "literal", text: seg.body }];
+        default:
+            return [];
+    }
+}
+
+// expandWord: returns potentially multiple strings after IFS splitting,
+// brace expansion, and glob expansion.  Use this for command arguments.
 export async function expandWord(word: Word): Promise<string[]> {
     const hasGlob = word.segments.some(s => s.type === "Glob");
-    const str = await expandWordToStr(word);
-    // Brace expansion first (produces multiple words), then glob each.
-    const braceExpanded = expandBraces(str);
-    if (!hasGlob && braceExpanded.length <= 1) return braceExpanded.length === 0 ? [str] : braceExpanded;
+
+    // Check if any segment could produce IFS splitting or "$@" breaks.
+    const hasExpansion = word.segments.some(s =>
+        s.type === "VariableExpansion" || s.type === "CommandSubstitution" ||
+        s.type === "ArithmeticExpansion" ||
+        (s.type === "DoubleQuoted" && (s as DoubleQuotedSegment).segments.some(
+            inner => inner.type === "VariableExpansion" || inner.type === "CommandSubstitution" ||
+                     inner.type === "ArithmeticExpansion"
+        ))
+    );
+
+    if (!hasExpansion) {
+        // Fast path: no expansions that need splitting — use old string path.
+        const str = await expandWordToStr(word);
+        const braceExpanded = expandBraces(str);
+        if (!hasGlob && braceExpanded.length <= 1) return braceExpanded.length === 0 ? [str] : braceExpanded;
+        const results: string[] = [];
+        for (const w of braceExpanded) {
+            results.push(...(hasGlob ? await expandGlob(w) : [w]));
+        }
+        return results;
+    }
+
+    // Fragment-based path: expand with IFS splitting awareness.
+    // Handle tilde expansion on leading literal.
+    const segs = word.segments;
+    const fragments: Fragment[] = [];
+    let startIdx = 0;
+    if (segs.length > 0 && segs[0]!.type === "Literal") {
+        const lit = (segs[0] as LiteralSegment).value;
+        if (lit === "~" || lit.startsWith("~/")) {
+            const home = String($["HOME"] ?? os.homedir());
+            fragments.push({ type: "literal", text: home + lit.slice(1) });
+            startIdx = 1;
+        }
+    }
+    for (let i = startIdx; i < segs.length; i++) {
+        fragments.push(...await expandSegmentToFragments(segs[i]!, false));
+    }
+
+    // Convert fragments to words via IFS splitting.
+    const words = fragmentsToWords(fragments);
+
+    // Apply brace and glob expansion to each resulting word.
     const results: string[] = [];
-    for (const w of braceExpanded) {
-        if (hasGlob) {
-            results.push(...await expandGlob(w));
-        } else {
-            results.push(w);
+    for (const w of words) {
+        const braceExpanded = expandBraces(w);
+        for (const b of braceExpanded) {
+            results.push(...(hasGlob ? await expandGlob(b) : [b]));
         }
     }
     return results;

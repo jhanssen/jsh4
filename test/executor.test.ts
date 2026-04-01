@@ -638,7 +638,7 @@ describe("executor — subshells", () => {
     });
 
     it("should capture subshell with for loop in command substitution", () => {
-        assert.strictEqual(run("X=$(for i in a b c; do echo $i; done); echo \"$X\""), "a\nb\nc");
+        assert.strictEqual(run("echo $(for i in a b c; do echo $i; done)"), "a b c");
     });
 
     it("should not leak export from subshell", () => {
@@ -696,5 +696,57 @@ describe("executor — subshell redirections", () => {
         const f = join(tmp, "sub-err.txt");
         run(`(echo oops >&2) 2> ${f}`);
         assert.strictEqual(run(`cat ${f}`), "oops");
+    });
+});
+
+describe("executor — IFS word splitting", () => {
+    it("should split unquoted variable on spaces", () => {
+        assert.strictEqual(run('X="a  b  c"; echo $X'), "a b c");
+    });
+
+    it("should not split quoted variable", () => {
+        assert.strictEqual(run('X="a  b  c"; echo "$X"'), "a  b  c");
+    });
+
+    it("should split unquoted command substitution", () => {
+        assert.strictEqual(run("echo $(echo 'a  b  c')"), "a b c");
+    });
+
+    it("should not split quoted command substitution", () => {
+        assert.strictEqual(run('echo "$(echo \'a  b  c\')"'), "a  b  c");
+    });
+
+    it("should split on newlines in unquoted $() result", () => {
+        assert.strictEqual(run("echo $(echo a; echo b; echo c)"), "a b c");
+    });
+
+    it("should remove empty unquoted expansion", () => {
+        assert.strictEqual(run('EMPTY=""; echo a${EMPTY}b'), "ab");
+    });
+
+    it("should preserve empty quoted expansion", () => {
+        assert.strictEqual(run('EMPTY=""; echo "a${EMPTY}b"'), "ab");
+    });
+
+    it("should split unquoted $@ in for loop", () => {
+        assert.strictEqual(
+            run('f() { for i in $@; do echo "[$i]"; done; }; f "hello world" "foo bar"'),
+            "[hello]\n[world]\n[foo]\n[bar]"
+        );
+    });
+
+    it('should keep "$@" args separate in for loop', () => {
+        assert.strictEqual(
+            run('f() { for i in "$@"; do echo "[$i]"; done; }; f "hello world" "foo bar"'),
+            "[hello world]\n[foo bar]"
+        );
+    });
+
+    it('should join "$*" with space', () => {
+        assert.strictEqual(run('f() { echo "$*"; }; f a b c'), "a b c");
+    });
+
+    it("should split $() with for loop", () => {
+        assert.strictEqual(run("echo $(for i in a b c; do echo $i; done)"), "a b c");
     });
 });
