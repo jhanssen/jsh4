@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { parse, IncompleteInputError } from "../parser/index.js";
 import { execute } from "../executor/index.js";
 import { $ } from "../variables/index.js";
-import { getPrompt, setPrompt, alias, unalias, registerJsFunction } from "../api/index.js";
+import { getPrompt, setPrompt, alias, unalias, registerJsFunction, exec } from "../api/index.js";
 import type { JsPipelineFunction } from "../jsfunctions/index.js";
 
 const require = createRequire(import.meta.url);
@@ -39,7 +39,7 @@ async function loadRc(): Promise<void> {
     const rcPath = join(String($["HOME"] ?? homedir()), ".jshrc");
 
     // Expose the jsh API as a single global object.
-    const jshApi = { $, setPrompt, alias, unalias, registerJsFunction };
+    const jshApi = { $, setPrompt, alias, unalias, registerJsFunction, exec };
     (globalThis as Record<string, unknown>)["jsh"] = jshApi;
 
     try {

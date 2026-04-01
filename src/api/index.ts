@@ -2,6 +2,8 @@
 
 export { $ } from "../variables/index.js";
 export { registerJsFunction } from "../jsfunctions/index.js";
+export { exec } from "../exec/index.js";
+export type { ExecResult, ExecOptions } from "../exec/index.js";
 
 // ---- Prompt -----------------------------------------------------------------
 
