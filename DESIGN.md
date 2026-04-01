@@ -57,6 +57,7 @@ Supported syntax:
 - Command substitution (`$(...)`, backticks)
 - Arithmetic expansion (`$((...))`)
 - Globbing (`*`, `?`, `[...]`, `**` recursive)
+- Brace expansion (`{a,b,c}`, `{1..5}`, `{a..z}`, nested)
 - Control flow: `for`/`do`/`done`, `while`/`until`, `if`/`then`/`elif`/`else`/`fi`, `case`/`esac`
 - Subshells `(...)`, brace groups `{ ...; }`
 - Functions: `name() { ...; }`
@@ -80,11 +81,12 @@ Handles word expansion before command execution:
 2. Parameter expansion (`$VAR`, `${VAR:-default}`, etc.)
 3. Command substitution (`$(...)` → fork + pipe capture)
 4. Arithmetic expansion (`$((...))` → JS `Function()` eval)
-5. Word splitting (on IFS — currently space/tab/newline)
-6. Glob/pathname expansion (via Node.js `fs.glob`)
-7. Quote removal
+5. Brace expansion (`{a,b,c}`, `{1..5}`, `{a..z}`, nested)
+6. Word splitting (on IFS — currently space/tab/newline)
+7. Glob/pathname expansion (via Node.js `fs.glob`)
+8. Quote removal
 
-Returns `string[]` per word to support glob expansion producing multiple results.
+Returns `string[]` per word to support brace and glob expansion producing multiple results.
 
 **4. Line Editor (linenoise, N-API binding)**
 
@@ -245,17 +247,18 @@ Builtins execute in-process (no fork):
 | `echo` | ✅ | Output (builtin for performance) |
 | `true` / `false` | ✅ | Exit status |
 | `alias` / `unalias` | ✅ | Define/remove aliases |
-| `source` / `.` | ❌ | Execute file in current context |
+| `test` / `[` | ✅ | Conditional expressions (string, integer, file tests, logical ops) |
+| `source` / `.` | ✅ | Execute file in current shell context |
+| `read` | ✅ | Read line from stdin/here-strings, IFS splitting, `-r` flag |
+| `set` | ✅ | Shell options: `-e`, `-u`, `-x`, `-o pipefail` |
+| `local` | ✅ | Function-scoped variables with save/restore |
+| `shift` | ✅ | Shift positional parameters |
+| `exec` | ✅ | Replace shell with command (native `execvp`) |
 | `eval` | ❌ | Parse and execute string |
-| `exec` | ❌ | Replace shell with command |
 | `jobs` | ❌ | List jobs |
 | `fg` | ❌ | Foreground a job |
 | `bg` | ❌ | Background a job |
-| `set` | ❌ | Set shell options |
-| `shift` | ❌ | Shift positional params |
-| `read` | ❌ | Read line from stdin |
 | `printf` | ❌ | Formatted output |
-| `test` / `[` | ❌ | Conditional expression |
 | `type` / `which` | ❌ | Command lookup |
 | `hash` | ❌ | Command hash table |
 | `trap` | ❌ | Signal trapping |
@@ -331,7 +334,9 @@ jsh.$.items = ['a', 'b', 'c'];   // JS can store any type
 
 ### Function scoping
 
-Shell function variables are global by default (POSIX behavior). Positional parameters (`$1`, `$2`, `$#`, `$@`, `$*`) use a scope stack — pushed on function entry, popped on exit.
+Shell function variables are global by default (POSIX behavior). The `local` builtin declares function-scoped variables — on function entry a scope is pushed, `local VAR` saves the current value, and on function exit all saved values are restored.
+
+Positional parameters (`$1`, `$2`, `$#`, `$@`, `$*`) use a separate scope stack — pushed on function entry, popped on exit. `shift` mutates the current frame.
 
 ---
 
@@ -344,4 +349,4 @@ JS functions map to exit codes as follows:
 - `throw`/`reject` → exit 1, error stringified to stderr
 - `return { exitCode: N }` → exit N
 
-`set -e` and `set -o pipefail` are not yet implemented.
+`set -e` (errexit), `set -u` (nounset), `set -x` (xtrace), and `set -o pipefail` are implemented. `pipefail` tracks whether any pipeline stage fails; `errexit` aborts on non-zero exit in list context.

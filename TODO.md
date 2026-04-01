@@ -48,6 +48,13 @@
 - [x] `echo`
 - [x] `true` / `false`
 - [x] Alias expansion
+- [x] `test` / `[` — string, integer, file tests, logical operators, negation
+- [x] `source` / `.` — execute file in current shell context, optional positional params
+- [x] `read` — read line from stdin/here-strings/file redirects, IFS splitting, `-r` flag
+- [x] `set` — `-e` (errexit), `-u` (nounset), `-x` (xtrace), `-o pipefail`, `+` to disable
+- [x] `local` — function-scoped variables with save/restore
+- [x] `shift` — shift positional parameters by N
+- [x] `exec` — replace shell process via native `execvp`
 
 ### Expansion
 - [x] Variable expansion with all operators (`:-`, `:+`, `:=`, `:?`, `#`, `##`, `%`, `%%`)
@@ -55,6 +62,7 @@
 - [x] Command substitution `$()` (fork + pipe capture)
 - [x] Arithmetic expansion `$((...))` via JS `Function()`
 - [x] Glob expansion via Node.js `fs.glob` (`*`, `**`, `?`, `[...]`)
+- [x] Brace expansion (`{a,b,c}`, `{1..5}`, `{a..z}`, step `{1..10..2}`, nested)
 - [x] Here-doc body variable expansion (`$VAR`, `${VAR}`)
 
 ### JS Integration (`@` syntax)
@@ -70,6 +78,7 @@
 - [x] Non-blocking linenoise integration via libuv `uv_poll`
 - [x] Multi-line continuation prompt (`> `) for incomplete input
 - [x] History (in-memory + persist to `~/.jsh_history`)
+- [x] Non-interactive stdin mode (script execution via `readFileSync`)
 - [x] Tab completion: files/dirs, commands, `@` functions, user-defined handlers
 - [x] Ctrl-C clears current line/buffer
 - [x] Ctrl-D exits
@@ -105,21 +114,14 @@
 
 ### High priority (needed for real scripts)
 
-- [ ] **`test` / `[` / `[[`** — conditional expressions; `if [ -f foo ]`, `[ $x -eq 1 ]`, string/file tests
-- [ ] **`source` / `.`** — execute a file in the current shell context
-- [ ] **`read` builtin** — read a line from stdin into a variable
-- [ ] **`set` builtin** — `set -e`, `set -o pipefail`, `set -x` (trace), `set -u` (unbound vars)
-- [ ] **`local` builtin** — function-scoped variables; without this, shell functions clobber globals
+- [ ] **`[[` extended test** — regex matching `=~`, `<`/`>` string comparison
 
 ### Medium priority
 
 - [ ] **Subshells `(...)`** — currently run in-process (variable mutations leak); needs clone-and-restore of variable store + cwd
 - [ ] **`$@` / `$*` proper word splitting** — currently joins with space; should produce separate words in `for i in "$@"`
 - [ ] **Background `&` / job control** — job table, `jobs`, `fg`, `bg`, `SIGCHLD` tracking, `SIGTSTP`
-- [ ] **`shift` builtin** — shift positional parameters
-- [ ] **`exec` builtin** — replace shell with command
 - [ ] **`$PIPESTATUS`** — exit codes of each pipeline stage
-- [ ] **Brace expansion** — `{a,b,c}`, `{1..5}`
 - [ ] **`type` / `which` builtins** — command lookup; common for checking if commands exist
 - [ ] **Arithmetic in `$((...))`: `++`/`--`** — currently only basic JS arithmetic; shell-specific operators
 
@@ -134,7 +136,6 @@
 - [ ] **`printf` builtin**
 - [ ] **`trap`** — signal trapping
 - [ ] **Process substitution** `<(cmd)` and `>(cmd)`
-- [ ] **`[[` extended test** — regex matching `=~`, `<`/`>` string comparison
 - [ ] **Named pipes / coprocesses**
 - [ ] **History expansion** `!!`, `!$`, `!n`
 - [ ] **Tab completion: async handlers** — currently sync only
