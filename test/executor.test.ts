@@ -645,3 +645,56 @@ describe("executor — subshells", () => {
         assert.strictEqual(run("(export SUBVAR=leaked); echo ${SUBVAR:-empty}"), "empty");
     });
 });
+
+describe("executor — brace group redirections", () => {
+    let tmp: string;
+    before(() => { tmp = mkdtempSync(join(tmpdir(), "jsh-brace-")); });
+    after(() => { rmSync(tmp, { recursive: true }); });
+
+    it("should redirect stdout from brace group to file", () => {
+        const f = join(tmp, "brace-out.txt");
+        run(`{ echo hello; echo world; } > ${f}`);
+        assert.strictEqual(run(`cat ${f}`), "hello\nworld");
+    });
+
+    it("should append brace group output to file", () => {
+        const f = join(tmp, "brace-append.txt");
+        run(`echo first > ${f}`);
+        run(`{ echo second; echo third; } >> ${f}`);
+        assert.strictEqual(run(`cat ${f}`), "first\nsecond\nthird");
+    });
+
+    it("should redirect stdin into brace group", () => {
+        const f = join(tmp, "brace-in.txt");
+        run(`echo content > ${f}`);
+        assert.strictEqual(run(`{ cat; } < ${f}`), "content");
+    });
+
+    it("should not isolate variables in brace group", () => {
+        assert.strictEqual(run("X=before; { X=after; }; echo $X"), "after");
+    });
+});
+
+describe("executor — subshell redirections", () => {
+    let tmp: string;
+    before(() => { tmp = mkdtempSync(join(tmpdir(), "jsh-sub-redir-")); });
+    after(() => { rmSync(tmp, { recursive: true }); });
+
+    it("should redirect stdout from subshell to file", () => {
+        const f = join(tmp, "sub-out.txt");
+        run(`(echo hello; echo world) > ${f}`);
+        assert.strictEqual(run(`cat ${f}`), "hello\nworld");
+    });
+
+    it("should redirect stdin into subshell", () => {
+        const f = join(tmp, "sub-in.txt");
+        run(`echo piped > ${f}`);
+        assert.strictEqual(run(`(cat) < ${f}`), "piped");
+    });
+
+    it("should redirect stderr from subshell", () => {
+        const f = join(tmp, "sub-err.txt");
+        run(`(echo oops >&2) 2> ${f}`);
+        assert.strictEqual(run(`cat ${f}`), "oops");
+    });
+});

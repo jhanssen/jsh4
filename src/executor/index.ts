@@ -1,12 +1,12 @@
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
-import { createReadStream, createWriteStream, read as fsRead, readFileSync, readSync, accessSync, constants as fsConstants } from "node:fs";
+import { createReadStream, createWriteStream, read as fsRead, readFileSync, readSync, accessSync, openSync, closeSync, constants as fsConstants } from "node:fs";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
 
 const fsReadAsync = promisify(fsRead);
 import type {
-    ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup, Subshell,
+    ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup, Subshell, Redirection,
     IfClause, WhileClause, ForClause, FunctionDef, JsFunction, CaseClause,
     ConditionalExpr,
 } from "../parser/index.js";
@@ -86,7 +86,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         case "Pipeline":       return executePipeline(node as Pipeline);
         case "AndOr":          return executeAndOr(node as AndOr);
         case "List":           return executeList(node as List);
-        case "BraceGroup":     return executeNode((node as BraceGroup).body);
+        case "BraceGroup":     return executeBraceGroup(node as BraceGroup);
         case "Subshell":       return executeSubshell(node as Subshell);
         case "IfClause":       return executeIf(node as IfClause);
         case "WhileClause":    return executeWhile(node as WhileClause);
@@ -101,6 +101,113 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
     }
 }
 
+// ---- In-process fd-level redirections ----------------------------------------
+// Applies redirections around a block for compound commands (brace groups,
+// subshells) that execute in-process rather than in a forked child.
+
+async function withRedirections(redirs: Redirection[], body: () => Promise<ExecResult>): Promise<ExecResult> {
+    if (redirs.length === 0) return body();
+
+    const saved: Array<{ fd: number; savedFd: number }> = [];
+    const opened: number[] = [];
+
+    try {
+        for (const r of redirs) {
+            const target = await expandWordToStr(r.target);
+            const seg = r.target.segments[0];
+            const isHereDoc = seg?.type === "HereDoc";
+
+            if (isHereDoc) {
+                // Here-doc: create a pipe, write body into it, redirect stdin from it.
+                const hd = seg as { type: "HereDoc"; body: string; quoted: boolean };
+                const bodyText = hd.quoted ? hd.body : expandHereDocVars(hd.body);
+                const [readEnd, writeEnd] = native.createCloexecPipe();
+                native.clearCloexec(readEnd);
+                native.clearCloexec(writeEnd);
+                const buf = Buffer.from(bodyText);
+                let written = 0;
+                while (written < buf.length) {
+                    written += require("node:fs").writeSync(writeEnd, buf, written);
+                }
+                native.closeFd(writeEnd);
+                const srcFd = r.fd ?? 0;
+                saved.push({ fd: srcFd, savedFd: native.dupFd(srcFd) });
+                native.dup2Fd(readEnd, srcFd);
+                native.closeFd(readEnd);
+                continue;
+            }
+
+            switch (r.op) {
+                case ">": case ">>": {
+                    const flags = r.op === ">"
+                        ? fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC
+                        : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
+                    const fileFd = openSync(target, flags, 0o666);
+                    opened.push(fileFd);
+                    const srcFd = r.fd ?? 1;
+                    saved.push({ fd: srcFd, savedFd: native.dupFd(srcFd) });
+                    native.dup2Fd(fileFd, srcFd);
+                    break;
+                }
+                case "<": {
+                    const fileFd = openSync(target, fsConstants.O_RDONLY);
+                    opened.push(fileFd);
+                    const srcFd = r.fd ?? 0;
+                    saved.push({ fd: srcFd, savedFd: native.dupFd(srcFd) });
+                    native.dup2Fd(fileFd, srcFd);
+                    break;
+                }
+                case ">&": {
+                    // fd duplication: e.g. 2>&1
+                    const dstFd = parseInt(target, 10);
+                    const srcFd = r.fd ?? 1;
+                    saved.push({ fd: srcFd, savedFd: native.dupFd(srcFd) });
+                    native.dup2Fd(dstFd, srcFd);
+                    break;
+                }
+                case "<&": {
+                    const dstFd = parseInt(target, 10);
+                    const srcFd = r.fd ?? 0;
+                    saved.push({ fd: srcFd, savedFd: native.dupFd(srcFd) });
+                    native.dup2Fd(dstFd, srcFd);
+                    break;
+                }
+                case "&>": case "&>>": {
+                    // Redirect both stdout and stderr to file.
+                    const flags = r.op === "&>"
+                        ? fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC
+                        : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
+                    const fileFd = openSync(target, flags, 0o666);
+                    opened.push(fileFd);
+                    saved.push({ fd: 1, savedFd: native.dupFd(1) });
+                    saved.push({ fd: 2, savedFd: native.dupFd(2) });
+                    native.dup2Fd(fileFd, 1);
+                    native.dup2Fd(fileFd, 2);
+                    break;
+                }
+            }
+        }
+
+        return await body();
+    } finally {
+        // Restore all saved fds in reverse order.
+        for (let i = saved.length - 1; i >= 0; i--) {
+            const { fd, savedFd } = saved[i]!;
+            native.dup2Fd(savedFd, fd);
+            native.closeFd(savedFd);
+        }
+        for (const fd of opened) {
+            closeSync(fd);
+        }
+    }
+}
+
+// ---- Brace group execution ---------------------------------------------------
+
+async function executeBraceGroup(node: BraceGroup): Promise<ExecResult> {
+    return withRedirections(node.redirections, () => executeNode(node.body));
+}
+
 // ---- Subshell execution (isolated environment) ------------------------------
 
 async function executeSubshell(node: Subshell): Promise<ExecResult> {
@@ -109,7 +216,7 @@ async function executeSubshell(node: Subshell): Promise<ExecResult> {
     const savedParams = snapshotParams();
     pushSnapshot();
     try {
-        return await executeNode(node.body);
+        return await withRedirections(node.redirections, () => executeNode(node.body));
     } finally {
         popSnapshot();
         restoreShellOpts(savedOpts);
