@@ -4,6 +4,7 @@ export type {
     LiteralSegment, SingleQuotedSegment, DoubleQuotedSegment,
     VariableExpansion, CommandSubstitution, ArithmeticExpansion, GlobSegment,
     IfClause, WhileClause, ForClause, FunctionDef, JsFunction, CaseClause,
+    ConditionalExpr,
 } from "./ast.js";
 
 export { Lexer, TokenType, LexerError } from "./lexer.js";

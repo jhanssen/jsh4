@@ -55,6 +55,8 @@
 - [x] `local` — function-scoped variables with save/restore
 - [x] `shift` — shift positional parameters by N
 - [x] `exec` — replace shell process via native `execvp`
+- [x] `type` / `which` — command lookup (alias, builtin, function, PATH)
+- [x] `[[ ]]` — extended conditional: `=~` regex, `<`/`>` string comparison, `&&`/`||`/`!`/`()`
 
 ### Expansion
 - [x] Variable expansion with all operators (`:-`, `:+`, `:=`, `:?`, `#`, `##`, `%`, `%%`)
@@ -112,17 +114,12 @@
 
 ## Pending
 
-### High priority (needed for real scripts)
-
-- [ ] **`[[` extended test** — regex matching `=~`, `<`/`>` string comparison
-
 ### Medium priority
 
 - [ ] **Subshells `(...)`** — currently run in-process (variable mutations leak); needs clone-and-restore of variable store + cwd
 - [ ] **`$@` / `$*` proper word splitting** — currently joins with space; should produce separate words in `for i in "$@"`
 - [ ] **Background `&` / job control** — job table, `jobs`, `fg`, `bg`, `SIGCHLD` tracking, `SIGTSTP`
 - [ ] **`$PIPESTATUS`** — exit codes of each pipeline stage
-- [ ] **`type` / `which` builtins** — command lookup; common for checking if commands exist
 - [ ] **Arithmetic in `$((...))`: `++`/`--`** — currently only basic JS arithmetic; shell-specific operators
 
 ### Lower priority / quality of life

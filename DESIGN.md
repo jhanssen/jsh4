@@ -254,12 +254,13 @@ Builtins execute in-process (no fork):
 | `local` | ✅ | Function-scoped variables with save/restore |
 | `shift` | ✅ | Shift positional parameters |
 | `exec` | ✅ | Replace shell with command (native `execvp`) |
+| `type` / `which` | ✅ | Command lookup (alias, builtin, function, PATH) |
+| `[[ ]]` | ✅ | Extended conditional (`=~` regex, `<`/`>`, `&&`/`||`) |
 | `eval` | ❌ | Parse and execute string |
 | `jobs` | ❌ | List jobs |
 | `fg` | ❌ | Foreground a job |
 | `bg` | ❌ | Background a job |
 | `printf` | ❌ | Formatted output |
-| `type` / `which` | ❌ | Command lookup |
 | `hash` | ❌ | Command hash table |
 | `trap` | ❌ | Signal trapping |
 

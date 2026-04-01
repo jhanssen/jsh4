@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
-import { createReadStream, createWriteStream, read as fsRead, readFileSync, readSync } from "node:fs";
+import { createReadStream, createWriteStream, read as fsRead, readFileSync, readSync, accessSync, constants as fsConstants } from "node:fs";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -8,6 +8,7 @@ const fsReadAsync = promisify(fsRead);
 import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup,
     IfClause, WhileClause, ForClause, FunctionDef, JsFunction, CaseClause,
+    ConditionalExpr,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl } from "../expander/index.js";
@@ -89,6 +90,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         case "ForClause":      return executeFor(node as ForClause);
         case "FunctionDef":    return executeFunctionDef(node as FunctionDef);
         case "CaseClause":     return executeCase(node as CaseClause);
+        case "ConditionalExpr": return executeConditionalExpr(node as ConditionalExpr);
         case "JsFunction":     return executeJsStage(node as JsFunction, 0, 1);
         default:
             process.stderr.write(`jsh: unimplemented: ${node.type}\n`);
@@ -896,9 +898,161 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             // No args: exec with no command is a no-op (POSIX: redirections-only form not yet supported)
             if (args.length === 0) return { exitCode: 0 };
             return runExec(name, args);
+        case "type":
+            return runType(args);
+        case "which":
+            return runWhich(args);
         default:
             return null;
     }
+}
+
+// ---- [[ conditional expression ]] -------------------------------------------
+
+async function executeConditionalExpr(node: ConditionalExpr): Promise<ExecResult> {
+    // Expand each word to a string (no glob expansion inside [[ ]])
+    const args: string[] = [];
+    for (const w of node.words) {
+        args.push(await expandWordToStr(w));
+    }
+    try {
+        return { exitCode: evalCondExpr(args, 0, args.length)[0] ? 0 : 1 };
+    } catch (e) {
+        process.stderr.write(`[[: ${e instanceof Error ? e.message : e}\n`);
+        return { exitCode: 2 };
+    }
+}
+
+type CondResult = [boolean, number];
+
+function evalCondExpr(args: string[], pos: number, end: number): CondResult {
+    if (pos >= end) return [false, pos];
+    let [val, next] = evalCondAnd(args, pos, end);
+    while (next < end && args[next] === "||") {
+        const [rhs, rn] = evalCondAnd(args, next + 1, end);
+        val = val || rhs;
+        next = rn;
+    }
+    return [val, next];
+}
+
+function evalCondAnd(args: string[], pos: number, end: number): CondResult {
+    let [val, next] = evalCondNot(args, pos, end);
+    while (next < end && args[next] === "&&") {
+        const [rhs, rn] = evalCondNot(args, next + 1, end);
+        val = val && rhs;
+        next = rn;
+    }
+    return [val, next];
+}
+
+function evalCondNot(args: string[], pos: number, end: number): CondResult {
+    if (pos < end && args[pos] === "!") {
+        const [val, next] = evalCondNot(args, pos + 1, end);
+        return [!val, next];
+    }
+    return evalCondPrimary(args, pos, end);
+}
+
+function evalCondPrimary(args: string[], pos: number, end: number): CondResult {
+    if (pos >= end) return [false, pos];
+    const tok = args[pos]!;
+
+    // Parenthesized
+    if (tok === "(") {
+        const [val, next] = evalCondExpr(args, pos + 1, end);
+        if (next >= end || args[next] !== ")") throw new Error("missing ')'");
+        return [val, next + 1];
+    }
+
+    // Unary operators (reuse test's unary ops)
+    if (pos + 1 < end) {
+        const unary = evalUnaryTest(tok, args[pos + 1]!);
+        if (unary !== null) return [unary, pos + 2];
+    }
+
+    // Binary operators
+    if (pos + 2 < end) {
+        const op = args[pos + 1]!;
+        const right = args[pos + 2]!;
+        // [[ extensions
+        if (op === "=~") {
+            try {
+                return [new RegExp(right).test(tok), pos + 3];
+            } catch {
+                throw new Error(`invalid regex: ${right}`);
+            }
+        }
+        if (op === "<") return [tok < right, pos + 3];
+        if (op === ">") return [tok > right, pos + 3];
+        // Standard binary ops from test
+        const bin = evalBinaryOp(tok, op, right, pos);
+        if (bin !== null) return [bin, pos + 3];
+    }
+
+    // Single argument: true if non-empty
+    return [tok.length > 0, pos + 1];
+}
+
+// ---- type / which builtins --------------------------------------------------
+
+const BUILTIN_NAMES = new Set([
+    "cd", "exit", "export", "unset", "echo", "true", "false",
+    "test", "[", "set", "local", "shift", "exec", "read",
+    "source", ".", "alias", "unalias", "type", "which",
+]);
+
+function findInPath(cmd: string): string | null {
+    if (cmd.includes("/")) {
+        try { accessSync(cmd, fsConstants.X_OK); return cmd; } catch { return null; }
+    }
+    const path = String($["PATH"] ?? process.env["PATH"] ?? "");
+    for (const dir of path.split(":")) {
+        const full = dir + "/" + cmd;
+        try { accessSync(full, fsConstants.X_OK); return full; } catch { /* skip */ }
+    }
+    return null;
+}
+
+function classifyCommand(name: string): { kind: string; detail: string } | null {
+    const alias = getAlias(name);
+    if (alias) return { kind: "alias", detail: `${name} is aliased to '${alias}'` };
+    if (BUILTIN_NAMES.has(name)) return { kind: "builtin", detail: `${name} is a shell builtin` };
+    if (shellFunctions.has(name)) return { kind: "function", detail: `${name} is a shell function` };
+    if (name.startsWith("@") && lookupJsFunction(name.slice(1))) return { kind: "function", detail: `${name} is a JS pipeline function` };
+    const path = findInPath(name);
+    if (path) return { kind: "file", detail: `${name} is ${path}` };
+    return null;
+}
+
+function runType(args: string[]): ExecResult {
+    let exitCode = 0;
+    for (const name of args) {
+        const info = classifyCommand(name);
+        if (info) {
+            process.stdout.write(info.detail + "\n");
+        } else {
+            process.stderr.write(`type: ${name}: not found\n`);
+            exitCode = 1;
+        }
+    }
+    return { exitCode };
+}
+
+function runWhich(args: string[]): ExecResult {
+    let exitCode = 0;
+    for (const name of args) {
+        const path = findInPath(name);
+        if (path) {
+            process.stdout.write(path + "\n");
+        } else if (BUILTIN_NAMES.has(name)) {
+            process.stdout.write(`${name}: shell built-in command\n`);
+        } else {
+            process.stderr.write(`which: ${name}: not found\n`);
+            exitCode = 1;
+        }
+    }
+    return { exitCode };
 }
 
 // ---- exec builtin -----------------------------------------------------------

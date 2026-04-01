@@ -147,6 +147,11 @@ export interface CaseClause extends ASTNode {
     items: CaseItem[];
 }
 
+export interface ConditionalExpr extends ASTNode {
+    type: "ConditionalExpr";
+    words: Word[];  // tokens between [[ and ]]
+}
+
 export interface JsFunction extends ASTNode {
     type: "JsFunction";
     name: string;           // function name (empty for inline @{ })

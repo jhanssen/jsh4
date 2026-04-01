@@ -22,6 +22,7 @@ const BUILTINS = [
     "cd", "exit", "export", "unset", "source", "eval", "exec",
     "jobs", "fg", "bg", "alias", "unalias", "set", "shift",
     "read", "echo", "printf", "test", "true", "false", "type",
+    "which", "local",
 ];
 
 // Cached PATH command list — rebuilt when PATH changes.

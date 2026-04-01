@@ -456,6 +456,77 @@ describe("executor — set builtin", () => {
     });
 });
 
+describe("executor — [[ ]] conditional expression", () => {
+    it("should test file existence", () => {
+        assert.strictEqual(ec("[[ -f package.json ]]"), 0);
+    });
+    it("should test file non-existence", () => {
+        assert.strictEqual(ec("[[ -f __nope__ ]]"), 1);
+    });
+    it("should test string equality", () => {
+        assert.strictEqual(ec('[[ foo == foo ]]'), 0);
+    });
+    it("should test string inequality", () => {
+        assert.strictEqual(ec('[[ foo != bar ]]'), 0);
+    });
+    it("should support regex matching with =~", () => {
+        assert.strictEqual(ec('[[ hello =~ ^he ]]'), 0);
+    });
+    it("should fail regex when no match", () => {
+        assert.strictEqual(ec('[[ hello =~ ^wo ]]'), 1);
+    });
+    it("should support < string comparison", () => {
+        assert.strictEqual(ec('[[ abc < def ]]'), 0);
+    });
+    it("should support > string comparison", () => {
+        assert.strictEqual(ec('[[ def > abc ]]'), 0);
+    });
+    it("should support && inside [[ ]]", () => {
+        assert.strictEqual(ec('[[ -f package.json && -d src ]]'), 0);
+    });
+    it("should support || inside [[ ]]", () => {
+        assert.strictEqual(ec('[[ -f __nope__ || -d src ]]'), 0);
+    });
+    it("should support ! negation", () => {
+        assert.strictEqual(ec('[[ ! -f __nope__ ]]'), 0);
+    });
+    it("should support parenthesized grouping", () => {
+        assert.strictEqual(ec('[[ ( -f __nope__ || -d src ) && -f package.json ]]'), 0);
+    });
+    it("should work with if statement", () => {
+        assert.strictEqual(run('if [[ -d src ]]; then echo yes; fi'), "yes");
+    });
+    it("should support variable expansion", () => {
+        assert.strictEqual(run('X=hello; [[ $X == hello ]] && echo match'), "match");
+    });
+});
+
+describe("executor — type / which builtins", () => {
+    it("should identify builtins", () => {
+        assert.strictEqual(run("type echo"), "echo is a shell builtin");
+    });
+    it("should identify external commands", () => {
+        const out = run("type ls");
+        assert.ok(out.includes("ls is /"), `expected path, got: ${out}`);
+    });
+    it("should return 1 for unknown commands", () => {
+        assert.strictEqual(ec("type __no_such_cmd_jsh__"), 1);
+    });
+    it("should identify shell functions", () => {
+        assert.strictEqual(run("myfn() { echo hi; }; type myfn"), "myfn is a shell function");
+    });
+    it("should print path with which", () => {
+        const out = run("which ls");
+        assert.ok(out.startsWith("/"), `expected absolute path, got: ${out}`);
+    });
+    it("should identify builtins with which when no binary exists", () => {
+        assert.ok(run("which local").includes("built-in"));
+    });
+    it("should return 1 for unknown commands with which", () => {
+        assert.strictEqual(ec("which __no_such_cmd_jsh__"), 1);
+    });
+});
+
 describe("executor — brace expansion", () => {
     it("should expand comma-separated braces", () => {
         assert.strictEqual(run("echo {a,b,c}"), "a b c");

@@ -2,6 +2,7 @@ import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List,
     Subshell, BraceGroup, Redirection, Word, WordSegment,
     IfClause, WhileClause, ForClause, FunctionDef, CaseClause, CaseItem,
+    ConditionalExpr,
 } from "./ast.js";
 import { Lexer, TokenType } from "./lexer.js";
 import type { Token } from "./lexer.js";
@@ -196,6 +197,9 @@ export class Parser {
             if (kw === "until") return this.parseWhile(true);
             if (kw === "for")   return this.parseFor();
             if (kw === "case")  return this.parseCase();
+
+            // [[ conditional expression
+            if (tok.value === "[[") return this.parseConditionalExpr();
 
             // Function definition: NAME ( )
             if (kw !== null && this.lexer.peekAt(1).type === TokenType.LParen &&
@@ -476,6 +480,63 @@ export class Parser {
         }
         this.lexer.next();
         return { type: "Subshell", body, redirections: this.parseRedirections() };
+    }
+
+    // conditional_expr : '[[' word* ']]'
+    private parseConditionalExpr(): ConditionalExpr {
+        this.lexer.next(); // consume [[
+        const words: Word[] = [];
+        while (true) {
+            const tok = this.lexer.peek();
+            if (tok.type === TokenType.EOF) {
+                throw new IncompleteInputError("Expected ']]'");
+            }
+            // ]] can be a Word token or parsed as special
+            if (tok.type === TokenType.Word && tok.value === "]]") {
+                this.lexer.next();
+                break;
+            }
+            // && and || are operators inside [[ ]]
+            if (tok.type === TokenType.And) {
+                words.push({ segments: [{ type: "Literal", value: "&&" }] });
+                this.lexer.next();
+                continue;
+            }
+            if (tok.type === TokenType.Or) {
+                words.push({ segments: [{ type: "Literal", value: "||" }] });
+                this.lexer.next();
+                continue;
+            }
+            // ( and ) for grouping
+            if (tok.type === TokenType.LParen) {
+                words.push({ segments: [{ type: "Literal", value: "(" }] });
+                this.lexer.next();
+                continue;
+            }
+            if (tok.type === TokenType.RParen) {
+                words.push({ segments: [{ type: "Literal", value: ")" }] });
+                this.lexer.next();
+                continue;
+            }
+            // Bang for negation
+            if (tok.type === TokenType.Bang) {
+                words.push({ segments: [{ type: "Literal", value: "!" }] });
+                this.lexer.next();
+                continue;
+            }
+            // < and > are string comparison operators inside [[ ]]
+            if (tok.type === TokenType.Redirect && (tok.value === "<" || tok.value === ">")) {
+                words.push({ segments: [{ type: "Literal", value: tok.value }] });
+                this.lexer.next();
+                continue;
+            }
+            if (tok.type !== TokenType.Word) {
+                throw new ParseError(`Unexpected token in [[ ]]: ${tok.value} (${tok.type})`);
+            }
+            words.push(tok.word!);
+            this.lexer.next();
+        }
+        return { type: "ConditionalExpr", words };
     }
 
     // brace_group : '{' list '}'
