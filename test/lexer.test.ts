@@ -373,4 +373,59 @@ describe("lexer", () => {
             assert.deepStrictEqual(tokenTypes("   \t  "), [TokenType.EOF]);
         });
     });
+
+    describe("token positions", () => {
+        it("should track start and end offsets", () => {
+            const lexer = new Lexer("echo hello");
+            const tokens = lexer.getTokens();
+            assert.strictEqual(tokens[0]!.start, 0);
+            assert.strictEqual(tokens[0]!.end, 4);
+            assert.strictEqual(tokens[1]!.start, 5);
+            assert.strictEqual(tokens[1]!.end, 10);
+        });
+
+        it("should track operator positions", () => {
+            const lexer = new Lexer("a | b && c");
+            const tokens = lexer.getTokens();
+            // a
+            assert.strictEqual(tokens[0]!.start, 0);
+            assert.strictEqual(tokens[0]!.end, 1);
+            // |
+            assert.strictEqual(tokens[1]!.start, 2);
+            assert.strictEqual(tokens[1]!.end, 3);
+            // b
+            assert.strictEqual(tokens[2]!.start, 4);
+            assert.strictEqual(tokens[2]!.end, 5);
+            // &&
+            assert.strictEqual(tokens[3]!.start, 6);
+            assert.strictEqual(tokens[3]!.end, 8);
+        });
+
+        it("should track EOF at input length", () => {
+            const lexer = new Lexer("ls");
+            const tokens = lexer.getTokens();
+            const eof = tokens[tokens.length - 1]!;
+            assert.strictEqual(eof.type, TokenType.EOF);
+            assert.strictEqual(eof.start, 2);
+        });
+    });
+
+    describe("partial mode", () => {
+        it("should not throw on incomplete input in partial mode", () => {
+            const lexer = new Lexer("echo 'unterminated", { partial: true });
+            const tokens = lexer.getTokens();
+            assert.ok(tokens.length >= 1);
+            assert.strictEqual(tokens[tokens.length - 1]!.type, TokenType.EOF);
+        });
+
+        it("should produce tokens before the error", () => {
+            const lexer = new Lexer("echo hello | ", { partial: true });
+            const tokens = lexer.getTokens().filter(t => t.type !== TokenType.EOF);
+            assert.ok(tokens.length >= 3); // echo, hello, |
+        });
+
+        it("should still throw in normal mode", () => {
+            assert.throws(() => new Lexer("echo 'unterminated"));
+        });
+    });
 });
