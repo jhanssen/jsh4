@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -120,7 +120,7 @@ describe("executor — builtins", () => {
     });
 
     it("cd changes directory and PWD is updated", () => {
-        assert.strictEqual(run("cd /tmp && echo $PWD"), "/tmp");
+        assert.strictEqual(run("cd /tmp && echo $PWD"), realpathSync("/tmp"));
     });
 
     it("export makes variable visible to children", () => {
