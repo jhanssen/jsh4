@@ -4,7 +4,7 @@ import type {
 } from "../parser/index.js";
 import { $ } from "../variables/index.js";
 import { getParam, getAllParams, getParamCount } from "../variables/positional.js";
-import { readdir } from "node:fs/promises";
+import { glob } from "node:fs/promises";
 import * as os from "node:os";
 
 // Registered by the executor to break the circular dependency.
@@ -41,47 +41,16 @@ export async function expandWordToStr(word: Word): Promise<string> {
 // ---- Glob expansion ---------------------------------------------------------
 
 async function expandGlob(pattern: string): Promise<string[]> {
-    const lastSlash = pattern.lastIndexOf("/");
-    const dir = lastSlash >= 0 ? (pattern.slice(0, lastSlash) || "/") : ".";
-    const filePat = lastSlash >= 0 ? pattern.slice(lastSlash + 1) : pattern;
-
-    // Only handle glob in the last path component for now.
-    if (!/[*?[]/.test(filePat)) return [pattern];
-
-    const regex = globToRegex(filePat);
-
     try {
-        const entries = await readdir(dir);
-        const matches = entries
-            .filter(e => !e.startsWith(".") || filePat.startsWith("."))
-            .filter(e => regex.test(e))
-            .sort();
-
+        const matches: string[] = [];
+        for await (const match of glob(pattern, { withFileTypes: false })) {
+            matches.push(match as string);
+        }
         if (matches.length === 0) return [pattern]; // no match → pass through literally
-        return matches.map(e => dir === "." ? e : `${dir}/${e}`);
+        return matches.sort();
     } catch {
         return [pattern];
     }
-}
-
-function globToRegex(pattern: string): RegExp {
-    let re = "^";
-    let i = 0;
-    while (i < pattern.length) {
-        const ch = pattern[i]!;
-        if (ch === "*") {
-            re += "[^/]*"; i++;
-        } else if (ch === "?") {
-            re += "[^/]"; i++;
-        } else if (ch === "[") {
-            const end = pattern.indexOf("]", i + 1);
-            if (end === -1) { re += "\\["; i++; }
-            else { re += pattern.slice(i, end + 1); i = end + 1; }
-        } else {
-            re += ch.replace(/[.+^${}()|\\]/g, "\\$&"); i++;
-        }
-    }
-    return new RegExp(re + "$");
 }
 
 // ---- Segment expansion ------------------------------------------------------
