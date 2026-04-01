@@ -17,6 +17,8 @@ struct LinenoiseCtx {
     char buf[4096];
     Napi::FunctionReference onLine;
     Napi::FunctionReference completionCb;
+    Napi::FunctionReference colorizeCb;
+    std::string rpromptStr;
     bool active = false;
 };
 
@@ -34,6 +36,30 @@ static void completionCallback(const char* input, linenoiseCompletions* lc) {
                 linenoiseAddCompletion(lc, item.As<Napi::String>().Utf8Value().c_str());
             }
         }
+    }
+}
+
+static void colorizeCallbackC(const char* buf, char* colorized, size_t maxlen, size_t* out_len) {
+    if (!g_ctx || g_ctx->colorizeCb.IsEmpty()) {
+        size_t len = strlen(buf);
+        if (len > maxlen) len = maxlen;
+        memcpy(colorized, buf, len);
+        *out_len = len;
+        return;
+    }
+    Napi::Env env = g_ctx->colorizeCb.Env();
+    Napi::Value result = g_ctx->colorizeCb.Call({Napi::String::New(env, buf)});
+    if (result.IsString()) {
+        std::string str = result.As<Napi::String>().Utf8Value();
+        size_t len = str.size();
+        if (len > maxlen) len = maxlen;
+        memcpy(colorized, str.c_str(), len);
+        *out_len = len;
+    } else {
+        size_t len = strlen(buf);
+        if (len > maxlen) len = maxlen;
+        memcpy(colorized, buf, len);
+        *out_len = len;
     }
 }
 
@@ -260,10 +286,38 @@ static Napi::Value WriteFd(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value SetColorize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (!g_ctx) g_ctx = new LinenoiseCtx();
+    if (info.Length() > 0 && info[0].IsFunction()) {
+        g_ctx->colorizeCb = Napi::Persistent(info[0].As<Napi::Function>());
+        linenoiseSetColorizeCallback(colorizeCallbackC);
+    } else {
+        g_ctx->colorizeCb.Reset();
+        linenoiseSetColorizeCallback(NULL);
+    }
+    return env.Undefined();
+}
+
+static Napi::Value SetRightPrompt(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (!g_ctx) g_ctx = new LinenoiseCtx();
+    if (info.Length() > 0 && info[0].IsString()) {
+        g_ctx->rpromptStr = info[0].As<Napi::String>().Utf8Value();
+        linenoiseSetRightPrompt(&g_ctx->ls, g_ctx->rpromptStr.c_str());
+    } else {
+        g_ctx->rpromptStr.clear();
+        linenoiseSetRightPrompt(&g_ctx->ls, NULL);
+    }
+    return env.Undefined();
+}
+
 Napi::Object InitLinenoise(Napi::Env env, Napi::Object exports) {
     exports.Set("linenoiseStart",         Napi::Function::New(env, Start));
     exports.Set("linenoiseStop",          Napi::Function::New(env, Stop));
     exports.Set("linenoiseSetCompletion", Napi::Function::New(env, SetCompletion));
+    exports.Set("linenoiseSetColorize",  Napi::Function::New(env, SetColorize));
+    exports.Set("linenoiseSetRightPrompt", Napi::Function::New(env, SetRightPrompt));
     exports.Set("linenoiseHide",          Napi::Function::New(env, Hide));
     exports.Set("linenoiseShow",          Napi::Function::New(env, Show));
     exports.Set("linenoiseHistoryAdd",    Napi::Function::New(env, HistoryAdd));

@@ -29,10 +29,23 @@ const BUILTINS = [
 let pathCache: string[] | null = null;
 let lastPath: string | undefined;
 
+let pathSet: Set<string> | null = null;
+
+export function commandExists(name: string): boolean {
+    // Check builtins
+    if (BUILTINS.includes(name)) return true;
+    // Check PATH cache
+    getPathCommands(); // ensure cache is populated
+    if (!pathSet) pathSet = new Set(pathCache!);
+    else if (pathCache && pathSet.size !== pathCache.length) pathSet = new Set(pathCache);
+    return pathSet.has(name);
+}
+
 function getPathCommands(): string[] {
     const path = String($["PATH"] ?? process.env["PATH"] ?? "");
     if (pathCache && lastPath === path) return pathCache;
     lastPath = path;
+    pathSet = null;
     const cmds = new Set<string>();
     for (const dir of path.split(":")) {
         try {

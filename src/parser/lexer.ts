@@ -23,6 +23,8 @@ export enum TokenType {
 export interface Token {
     type: TokenType;
     value: string;
+    start: number;        // byte offset of token start in input
+    end: number;          // byte offset of token end in input
     word?: Word;          // parsed word with segments (for Word tokens)
     fd?: number;          // for redirections: the fd number prefix
     jsBuffered?: boolean; // for JsInline tokens: true if @!{ }
@@ -40,10 +42,22 @@ export class Lexer {
     // Pending here-doc tokens awaiting body scan after end of current line.
     private pendingHereDocs: Array<{ token: Token; delim: string; quoted: boolean; stripTabs: boolean }> = [];
 
-    constructor(input: string) {
+    constructor(input: string, options?: { partial?: boolean }) {
         this.input = input;
         this.pos = 0;
-        this.tokenize();
+        if (options?.partial) {
+            try {
+                this.tokenize();
+            } catch (e) {
+                if (e instanceof IncompleteInputError || e instanceof LexerError) {
+                    this.tokens.push({ type: TokenType.EOF, value: "", start: this.input.length, end: this.input.length });
+                } else {
+                    throw e;
+                }
+            }
+        } else {
+            this.tokenize();
+        }
     }
 
     private tokenize(): void {
@@ -61,6 +75,7 @@ export class Lexer {
 
             // Newline — process any pending here-doc bodies first.
             if (ch === "\n") {
+                const nlStart = this.pos;
                 this.pos++;
                 if (this.pendingHereDocs.length > 0) {
                     for (const hd of this.pendingHereDocs) {
@@ -69,7 +84,7 @@ export class Lexer {
                     }
                     this.pendingHereDocs = [];
                 }
-                this.tokens.push({ type: TokenType.Newline, value: "\n" });
+                this.tokens.push({ type: TokenType.Newline, value: "\n", start: nlStart, end: this.pos });
                 continue;
             }
 
@@ -104,7 +119,7 @@ export class Lexer {
             );
         }
 
-        this.tokens.push({ type: TokenType.EOF, value: "" });
+        this.tokens.push({ type: TokenType.EOF, value: "", start: this.input.length, end: this.input.length });
     }
 
     private skipSpacesAndTabs(): void {
@@ -125,49 +140,50 @@ export class Lexer {
     }
 
     private tryOperator(): Token | null {
+        const s = this.pos;
         const rest = this.input.slice(this.pos);
 
         // @{ expr } and @!{ expr } — inline JS functions
         if (rest.startsWith("@!{")) {
             this.pos += 3;
             const body = this.readJsExpression();
-            return { type: TokenType.JsInline, value: body, jsBuffered: true };
+            return { type: TokenType.JsInline, value: body, start: s, end: this.pos, jsBuffered: true };
         }
         if (rest.startsWith("@{")) {
             this.pos += 2;
             const body = this.readJsExpression();
-            return { type: TokenType.JsInline, value: body, jsBuffered: false };
+            return { type: TokenType.JsInline, value: body, start: s, end: this.pos, jsBuffered: false };
         }
 
         // ;; case terminator (must come before single ;)
         if (rest.startsWith(";;")) {
             this.pos += 2;
-            return { type: TokenType.CaseSemi, value: ";;" };
+            return { type: TokenType.CaseSemi, value: ";;", start: s, end: this.pos };
         }
 
         // Two-char operators first
         if (rest.startsWith("&&")) {
             this.pos += 2;
-            return { type: TokenType.And, value: "&&" };
+            return { type: TokenType.And, value: "&&", start: s, end: this.pos };
         }
         if (rest.startsWith("||")) {
             this.pos += 2;
-            return { type: TokenType.Or, value: "||" };
+            return { type: TokenType.Or, value: "||", start: s, end: this.pos };
         }
         if (rest.startsWith("|&")) {
             this.pos += 2;
-            return { type: TokenType.PipeAnd, value: "|&" };
+            return { type: TokenType.PipeAnd, value: "|&", start: s, end: this.pos };
         }
 
         const ch = this.input[this.pos]!;
 
         if (ch === "|") {
             this.pos++;
-            return { type: TokenType.Pipe, value: "|" };
+            return { type: TokenType.Pipe, value: "|", start: s, end: this.pos };
         }
         if (ch === ";") {
             this.pos++;
-            return { type: TokenType.Semi, value: ";" };
+            return { type: TokenType.Semi, value: ";", start: s, end: this.pos };
         }
         // & but not &> or &>>
         if (ch === "&") {
@@ -175,22 +191,22 @@ export class Lexer {
                 return null; // let redirection handle it
             }
             this.pos++;
-            return { type: TokenType.Amp, value: "&" };
+            return { type: TokenType.Amp, value: "&", start: s, end: this.pos };
         }
         if (ch === "(") {
             this.pos++;
-            return { type: TokenType.LParen, value: "(" };
+            return { type: TokenType.LParen, value: "(", start: s, end: this.pos };
         }
         if (ch === ")") {
             this.pos++;
-            return { type: TokenType.RParen, value: ")" };
+            return { type: TokenType.RParen, value: ")", start: s, end: this.pos };
         }
         if (ch === "!") {
             // Only treat as bang if followed by whitespace or at a position where it's the start of a pipeline
             const next = this.pos + 1 < this.input.length ? this.input[this.pos + 1] : "";
             if (next === " " || next === "\t" || next === "\n" || next === "" || next === "(") {
                 this.pos++;
-                return { type: TokenType.Bang, value: "!" };
+                return { type: TokenType.Bang, value: "!", start: s, end: this.pos };
             }
         }
 
@@ -205,11 +221,11 @@ export class Lexer {
             const rest = this.input.slice(this.pos);
             if (rest.startsWith("&>>")) {
                 this.pos += 3;
-                return { type: TokenType.Redirect, value: "&>>" };
+                return { type: TokenType.Redirect, value: "&>>", start: startPos, end: this.pos };
             }
             if (rest.startsWith("&>")) {
                 this.pos += 2;
-                return { type: TokenType.Redirect, value: "&>" };
+                return { type: TokenType.Redirect, value: "&>", start: startPos, end: this.pos };
             }
             return null;
         }
@@ -272,7 +288,7 @@ export class Lexer {
 
                         const { delim, quoted } = this.readHeredocDelim();
                         // Create token with empty body; body is filled after line ends.
-                        const tok: Token = { type: TokenType.Redirect, value: op, fd, hereDoc: { delim, body: "", quoted } };
+                        const tok: Token = { type: TokenType.Redirect, value: op, start: startPos, end: this.pos, fd, hereDoc: { delim, body: "", quoted } };
                         this.pendingHereDocs.push({ token: tok, delim, quoted, stripTabs });
                         return tok;
                     }
@@ -280,7 +296,7 @@ export class Lexer {
             }
         }
 
-        return { type: TokenType.Redirect, value: op, fd };
+        return { type: TokenType.Redirect, value: op, start: startPos, end: this.pos, fd };
     }
 
     private readWord(): Token | null {
@@ -352,19 +368,21 @@ export class Lexer {
             if (this.pos < this.input.length) {
                 const ch = this.input[this.pos]!;
                 if (ch === "{") {
+                    const s = this.pos;
                     this.pos++;
-                    return { type: TokenType.LBrace, value: "{" };
+                    return { type: TokenType.LBrace, value: "{", start: s, end: this.pos };
                 }
                 if (ch === "}") {
+                    const s = this.pos;
                     this.pos++;
-                    return { type: TokenType.RBrace, value: "}" };
+                    return { type: TokenType.RBrace, value: "}", start: s, end: this.pos };
                 }
             }
             return null;
         }
 
         const word: Word = { segments };
-        return { type: TokenType.Word, value: this.input.slice(startPos, this.pos), word };
+        return { type: TokenType.Word, value: this.input.slice(startPos, this.pos), start: startPos, end: this.pos, word };
     }
 
     private readLiteral(): WordSegment {

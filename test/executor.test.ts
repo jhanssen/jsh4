@@ -898,3 +898,88 @@ describe("executor — job control", () => {
         assert.strictEqual(ec("jobs"), 0);
     });
 });
+
+describe("executor — eval builtin", () => {
+    it("should execute a string as a command", () => {
+        assert.strictEqual(run('eval "echo hello"'), "hello");
+    });
+
+    it("should execute in current context", () => {
+        assert.strictEqual(run('X=42; eval "echo \\$X"'), "42");
+    });
+
+    it("should handle command substitution in eval", () => {
+        assert.strictEqual(run('eval "$(echo echo hi)"'), "hi");
+    });
+
+    it("should return 0 for empty eval", () => {
+        assert.strictEqual(ec("eval"), 0);
+    });
+
+    it("should concatenate multiple args", () => {
+        assert.strictEqual(run("eval echo hello world"), "hello world");
+    });
+});
+
+describe("executor — printf builtin", () => {
+    it("should format a string", () => {
+        assert.strictEqual(run('printf "%s\\n" hello'), "hello");
+    });
+
+    it("should format integers", () => {
+        assert.strictEqual(run('printf "%d\\n" 42'), "42");
+    });
+
+    it("should format hex", () => {
+        assert.strictEqual(run('printf "%x\\n" 255'), "ff");
+    });
+
+    it("should handle escape sequences in format", () => {
+        assert.strictEqual(run('printf "a\\tb"'), "a\tb");
+    });
+
+    it("should reuse format for multiple args", () => {
+        assert.strictEqual(run('printf "%s\\n" a b c'), "a\nb\nc");
+    });
+
+    it("should handle %q quoting", () => {
+        assert.strictEqual(run("printf '%q\\n' 'hello world'"), "'hello world'");
+    });
+
+    it("should handle %b escape expansion", () => {
+        assert.strictEqual(run('printf "%b" "hello\\nworld"'), "hello\nworld");
+    });
+
+    it("should output nothing without format args for %s", () => {
+        assert.strictEqual(run('printf "%s" ""'), "");
+    });
+
+    it("should handle %% literal percent", () => {
+        assert.strictEqual(run('printf "100%%\\n"'), "100%");
+    });
+});
+
+describe("executor — trap builtin", () => {
+    it("should run EXIT trap on exit", () => {
+        assert.strictEqual(run('trap "echo cleanup" EXIT'), "cleanup");
+    });
+
+    it("should list traps", () => {
+        const out = run('trap "echo bye" EXIT\ntrap');
+        assert.match(out, /trap -- 'echo bye' EXIT/);
+    });
+
+    it("should reset trap with -", () => {
+        // After resetting, EXIT trap should not run
+        assert.strictEqual(run('trap "echo nope" EXIT\ntrap - EXIT'), "");
+    });
+
+    it("should handle empty action (ignore)", () => {
+        assert.strictEqual(run('trap "" EXIT'), "");
+    });
+
+    it("should reject invalid signal names", () => {
+        const { stderr } = runFull("trap 'echo x' INVALID");
+        assert.match(stderr, /invalid signal/);
+    });
+});

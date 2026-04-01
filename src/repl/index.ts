@@ -1,12 +1,18 @@
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { readFileSync } from "node:fs";
 import { parse, IncompleteInputError } from "../parser/index.js";
-import { execute, setCommandText, reapJobs } from "../executor/index.js";
+import { execute, executeString, setCommandText, reapJobs } from "../executor/index.js";
 import { $ } from "../variables/index.js";
-import { getPrompt, setPrompt, alias, unalias, registerJsFunction, exec, registerCompletion } from "../api/index.js";
+import {
+    getPromptAsync, setPrompt, setRightPrompt, getRightPromptAsync,
+    setColorize, getColorize, setTheme,
+    alias, unalias, registerJsFunction, exec, registerCompletion,
+} from "../api/index.js";
 import { getCompletions } from "../completion/index.js";
+import { colorize, getCurrentTheme } from "../colorize/index.js";
+import { runTrap } from "../trap/index.js";
 import type { JsPipelineFunction } from "../jsfunctions/index.js";
 
 const require = createRequire(import.meta.url);
@@ -18,6 +24,8 @@ const native = require("../../build/Release/jsh_native.node") as {
     linenoiseHistorySave: (path: string) => number;
     linenoiseHistoryLoad: (path: string) => number;
     linenoiseSetCompletion: (cb: (input: string) => string[]) => void;
+    linenoiseSetColorize: (cb: ((input: string) => string) | null) => void;
+    linenoiseSetRightPrompt: (rprompt: string | null) => void;
     EAGAIN: () => number;
 };
 
@@ -33,11 +41,24 @@ export async function startRepl(): Promise<void> {
         native.linenoiseHistorySetMaxLen(1000);
         native.linenoiseHistoryLoad(historyFile);
 
+        process.on("beforeExit", async () => {
+            await runTrap("EXIT", executeString);
+        });
         process.on("exit", () => {
             native.linenoiseHistorySave(historyFile);
         });
 
         native.linenoiseSetCompletion((input: string) => getCompletions(input));
+
+        // Set up syntax highlighting.
+        native.linenoiseSetColorize((input: string): string => {
+            const userFn = getColorize();
+            if (userFn) return userFn(input);
+            return colorize(input, getCurrentTheme());
+        });
+
+        // Emit OSC 7 (cwd) at startup.
+        emitOsc7();
 
         promptLoop("");
     } else {
@@ -50,7 +71,11 @@ async function loadRc(): Promise<void> {
     const rcPath = join(String($["HOME"] ?? homedir()), ".jshrc");
 
     // Expose the jsh API as a single global object.
-    const jshApi = { $, setPrompt, alias, unalias, registerJsFunction, exec, complete: registerCompletion };
+    const jshApi = {
+        $, setPrompt, setRightPrompt, setColorize, setTheme,
+        alias, unalias, registerJsFunction, exec,
+        complete: registerCompletion,
+    };
     (globalThis as Record<string, unknown>)["jsh"] = jshApi;
 
     try {
@@ -83,7 +108,13 @@ async function executeScript(input: string): Promise<void> {
     }
 }
 
-function promptLoop(buffer: string): void {
+function emitOsc7(): void {
+    const cwd = process.cwd();
+    const host = hostname();
+    process.stdout.write(`\x1b]7;file://${host}${cwd}\x07`);
+}
+
+async function promptLoop(buffer: string): Promise<void> {
     // Reap finished background jobs and print notifications.
     if (!buffer) {
         const notifications = reapJobs();
@@ -92,16 +123,26 @@ function promptLoop(buffer: string): void {
         }
     }
 
-    const prompt = buffer ? "> " : getPrompt();
+    const prompt = buffer ? "> " : await getPromptAsync();
+    const rprompt = buffer ? "" : await getRightPromptAsync();
 
-    native.linenoiseStart(prompt, async (line, errno) => {
+    // Set right prompt for linenoise.
+    native.linenoiseSetRightPrompt(rprompt || null);
+
+    // Build prompt with OSC 133 marks:
+    // A = prompt start, B = prompt end / command input begins
+    const markedPrompt = `\x1b]133;A\x07${prompt}\x1b]133;B\x07`;
+
+    native.linenoiseStart(markedPrompt, async (line, errno) => {
         if (line === null) {
             if (errno === EAGAIN) {
                 // Ctrl-C: clear buffer, restart prompt
                 if (buffer) process.stdout.write("\n");
+                process.stdout.write(`\x1b]133;D;130\x07`);
                 promptLoop("");
             } else {
                 process.stdout.write("\n");
+                await runTrap("EXIT", executeString);
                 process.exit(0);
             }
             return;
@@ -111,6 +152,7 @@ function promptLoop(buffer: string): void {
         const trimmed = input.trim();
 
         if (!trimmed) {
+            process.stdout.write(`\x1b]133;D;0\x07`);
             promptLoop("");
             return;
         }
@@ -120,8 +162,13 @@ function promptLoop(buffer: string): void {
             if (ast) {
                 native.linenoiseHistoryAdd(input);
                 setCommandText(trimmed);
+                // OSC 133;C — command execution begins
+                process.stdout.write("\x1b]133;C\x07");
                 await execute(ast);
             }
+            const exitCode = String($["?"] ?? "0");
+            process.stdout.write(`\x1b]133;D;${exitCode}\x07`);
+            emitOsc7();
             promptLoop("");
         } catch (e: unknown) {
             if (e instanceof IncompleteInputError) {
@@ -131,6 +178,7 @@ function promptLoop(buffer: string): void {
             }
             const msg = e instanceof Error ? e.message : String(e);
             process.stderr.write(`jsh: ${msg}\n`);
+            process.stdout.write(`\x1b]133;D;1\x07`);
             promptLoop("");
         }
     });

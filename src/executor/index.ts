@@ -21,6 +21,7 @@ import {
     addJob, removeJob, getJobBySpec, getCurrentJob, getAllJobs,
     markJobStopped, markJobRunning, reapFinishedJobs,
 } from "../jobs/index.js";
+import { setTrap, getAllTraps, runTrap } from "../trap/index.js";
 
 const require = createRequire(import.meta.url);
 interface PipelineResult {
@@ -65,6 +66,16 @@ export interface ExecResult {
 
 // Shell function registry.
 const shellFunctions = new Map<string, ASTNode>();
+
+// Execute a string as shell commands (used by trap and eval).
+export async function executeString(code: string): Promise<void> {
+    const ast = parse(code.trim());
+    if (ast) await executeNode(ast);
+}
+
+export function hasShellFunction(name: string): boolean {
+    return shellFunctions.has(name);
+}
 
 // Command text tracking for job display strings.
 let currentCommandText = "";
@@ -387,6 +398,34 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         const r = await runSource(args[0]!, args.slice(1));
         $["PIPESTATUS"] = [r.exitCode];
         return r;
+    }
+
+    // exit — run EXIT trap before exiting
+    if (command === "exit") {
+        const code = args[0] !== undefined ? parseInt(args[0], 10) : 0;
+        await runTrap("EXIT", executeString);
+        process.exit(isNaN(code) ? 0 : code);
+    }
+
+    // trap — register signal handlers
+    if (command === "trap") {
+        return runTrapBuiltin(args);
+    }
+
+    // eval — parse and execute string in current context
+    if (command === "eval") {
+        if (args.length === 0) return { exitCode: 0 };
+        const code = args.join(" ");
+        try {
+            const ast = parse(code);
+            if (!ast) return { exitCode: 0 };
+            const r = await executeNode(ast);
+            $["PIPESTATUS"] = [r.exitCode];
+            return r;
+        } catch (e: unknown) {
+            process.stderr.write(`eval: ${e instanceof Error ? e.message : e}\n`);
+            return { exitCode: 1 };
+        }
     }
 
     // Job control builtins (async).
@@ -1157,6 +1196,195 @@ function toInt(s: string): number {
     return n;
 }
 
+// ---- trap builtin -----------------------------------------------------------
+
+function runTrapBuiltin(args: string[]): ExecResult {
+    // No args: list current traps
+    if (args.length === 0) {
+        for (const [sig, action] of getAllTraps()) {
+            process.stdout.write(`trap -- ${shellQuote(action)} ${sig}\n`);
+        }
+        return { exitCode: 0 };
+    }
+
+    // trap -l: list signal names (not standard, but useful)
+    if (args[0] === "-l") {
+        process.stdout.write("EXIT INT TERM HUP QUIT ERR DEBUG RETURN\n");
+        return { exitCode: 0 };
+    }
+
+    // Single arg: treated as signal name with action inherited (print)
+    // trap action sig1 [sig2 ...]
+    if (args.length === 1) {
+        // Single arg could be a signal to display
+        const action = getAllTraps().get(args[0]!.toUpperCase().replace(/^SIG/, ""));
+        if (action !== undefined) {
+            process.stdout.write(`trap -- ${shellQuote(action)} ${args[0]}\n`);
+        }
+        return { exitCode: 0 };
+    }
+
+    const action = args[0]!;
+    let ok = true;
+    for (let i = 1; i < args.length; i++) {
+        if (!setTrap(args[i]!, action)) ok = false;
+    }
+    return { exitCode: ok ? 0 : 1 };
+}
+
+function shellQuote(s: string): string {
+    if (s === "") return "''";
+    if (/^[a-zA-Z0-9_.\/:@=+-]+$/.test(s)) return `'${s}'`;
+    return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+// ---- printf builtin ---------------------------------------------------------
+
+function printfEscape(s: string): string {
+    let result = "";
+    let i = 0;
+    while (i < s.length) {
+        if (s[i] === "\\" && i + 1 < s.length) {
+            const next = s[i + 1]!;
+            switch (next) {
+                case "n": result += "\n"; i += 2; break;
+                case "t": result += "\t"; i += 2; break;
+                case "r": result += "\r"; i += 2; break;
+                case "\\": result += "\\"; i += 2; break;
+                case "a": result += "\x07"; i += 2; break;
+                case "b": result += "\b"; i += 2; break;
+                case "f": result += "\f"; i += 2; break;
+                case "v": result += "\v"; i += 2; break;
+                case "0": {
+                    // Octal: \0NNN (up to 3 digits after 0)
+                    let oct = "";
+                    let j = i + 2;
+                    while (j < s.length && j < i + 5 && s[j]! >= "0" && s[j]! <= "7") {
+                        oct += s[j]; j++;
+                    }
+                    result += String.fromCharCode(parseInt(oct || "0", 8));
+                    i = j;
+                    break;
+                }
+                case "x": {
+                    // Hex: \xNN
+                    let hex = "";
+                    let j = i + 2;
+                    while (j < s.length && j < i + 4 && /[0-9a-fA-F]/.test(s[j]!)) {
+                        hex += s[j]; j++;
+                    }
+                    if (hex) result += String.fromCharCode(parseInt(hex, 16));
+                    i = j;
+                    break;
+                }
+                default: result += "\\" + next; i += 2; break;
+            }
+        } else {
+            result += s[i]; i++;
+        }
+    }
+    return result;
+}
+
+function runPrintf(args: string[]): ExecResult {
+    if (args.length === 0) {
+        process.stderr.write("printf: usage: printf format [arguments]\n");
+        return { exitCode: 1 };
+    }
+
+    const fmt = args[0]!;
+    let argIdx = 1;
+
+    // Process format string, reusing it if args remain (POSIX behavior).
+    do {
+        const startArgIdx = argIdx;
+        let output = "";
+        let i = 0;
+
+        while (i < fmt.length) {
+            if (fmt[i] === "\\" && i + 1 < fmt.length) {
+                // Format string escape sequences
+                const consumed = consumeEscape(fmt, i);
+                output += consumed.char;
+                i = consumed.next;
+                continue;
+            }
+
+            if (fmt[i] === "%" && i + 1 < fmt.length) {
+                i++;
+                if (fmt[i] === "%") { output += "%"; i++; continue; }
+
+                // Parse flags, width, precision
+                while (i < fmt.length && "-+ #0".includes(fmt[i]!)) i++;
+                while (i < fmt.length && fmt[i]! >= "0" && fmt[i]! <= "9") i++;
+                if (i < fmt.length && fmt[i] === ".") {
+                    i++;
+                    while (i < fmt.length && fmt[i]! >= "0" && fmt[i]! <= "9") i++;
+                }
+
+                const conversion = i < fmt.length ? fmt[i]! : "";
+                i++;
+                const arg = argIdx < args.length ? args[argIdx]! : "";
+                if (argIdx < args.length) argIdx++;
+
+                switch (conversion) {
+                    case "s": output += arg; break;
+                    case "d": case "i": output += String(parseInt(arg, 10) || 0); break;
+                    case "o": output += ((parseInt(arg, 10) || 0) >>> 0).toString(8); break;
+                    case "x": output += ((parseInt(arg, 10) || 0) >>> 0).toString(16); break;
+                    case "X": output += ((parseInt(arg, 10) || 0) >>> 0).toString(16).toUpperCase(); break;
+                    case "f": output += (parseFloat(arg) || 0).toFixed(6); break;
+                    case "c": output += arg ? arg[0]! : ""; break;
+                    case "b": output += printfEscape(arg); break;
+                    case "q":
+                        if (arg === "") output += "''";
+                        else if (/^[a-zA-Z0-9_.\/:@=-]+$/.test(arg)) output += arg;
+                        else output += "'" + arg.replace(/'/g, "'\\''") + "'";
+                        break;
+                    default: output += "%" + conversion; break;
+                }
+                continue;
+            }
+
+            output += fmt[i]; i++;
+        }
+
+        process.stdout.write(output);
+
+        // If no args were consumed this pass, stop (avoid infinite loop on format with no specifiers).
+        if (argIdx === startArgIdx) break;
+    } while (argIdx < args.length);
+
+    return { exitCode: 0 };
+}
+
+function consumeEscape(s: string, i: number): { char: string; next: number } {
+    const next = s[i + 1]!;
+    switch (next) {
+        case "n": return { char: "\n", next: i + 2 };
+        case "t": return { char: "\t", next: i + 2 };
+        case "r": return { char: "\r", next: i + 2 };
+        case "\\": return { char: "\\", next: i + 2 };
+        case "a": return { char: "\x07", next: i + 2 };
+        case "b": return { char: "\b", next: i + 2 };
+        case "f": return { char: "\f", next: i + 2 };
+        case "v": return { char: "\v", next: i + 2 };
+        case "0": {
+            let oct = "";
+            let j = i + 2;
+            while (j < s.length && j < i + 5 && s[j]! >= "0" && s[j]! <= "7") { oct += s[j]; j++; }
+            return { char: String.fromCharCode(parseInt(oct || "0", 8)), next: j };
+        }
+        case "x": {
+            let hex = "";
+            let j = i + 2;
+            while (j < s.length && j < i + 4 && /[0-9a-fA-F]/.test(s[j]!)) { hex += s[j]; j++; }
+            return { char: hex ? String.fromCharCode(parseInt(hex, 16)) : "\\x", next: j };
+        }
+        default: return { char: "\\" + next, next: i + 2 };
+    }
+}
+
 function runBuiltin(name: string, args: string[]): ExecResult | null {
     switch (name) {
         case "cd": {
@@ -1170,11 +1398,6 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             }
             return { exitCode: 0 };
         }
-        case "exit": {
-            const code = args[0] !== undefined ? parseInt(args[0], 10) : 0;
-            process.exit(isNaN(code) ? 0 : code);
-        }
-        // eslint-disable-next-line no-fallthrough
         case "export": {
             for (const arg of args) {
                 const eq = arg.indexOf("=");
@@ -1238,6 +1461,8 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             return runType(args);
         case "which":
             return runWhich(args);
+        case "printf":
+            return runPrintf(args);
         default:
             return null;
     }
