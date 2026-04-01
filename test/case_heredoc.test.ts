@@ -102,4 +102,16 @@ describe("here-docs — execution", () => {
     it("should suppress expansion with quoted delimiter", () => {
         assert.strictEqual(run('cat << "EOF"\nhello $USER\nEOF'), "hello $USER");
     });
+
+    it("should expand $() command substitution in here-doc", () => {
+        assert.strictEqual(run("cat <<EOF\nhello $(echo world)\nEOF"), "hello world");
+    });
+
+    it("should expand $(()) arithmetic in here-doc", () => {
+        assert.strictEqual(run("X=5; cat <<EOF\nresult: $((X + 3))\nEOF"), "result: 8");
+    });
+
+    it("should handle nested $() in here-doc", () => {
+        assert.strictEqual(run("cat <<EOF\n$(echo $(echo deep))\nEOF"), "deep");
+    });
 });

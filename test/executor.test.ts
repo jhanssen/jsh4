@@ -983,3 +983,19 @@ describe("executor — trap builtin", () => {
         assert.match(stderr, /invalid signal/);
     });
 });
+
+describe("executor — process substitution", () => {
+    it("should read from <() process substitution", () => {
+        assert.strictEqual(run("cat <(echo hello)"), "hello");
+    });
+
+    it("should use <() with diff", () => {
+        const out = run("diff <(echo a) <(echo b)");
+        assert.ok(out.includes("< a"), "expected diff output");
+        assert.ok(out.includes("> b"), "expected diff output");
+    });
+
+    it("should handle <() in arguments", () => {
+        assert.strictEqual(run("cat <(echo line1) <(echo line2)"), "line1\nline2");
+    });
+});
