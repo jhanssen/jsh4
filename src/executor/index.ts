@@ -250,9 +250,7 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         const sin  = stdinFd(i);
         const sout = stdoutFd(i);
 
-        // Temporarily clear CLOEXEC on the fds this child will use.
-        if (sin  !== 0) native.clearCloexec(sin);
-        if (sout !== 1) native.clearCloexec(sout);
+        // pipe fds have CLOEXEC — forkExec dup2s them to STDIN/STDOUT without CLOEXEC.
 
         const pid = native.forkExec(stage.cmd, stage.args, sin, sout, -1, pgid);
         if (pgid === 0) pgid = pid;
@@ -376,7 +374,13 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
         return 1;
     } finally {
         if (out !== process.stdout) {
-            await new Promise<void>(res => (out as NodeJS.WritableStream).end(res));
+            // end() may never fire on a broken pipe (EPIPE) — resolve on error/close too.
+            await new Promise<void>(res => {
+                const w = out as NodeJS.WritableStream;
+                w.once("error", res);
+                w.once("close", res);
+                w.end(res);
+            });
         }
     }
 }

@@ -170,9 +170,8 @@ export class ExecHandle implements PromiseLike<ExecResult> {
                        : options.stderr === "pipe"  ? stderrW
                        : -1; // inherit
 
-            if (sin  !== 0)  native.clearCloexec(sin);
-            native.clearCloexec(sout);
-            if (serr !== -1 && serr !== sout) native.clearCloexec(serr);
+            // pipe fds already have CLOEXEC — forkExec dup2s them to STDIN/STDOUT
+            // which creates new fds without CLOEXEC; originals are closed on exec.
 
             const pid = native.forkExec(stagecmd, args, sin, sout, serr, pgid);
             if (pgid === 0) pgid = pid;
