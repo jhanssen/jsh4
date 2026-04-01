@@ -23,6 +23,10 @@ struct SpawnCtx {
     bool captureOutput = false;
     std::string capturedOutput;
     std::vector<int> pipeStatus;  // per-stage exit codes
+    bool stopped = false;         // true if job was stopped (SIGTSTP)
+    int stoppedSignal = 0;
+    pid_t pgid = -1;
+    std::vector<pid_t> pids;     // for background/stopped jobs
 };
 
 static void OnSpawnDone(Napi::Env env, Napi::Function, SpawnCtx* ctx) {
@@ -40,6 +44,16 @@ static void OnSpawnDone(Napi::Env env, Napi::Function, SpawnCtx* ctx) {
             ps.Set(static_cast<uint32_t>(i), Napi::Number::New(env, ctx->pipeStatus[i]));
         }
         result.Set("pipeStatus", ps);
+        result.Set("stopped", Napi::Boolean::New(env, ctx->stopped));
+        result.Set("stoppedSignal", Napi::Number::New(env, ctx->stoppedSignal));
+        result.Set("pgid", Napi::Number::New(env, ctx->pgid));
+        if (!ctx->pids.empty()) {
+            Napi::Array pidsArr = Napi::Array::New(env, ctx->pids.size());
+            for (size_t i = 0; i < ctx->pids.size(); i++) {
+                pidsArr.Set(static_cast<uint32_t>(i), Napi::Number::New(env, static_cast<int>(ctx->pids[i])));
+            }
+            result.Set("pids", pidsArr);
+        }
         ctx->deferred.Resolve(result);
     }
     ctx->tsfn.Release();
@@ -66,6 +80,7 @@ struct PipelineRequest {
     std::vector<std::string> pipeOps;
     SpawnCtx* ctx;
     bool captureOutput = false;
+    bool background = false;
 };
 
 // ---- Helpers used in the child (post-fork, pre-exec) --------------------
@@ -193,10 +208,24 @@ struct WaitRequest {
 
 static void processWait(WaitRequest* req) {
     int lastCode = 0;
+    bool foreground = req->pgid > 0;
+    int waitFlags = foreground ? WUNTRACED : 0;
     req->ctx->pipeStatus.resize(req->pids.size(), 0);
+    req->ctx->pgid = req->pgid;
     for (size_t i = 0; i < req->pids.size(); i++) {
         int status = 0;
-        waitpid(req->pids[i], &status, 0);
+        waitpid(req->pids[i], &status, waitFlags);
+        if (WIFSTOPPED(status)) {
+            req->ctx->stopped = true;
+            req->ctx->stoppedSignal = WSTOPSIG(status);
+            req->ctx->exitCode = 128 + WSTOPSIG(status);
+            req->ctx->pids = req->pids;
+            if (g_interactive && req->pgid > 0)
+                tcsetpgrp(STDIN_FILENO, getpgrp());
+            req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+            delete req;
+            return;
+        }
         int code = WIFEXITED(status)   ? WEXITSTATUS(status) :
                    WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
         req->ctx->pipeStatus[i] = code;
@@ -405,6 +434,18 @@ struct ExecutorState {
             close(p[1]);
         }
 
+        // Store pgid for job control.
+        req->ctx->pgid = pgid;
+
+        // Background mode: don't give terminal, don't wait.
+        if (req->background) {
+            req->ctx->exitCode = 0;
+            req->ctx->pids = pids;
+            req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+            delete req;
+            return;
+        }
+
         if (!req->captureOutput && g_interactive && pgid > 0) {
             tcsetpgrp(STDIN_FILENO, pgid);
         }
@@ -422,11 +463,28 @@ struct ExecutorState {
         }
 
         // Wait for all children; collect per-stage exit codes.
+        // Use WUNTRACED for foreground jobs so we detect Ctrl-Z (SIGTSTP).
         int lastExitCode = 0;
+        int waitFlags = req->captureOutput ? 0 : WUNTRACED;
         req->ctx->pipeStatus.resize(pids.size(), 0);
         for (size_t i = 0; i < pids.size(); i++) {
             int status = 0;
-            waitpid(pids[i], &status, 0);
+            waitpid(pids[i], &status, waitFlags);
+            if (WIFSTOPPED(status)) {
+                // Job was stopped (Ctrl-Z). All processes in the group
+                // received SIGTSTP — break immediately.
+                req->ctx->stopped = true;
+                req->ctx->stoppedSignal = WSTOPSIG(status);
+                req->ctx->exitCode = 128 + WSTOPSIG(status);
+                req->ctx->pids = pids;
+                // Return terminal to shell.
+                if (g_interactive && pgid > 0) {
+                    tcsetpgrp(STDIN_FILENO, getpgrp());
+                }
+                req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+                delete req;
+                return;
+            }
             int code = WIFEXITED(status)  ? WEXITSTATUS(status) :
                        WIFSIGNALED(status)? 128 + WTERMSIG(status) : 1;
             req->ctx->pipeStatus[i] = code;
@@ -536,8 +594,9 @@ static Napi::Value SpawnPipeline(const Napi::CallbackInfo& info) {
     std::vector<StageSpec> stages;
     std::vector<std::string> pipeOps;
     parseStages(env, info[0].As<Napi::Array>(), info[1].As<Napi::Array>(), stages, pipeOps);
+    bool background = info.Length() > 2 && info[2].IsBoolean() && info[2].As<Napi::Boolean>().Value();
     auto* ctx = makeCtx(env, false);
-    g_executor->enqueue(new PipelineRequest { std::move(stages), std::move(pipeOps), ctx, false });
+    g_executor->enqueue(new PipelineRequest { std::move(stages), std::move(pipeOps), ctx, false, background });
     return ctx->deferred.Promise();
 }
 
@@ -763,6 +822,59 @@ static Napi::Value Execvp(const Napi::CallbackInfo& info) {
     return Napi::Number::New(env, err == ENOENT ? 127 : 126);
 }
 
+// ---- Job control helpers --------------------------------------------------
+
+static Napi::Value SendSignal(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "sendSignal(pid, signal)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    int pid = info[0].As<Napi::Number>().Int32Value();
+    int sig = info[1].As<Napi::Number>().Int32Value();
+    int rc = kill(pid, sig);
+    return Napi::Number::New(env, rc);
+}
+
+static Napi::Value ReapChildren(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Array results = Napi::Array::New(env);
+    uint32_t idx = 0;
+    int status;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        Napi::Object obj = Napi::Object::New(env);
+        obj.Set("pid", Napi::Number::New(env, static_cast<int>(pid)));
+        if (WIFEXITED(status)) {
+            obj.Set("exitCode", Napi::Number::New(env, WEXITSTATUS(status)));
+            obj.Set("stopped", Napi::Boolean::New(env, false));
+        } else if (WIFSIGNALED(status)) {
+            obj.Set("exitCode", Napi::Number::New(env, 128 + WTERMSIG(status)));
+            obj.Set("stopped", Napi::Boolean::New(env, false));
+        } else if (WIFSTOPPED(status)) {
+            obj.Set("exitCode", Napi::Number::New(env, 128 + WSTOPSIG(status)));
+            obj.Set("stopped", Napi::Boolean::New(env, true));
+        }
+        results.Set(idx++, obj);
+    }
+    return results;
+}
+
+static Napi::Value TcsetpgrpFg(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "tcsetpgrpFg(pgid)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    tcsetpgrp(STDIN_FILENO, info[0].As<Napi::Number>().Int32Value());
+    return env.Undefined();
+}
+
+static Napi::Value TcsetpgrpShell(const Napi::CallbackInfo& info) {
+    tcsetpgrp(STDIN_FILENO, getpgrp());
+    return info.Env().Undefined();
+}
+
 Napi::Object InitExecutor(Napi::Env env, Napi::Object exports) {
     exports.Set("initExecutor",     Napi::Function::New(env, InitExecutor_));
     exports.Set("spawnPipeline",    Napi::Function::New(env, SpawnPipeline));
@@ -775,6 +887,13 @@ Napi::Object InitExecutor(Napi::Env env, Napi::Object exports) {
     exports.Set("execvp",           Napi::Function::New(env, Execvp));
     exports.Set("dupFd",            Napi::Function::New(env, DupFd));
     exports.Set("dup2Fd",           Napi::Function::New(env, Dup2Fd));
+    exports.Set("sendSignal",       Napi::Function::New(env, SendSignal));
+    exports.Set("reapChildren",     Napi::Function::New(env, ReapChildren));
+    exports.Set("tcsetpgrpFg",      Napi::Function::New(env, TcsetpgrpFg));
+    exports.Set("tcsetpgrpShell",   Napi::Function::New(env, TcsetpgrpShell));
+    exports.Set("SIGCONT",          Napi::Number::New(env, SIGCONT));
+    exports.Set("SIGTSTP",          Napi::Number::New(env, SIGTSTP));
+    exports.Set("SIGTERM",          Napi::Number::New(env, SIGTERM));
     return exports;
 }
 

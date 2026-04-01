@@ -15,6 +15,16 @@ function run(cmd: string): string {
     return r.stdout.trim();
 }
 
+// Run command and return both stdout and stderr.
+function runFull(cmd: string): { stdout: string; stderr: string } {
+    const r = spawnSync("node", ["dist/index.js"], {
+        input: cmd + "\nexit\n",
+        encoding: "utf8",
+        cwd: process.cwd(),
+    });
+    return { stdout: r.stdout.trim(), stderr: r.stderr.trim() };
+}
+
 function ec(cmd: string): number {
     // Use $? to capture exit code from the command.
     const r = spawnSync("node", ["dist/index.js"], {
@@ -839,5 +849,52 @@ describe("executor — arithmetic ++/--", () => {
 
     it("should use increment in expression", () => {
         assert.strictEqual(run("x=3; echo $((++x + 10))"), "14");
+    });
+});
+
+describe("executor — job control", () => {
+    it("should run command in background with &", () => {
+        const { stdout, stderr } = runFull("sleep 0.01 &\nwait");
+        assert.match(stderr, /\[1\] \d+/);
+    });
+
+    it("should set $! to backgrounded pid", () => {
+        const out = run("sleep 0.01 &\necho $!");
+        assert.match(out, /^\d+$/);
+    });
+
+    it("should list jobs with jobs builtin", () => {
+        const { stdout } = runFull("sleep 10 &\njobs");
+        assert.match(stdout, /\[1\]\+\s+Running\s+sleep 10/);
+    });
+
+    it("should wait for background jobs", () => {
+        assert.strictEqual(run("echo hello &\nwait\necho done"), "hello\ndone");
+    });
+
+    it("should run pipeline in background", () => {
+        const out = run("echo hello | cat &\nwait");
+        assert.strictEqual(out, "hello");
+    });
+
+    it("should report no current job for fg with no jobs", () => {
+        const { stderr } = runFull("fg");
+        assert.match(stderr, /no current job/);
+    });
+
+    it("should report no stopped job for bg with no jobs", () => {
+        const { stderr } = runFull("bg");
+        assert.match(stderr, /no stopped job/);
+    });
+
+    it("should not regress PIPESTATUS", () => {
+        assert.strictEqual(
+            run("true | false | true; echo ${PIPESTATUS[0]} ${PIPESTATUS[1]} ${PIPESTATUS[2]}"),
+            "0 1 0"
+        );
+    });
+
+    it("should exit 0 for empty jobs list", () => {
+        assert.strictEqual(ec("jobs"), 0);
     });
 });

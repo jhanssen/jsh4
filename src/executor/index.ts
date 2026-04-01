@@ -17,13 +17,27 @@ import { pushParams, popParams, shiftParams, snapshotParams, restoreParams } fro
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { getAlias } from "../api/index.js";
 import { shellOpts, saveShellOpts, restoreShellOpts } from "../shellopts/index.js";
+import {
+    addJob, removeJob, getJobBySpec, getCurrentJob, getAllJobs,
+    markJobStopped, markJobRunning, reapFinishedJobs,
+} from "../jobs/index.js";
 
 const require = createRequire(import.meta.url);
+interface PipelineResult {
+    exitCode: number;
+    pipeStatus: number[];
+    stopped: boolean;
+    stoppedSignal: number;
+    pgid: number;
+    pids?: number[];
+}
+
 const native = require("../../build/Release/jsh_native.node") as {
     spawnPipeline: (
         stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
-        pipeOps: string[]
-    ) => Promise<{ exitCode: number; pipeStatus: number[] }>;
+        pipeOps: string[],
+        background?: boolean
+    ) => Promise<PipelineResult>;
     captureOutput: (
         stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
         pipeOps: string[]
@@ -32,10 +46,17 @@ const native = require("../../build/Release/jsh_native.node") as {
     clearCloexec: (fd: number) => void;
     closeFd: (fd: number) => void;
     forkExec: (cmd: string, args: string[], stdinFd?: number, stdoutFd?: number, stderrFd?: number, pgid?: number) => number;
-    waitForPids: (pids: number[], pgid?: number) => Promise<{ exitCode: number; pipeStatus: number[] }>;
+    waitForPids: (pids: number[], pgid?: number) => Promise<PipelineResult>;
     execvp: (cmd: string, args: string[]) => number;
     dupFd: (fd: number) => number;
     dup2Fd: (oldFd: number, newFd: number) => number;
+    sendSignal: (pid: number, signal: number) => number;
+    reapChildren: () => Array<{ pid: number; exitCode: number; stopped: boolean }>;
+    tcsetpgrpFg: (pgid: number) => void;
+    tcsetpgrpShell: () => void;
+    SIGCONT: number;
+    SIGTSTP: number;
+    SIGTERM: number;
 };
 
 export interface ExecResult {
@@ -44,6 +65,15 @@ export interface ExecResult {
 
 // Shell function registry.
 const shellFunctions = new Map<string, ASTNode>();
+
+// Command text tracking for job display strings.
+let currentCommandText = "";
+export function setCommandText(text: string): void { currentCommandText = text; }
+
+// Reap finished background jobs — called by REPL before each prompt.
+export function reapJobs(): string[] {
+    return reapFinishedJobs(() => native.reapChildren());
+}
 
 // Register command substitution handler with the expander.
 registerCaptureImpl(async (body: string): Promise<string> => {
@@ -359,6 +389,12 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         return r;
     }
 
+    // Job control builtins (async).
+    if (command === "fg") return runFg(args);
+    if (command === "bg") return runBg(args);
+    if (command === "jobs") return runJobs();
+    if (command === "wait") return runWait(args);
+
     // Builtins only run in-process when there are no redirections.
     const builtin = redirs.length === 0 ? runBuiltin(command, args) : null;
     if (builtin !== null) {
@@ -367,6 +403,13 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     }
 
     const result = await native.spawnPipeline([{ cmd: command, args, redirs }], []);
+    if (result.stopped) {
+        const pids = result.pids ?? [];
+        const cmdText = [command, ...args].join(" ");
+        const job = addJob(result.pgid, pids, cmdText, "stopped");
+        process.stderr.write(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
+        return { exitCode: 128 + result.stoppedSignal };
+    }
     $["PIPESTATUS"] = result.pipeStatus;
     return { exitCode: result.exitCode };
 }
@@ -417,10 +460,19 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
         stages.push(stage);
     }
     const result = await native.spawnPipeline(stages, node.pipeOps);
+
+    // Handle stopped (Ctrl-Z).
+    if (result.stopped) {
+        const pids = result.pids ?? [];
+        const cmdText = stages.map(s => [s.cmd, ...s.args].join(" ")).join(" | ");
+        const job = addJob(result.pgid, pids, cmdText, "stopped");
+        process.stderr.write(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
+        return { exitCode: 128 + result.stoppedSignal };
+    }
+
     $["PIPESTATUS"] = result.pipeStatus;
     let exitCode = result.exitCode;
     if (shellOpts.pipefail) {
-        // pipefail: use rightmost non-zero exit code, or 0 if all succeeded.
         for (let i = result.pipeStatus.length - 1; i >= 0; i--) {
             if (result.pipeStatus[i] !== 0) { exitCode = result.pipeStatus[i]!; break; }
         }
@@ -635,13 +687,117 @@ async function executeList(node: List): Promise<ExecResult> {
     let last: ExecResult = { exitCode: 0 };
     for (const entry of node.entries) {
         if (entry.separator === "&") {
-            process.stderr.write("jsh: background jobs not yet implemented\n");
+            last = await executeBackground(entry.node);
+            $["?"] = last.exitCode;
+            continue;
         }
         last = await executeNode(entry.node);
         $["?"] = last.exitCode;
         if (shellOpts.errexit && last.exitCode !== 0) return last;
     }
     return last;
+}
+
+async function executeBackground(node: ASTNode): Promise<ExecResult> {
+    // Build stages for pure-external pipeline or simple command.
+    let stages: Stage[] | null = null;
+    let pipeOps: string[] = [];
+
+    if (node.type === "SimpleCommand") {
+        const stage = await buildStage(node as SimpleCommand);
+        if (stage) stages = [stage];
+    } else if (node.type === "Pipeline") {
+        const pipe = node as Pipeline;
+        const allSimple = pipe.commands.every(c => c.type === "SimpleCommand");
+        if (allSimple) {
+            stages = [];
+            pipeOps = pipe.pipeOps;
+            for (const stageNode of pipe.commands) {
+                const s = await buildStage(stageNode as SimpleCommand);
+                if (!s) { stages = null; break; }
+                stages.push(s);
+            }
+        }
+    }
+
+    if (!stages || stages.length === 0) {
+        process.stderr.write("jsh: background not supported for this command type\n");
+        return executeNode(node);
+    }
+
+    const result = await native.spawnPipeline(stages, pipeOps, true);
+    const pids = result.pids ?? [];
+    const cmdText = stages.map(s => [s.cmd, ...s.args].join(" ")).join(" | ");
+    const job = addJob(result.pgid, pids, cmdText, "running");
+    const lastPid = pids.length > 0 ? pids[pids.length - 1]! : result.pgid;
+    $["!"] = lastPid;
+    process.stderr.write(`[${job.id}] ${lastPid}\n`);
+    return { exitCode: 0 };
+}
+
+// ---- Job control builtins ---------------------------------------------------
+
+async function runFg(args: string[]): Promise<ExecResult> {
+    const spec = args[0] ?? "%%";
+    const job = getJobBySpec(spec) ?? getCurrentJob();
+    if (!job) {
+        process.stderr.write("jsh: fg: no current job\n");
+        return { exitCode: 1 };
+    }
+    process.stderr.write(`${job.command}\n`);
+    markJobRunning(job.id);
+    native.tcsetpgrpFg(job.pgid);
+    native.sendSignal(-job.pgid, native.SIGCONT);
+    const result = await native.waitForPids(job.pids, job.pgid);
+    native.tcsetpgrpShell();
+    if (result.stopped) {
+        markJobStopped(job.id, result.stoppedSignal);
+        process.stderr.write(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
+        return { exitCode: 128 + result.stoppedSignal };
+    }
+    removeJob(job.id);
+    $["PIPESTATUS"] = result.pipeStatus;
+    return { exitCode: result.exitCode };
+}
+
+async function runBg(args: string[]): Promise<ExecResult> {
+    const spec = args[0] ?? "%%";
+    const job = getJobBySpec(spec) ?? getCurrentJob();
+    if (!job || job.status !== "stopped") {
+        process.stderr.write("jsh: bg: no stopped job\n");
+        return { exitCode: 1 };
+    }
+    markJobRunning(job.id);
+    native.sendSignal(-job.pgid, native.SIGCONT);
+    process.stderr.write(`[${job.id}]+ ${job.command} &\n`);
+    return { exitCode: 0 };
+}
+
+function runJobs(): ExecResult {
+    const currentJob = getCurrentJob();
+    for (const job of getAllJobs()) {
+        const marker = job === currentJob ? "+" : " ";
+        const status = job.status === "running" ? "Running" : "Stopped";
+        process.stdout.write(`[${job.id}]${marker}  ${status}\t\t${job.command}\n`);
+    }
+    return { exitCode: 0 };
+}
+
+async function runWait(args: string[]): Promise<ExecResult> {
+    const targets = args.length === 0
+        ? getAllJobs().filter(j => j.status === "running")
+        : args.map(a => getJobBySpec(a)).filter((j): j is NonNullable<typeof j> => j != null && j.status === "running");
+    let lastExit = 0;
+    for (const job of targets) {
+        const result = await native.waitForPids(job.pids, -1);
+        if (result.stopped) {
+            markJobStopped(job.id, result.stoppedSignal);
+        } else {
+            lastExit = result.exitCode;
+            removeJob(job.id);
+        }
+    }
+    return { exitCode: lastExit };
 }
 
 async function executeIf(node: IfClause): Promise<ExecResult> {

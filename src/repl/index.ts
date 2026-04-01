@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { parse, IncompleteInputError } from "../parser/index.js";
-import { execute } from "../executor/index.js";
+import { execute, setCommandText, reapJobs } from "../executor/index.js";
 import { $ } from "../variables/index.js";
 import { getPrompt, setPrompt, alias, unalias, registerJsFunction, exec, registerCompletion } from "../api/index.js";
 import { getCompletions } from "../completion/index.js";
@@ -74,13 +74,24 @@ async function executeScript(input: string): Promise<void> {
     if (!trimmed) return;
     try {
         const ast = parse(trimmed);
-        if (ast) await execute(ast);
+        if (ast) {
+            setCommandText(trimmed);
+            await execute(ast);
+        }
     } catch (e: unknown) {
         process.stderr.write(`jsh: ${e instanceof Error ? e.message : String(e)}\n`);
     }
 }
 
 function promptLoop(buffer: string): void {
+    // Reap finished background jobs and print notifications.
+    if (!buffer) {
+        const notifications = reapJobs();
+        for (const msg of notifications) {
+            process.stderr.write(msg + "\n");
+        }
+    }
+
     const prompt = buffer ? "> " : getPrompt();
 
     native.linenoiseStart(prompt, async (line, errno) => {
@@ -108,6 +119,7 @@ function promptLoop(buffer: string): void {
             const ast = parse(trimmed);
             if (ast) {
                 native.linenoiseHistoryAdd(input);
+                setCommandText(trimmed);
                 await execute(ast);
             }
             promptLoop("");
