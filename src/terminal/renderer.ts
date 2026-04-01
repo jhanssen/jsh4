@@ -37,9 +37,10 @@ export class Renderer {
         buf += "\r";
 
         // Write each line, clearing to end of line.
+        // Use \r\n between lines since OPOST is off in raw mode (\n alone doesn't CR).
         for (let i = 0; i < totalRows; i++) {
             buf += lines[i]! + "\x1b[0K";
-            if (i < totalRows - 1) buf += "\n";
+            if (i < totalRows - 1) buf += "\r\n";
         }
 
         // Clear any leftover lines from previous (taller) frame.

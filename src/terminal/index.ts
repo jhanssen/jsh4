@@ -142,8 +142,6 @@ export class TerminalUI {
 
     private onLine(line: string | null, errno?: number): void {
         this.widgets.stopTimers();
-        // Move past the frame before returning to caller.
-        this.native.inputWriteRaw("\n");
         this.renderer.reset();
         if (this.lineCallback) {
             this.lineCallback(line, errno);

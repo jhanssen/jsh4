@@ -339,6 +339,7 @@ static int getColumns() {
 static void notifyRender() {
     if (!g_ctx || g_ctx->onRender.IsEmpty()) return;
     Napi::Env env = g_ctx->onRender.Env();
+    Napi::HandleScope scope(env);
     Napi::Object state = Napi::Object::New(env);
     state.Set("buf", Napi::String::New(env, g_state.buf, g_state.len));
     state.Set("pos", Napi::Number::New(env, static_cast<double>(g_state.pos)));
@@ -357,6 +358,7 @@ static Completions doCompletion(InputState *s) {
     Completions lc;
     if (!g_ctx || g_ctx->onCompletion.IsEmpty()) return lc;
     Napi::Env env = g_ctx->onCompletion.Env();
+    Napi::HandleScope scope(env);
     Napi::Value result = g_ctx->onCompletion.Call({Napi::String::New(env, s->buf)});
     if (result.IsArray()) {
         Napi::Array arr = result.As<Napi::Array>();
@@ -569,14 +571,16 @@ static void pollCallback(uv_poll_t *handle, int status, int events) {
     g_ctx->poll = nullptr;
     g_state.active = false;
     disableRawMode(g_state.ifd);
+    // \r\n moves to new line. \x1b[G resets column to 1 (leftmost) to fix
+    // tab alignment after OSC sequences that may confuse column tracking.
+    write(g_state.ofd, "\r\n\x1b[G", 5);
 
     Napi::Env env = g_ctx->onLine.Env();
+    Napi::HandleScope scope(env);
     if (result == 1 && line) {
-        // Line complete
         g_ctx->onLine.Call({Napi::String::New(env, line)});
         free(line);
     } else {
-        // Error or signal
         Napi::Value null = env.Null();
         g_ctx->onLine.Call({null, Napi::Number::New(env, err)});
     }

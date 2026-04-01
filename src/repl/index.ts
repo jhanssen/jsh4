@@ -154,14 +154,12 @@ async function promptLoop(buffer: string): Promise<void> {
     const prompt = buffer ? "> " : await getPromptAsync();
     const rprompt = buffer ? "" : await getRightPromptAsync();
 
-    // Build prompt with OSC 133 marks.
     const markedPrompt = `\x1b]133;A\x07${prompt}\x1b]133;B\x07`;
 
     ui.start(markedPrompt, rprompt, async (line, errno) => {
         if (line === null) {
             if (errno === ui!.eagain) {
-                // Ctrl-C
-                if (buffer) process.stdout.write("\n");
+                // Ctrl-C — C++ already wrote \r\n
                 process.stdout.write(`\x1b]133;D;130\x07`);
                 promptLoop("");
             } else {
@@ -177,6 +175,7 @@ async function promptLoop(buffer: string): Promise<void> {
         const trimmed = input.trim();
 
         if (!trimmed) {
+            // C++ already wrote \r\n
             process.stdout.write(`\x1b]133;D;0\x07`);
             promptLoop("");
             return;
