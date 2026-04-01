@@ -4,7 +4,7 @@ import type {
     IfClause, WhileClause, ForClause, FunctionDef,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
-import { expandWord, registerCaptureImpl } from "../expander/index.js";
+import { expandWord, expandWordToStr, registerCaptureImpl } from "../expander/index.js";
 import { $ } from "../variables/index.js";
 import { pushParams, popParams } from "../variables/positional.js";
 
@@ -64,13 +64,16 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
 type Stage = { cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> };
 
 async function buildStage(cmd: SimpleCommand): Promise<Stage | null> {
-    const words = await Promise.all(cmd.words.map(expandWord));
+    // expandWord returns string[] (glob expansion may produce multiple words)
+    const wordArrays = await Promise.all(cmd.words.map(expandWord));
+    const words = wordArrays.flat();
     if (words.length === 0) return null;
     const [command, ...args] = words as [string, ...string[]];
+    // Redirections use expandWordToStr — no glob expansion on redirect targets
     const redirs = await Promise.all(cmd.redirections.map(async r => ({
         op: r.op,
         fd: r.fd ?? -1,
-        target: await expandWord(r.target),
+        target: await expandWordToStr(r.target),
     })));
     return { cmd: command, args, redirs };
 }
@@ -111,7 +114,7 @@ async function captureAst(node: ASTNode): Promise<string> {
 
 async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     for (const a of cmd.assignments) {
-        $[a.name] = await expandWord(a.value);
+        $[a.name] = await expandWordToStr(a.value);
     }
     if (cmd.words.length === 0) return { exitCode: 0 };
 
@@ -188,7 +191,8 @@ async function executeWhile(node: WhileClause): Promise<ExecResult> {
 }
 
 async function executeFor(node: ForClause): Promise<ExecResult> {
-    const items = node.items ? await Promise.all(node.items.map(expandWord)) : [];
+    const itemArrays = node.items ? await Promise.all(node.items.map(expandWord)) : [];
+    const items = itemArrays.flat();
     let last: ExecResult = { exitCode: 0 };
     for (const item of items) {
         $[node.name] = item;
