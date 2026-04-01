@@ -3,7 +3,8 @@ import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup,
     IfClause, WhileClause, ForClause, FunctionDef,
 } from "../parser/index.js";
-import { expandWord } from "../expander/index.js";
+import { parse } from "../parser/index.js";
+import { expandWord, registerCaptureImpl } from "../expander/index.js";
 import { $ } from "../variables/index.js";
 import { pushParams, popParams } from "../variables/positional.js";
 
@@ -13,14 +14,27 @@ const native = require("../../build/Release/jsh_native.node") as {
         stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
         pipeOps: string[]
     ) => Promise<number>;
+    captureOutput: (
+        stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
+        pipeOps: string[]
+    ) => Promise<{ exitCode: number; output: string }>;
 };
 
 export interface ExecResult {
     exitCode: number;
 }
 
-// Shell function registry — populated by FunctionDef nodes at runtime.
+// Shell function registry.
 const shellFunctions = new Map<string, ASTNode>();
+
+// Register command substitution handler with the expander.
+registerCaptureImpl(async (body: string): Promise<string> => {
+    const ast = parse(body.trim());
+    if (!ast) return "";
+    const result = await captureAst(ast);
+    // Strip trailing newlines — POSIX behaviour.
+    return result.replace(/\n+$/, "");
+});
 
 export async function execute(node: ASTNode): Promise<ExecResult> {
     const result = await executeNode(node);
@@ -45,73 +59,93 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
     }
 }
 
-// Build the redirection array for a stage.
-function buildRedirs(cmd: SimpleCommand) {
-    return cmd.redirections.map(r => ({
+// ---- Helpers ----------------------------------------------------------------
+
+type Stage = { cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> };
+
+async function buildStage(cmd: SimpleCommand): Promise<Stage | null> {
+    const words = await Promise.all(cmd.words.map(expandWord));
+    if (words.length === 0) return null;
+    const [command, ...args] = words as [string, ...string[]];
+    const redirs = await Promise.all(cmd.redirections.map(async r => ({
         op: r.op,
         fd: r.fd ?? -1,
-        target: expandWord(r.target),
-    }));
+        target: await expandWord(r.target),
+    })));
+    return { cmd: command, args, redirs };
 }
 
+// ---- captureAst: run an AST with stdout captured ----------------------------
+
+async function captureAst(node: ASTNode): Promise<string> {
+    // For SimpleCommand and Pipeline we can go directly through the native
+    // capture path.  Complex constructs (if/for/while) are not yet supported.
+    if (node.type === "SimpleCommand") {
+        const stage = await buildStage(node as SimpleCommand);
+        if (!stage) return "";
+        const result = await native.captureOutput([stage], []);
+        return result.output;
+    }
+
+    if (node.type === "Pipeline") {
+        const pipe = node as Pipeline;
+        const stages: Stage[] = [];
+        for (const stageNode of pipe.commands) {
+            if (stageNode.type !== "SimpleCommand") {
+                process.stderr.write("jsh: $(): complex pipeline stage not supported\n");
+                return "";
+            }
+            const stage = await buildStage(stageNode as SimpleCommand);
+            if (!stage) { process.stderr.write("jsh: $(): empty stage\n"); return ""; }
+            stages.push(stage);
+        }
+        const result = await native.captureOutput(stages, pipe.pipeOps);
+        return result.output;
+    }
+
+    process.stderr.write(`jsh: $(): ${node.type} not supported in command substitution\n`);
+    return "";
+}
+
+// ---- Command execution -------------------------------------------------------
+
 async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
-    // Prefix assignments with no command → set variables.
     for (const a of cmd.assignments) {
-        $[a.name] = expandWord(a.value);
+        $[a.name] = await expandWord(a.value);
     }
+    if (cmd.words.length === 0) return { exitCode: 0 };
 
-    if (cmd.words.length === 0) {
-        return { exitCode: 0 };
-    }
+    const stage = await buildStage(cmd);
+    if (!stage) return { exitCode: 0 };
+    const { cmd: command, args, redirs } = stage;
 
-    const words = cmd.words.map(expandWord);
-    const [command, ...args] = words as [string, ...string[]];
-    const redirs = buildRedirs(cmd);
-
-    // Shell functions take priority over builtins and external commands.
+    // Shell functions take priority.
     const func = shellFunctions.get(command);
     if (func) {
         pushParams(args);
-        try {
-            return await executeNode(func);
-        } finally {
-            popParams();
-        }
+        try { return await executeNode(func); }
+        finally { popParams(); }
     }
 
-    // Only run builtins in-process when there are no redirections.
-    // With redirections, fall through to the external binary so the OS
-    // applies the redirects correctly.
+    // Builtins only run in-process when there are no redirections.
     const builtin = redirs.length === 0 ? runBuiltin(command, args) : null;
-    if (builtin !== null) {
-        return builtin;
-    }
-    const exitCode = await native.spawnPipeline(
-        [{ cmd: command, args, redirs }],
-        []
-    );
+    if (builtin !== null) return builtin;
+
+    const exitCode = await native.spawnPipeline([{ cmd: command, args, redirs }], []);
     return { exitCode };
 }
 
 async function executePipeline(node: Pipeline): Promise<ExecResult> {
-    // Build stages — for now only SimpleCommand stages are supported.
-    const stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }> = [];
-
+    const stages: Stage[] = [];
     for (const stageNode of node.commands) {
         if (stageNode.type !== "SimpleCommand") {
             process.stderr.write(`jsh: unsupported pipeline stage: ${stageNode.type}\n`);
             return { exitCode: 1 };
         }
-        const cmd = stageNode as SimpleCommand;
-        const words = cmd.words.map(expandWord);
-        if (words.length === 0) {
-            process.stderr.write("jsh: empty command in pipeline\n");
-            return { exitCode: 1 };
-        }
-        const [command, ...args] = words as [string, ...string[]];
-        stages.push({ cmd: command, args, redirs: buildRedirs(cmd) });
+        const stage = await buildStage(stageNode as SimpleCommand);
+        if (!stage) { process.stderr.write("jsh: empty pipeline stage\n"); return { exitCode: 1 }; }
+        stages.push(stage);
     }
-
     let exitCode = await native.spawnPipeline(stages, node.pipeOps);
     if (node.negated) exitCode = exitCode === 0 ? 1 : 0;
     return { exitCode };
@@ -128,23 +162,17 @@ async function executeList(node: List): Promise<ExecResult> {
     let last: ExecResult = { exitCode: 0 };
     for (const entry of node.entries) {
         if (entry.separator === "&") {
-            // Background — not yet implemented, run synchronously for now.
             process.stderr.write("jsh: background jobs not yet implemented\n");
-            last = await executeNode(entry.node);
-        } else {
-            last = await executeNode(entry.node);
         }
+        last = await executeNode(entry.node);
     }
     return last;
 }
 
 async function executeIf(node: IfClause): Promise<ExecResult> {
     const cond = await executeNode(node.condition);
-    if (cond.exitCode === 0) {
-        return executeNode(node.consequent);
-    } else if (node.elseClause) {
-        return executeNode(node.elseClause);
-    }
+    if (cond.exitCode === 0) return executeNode(node.consequent);
+    if (node.elseClause) return executeNode(node.elseClause);
     return { exitCode: 0 };
 }
 
@@ -152,15 +180,15 @@ async function executeWhile(node: WhileClause): Promise<ExecResult> {
     let last: ExecResult = { exitCode: 0 };
     while (true) {
         const cond = await executeNode(node.condition);
-        const condMet = node.until ? cond.exitCode !== 0 : cond.exitCode === 0;
-        if (!condMet) break;
+        const met = node.until ? cond.exitCode !== 0 : cond.exitCode === 0;
+        if (!met) break;
         last = await executeNode(node.body);
     }
     return last;
 }
 
 async function executeFor(node: ForClause): Promise<ExecResult> {
-    const items = node.items?.map(w => expandWord(w)) ?? [];
+    const items = node.items ? await Promise.all(node.items.map(expandWord)) : [];
     let last: ExecResult = { exitCode: 0 };
     for (const item of items) {
         $[node.name] = item;
@@ -182,18 +210,15 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
                 process.chdir(target);
                 $["PWD"] = process.cwd();
             } catch (e: unknown) {
-                const msg = e instanceof Error ? e.message : String(e);
-                process.stderr.write(`cd: ${msg}\n`);
+                process.stderr.write(`cd: ${e instanceof Error ? e.message : e}\n`);
                 return { exitCode: 1 };
             }
             return { exitCode: 0 };
         }
-
         case "exit": {
             const code = args[0] !== undefined ? parseInt(args[0], 10) : 0;
             process.exit(isNaN(code) ? 0 : code);
         }
-
         // eslint-disable-next-line no-fallthrough
         case "export": {
             for (const arg of args) {
@@ -201,8 +226,7 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
                 if (eq > 0) {
                     const key = arg.slice(0, eq);
                     const val = arg.slice(eq + 1);
-                    $[key] = val;
-                    process.env[key] = val;
+                    $[key] = val; process.env[key] = val;
                 } else if (arg) {
                     const val = $[arg];
                     if (val !== undefined) process.env[arg] = String(val);
@@ -210,20 +234,14 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             }
             return { exitCode: 0 };
         }
-
-        case "unset": {
+        case "unset":
             for (const arg of args) delete $[arg];
             return { exitCode: 0 };
-        }
-
         case "true":  return { exitCode: 0 };
         case "false": return { exitCode: 1 };
-
-        case "echo": {
+        case "echo":
             process.stdout.write(args.join(" ") + "\n");
             return { exitCode: 0 };
-        }
-
         default:
             return null;
     }

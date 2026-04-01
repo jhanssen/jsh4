@@ -1,45 +1,49 @@
 import type {
-    Word, WordSegment, VariableExpansion,
+    Word, WordSegment, VariableExpansion, CommandSubstitution,
     LiteralSegment, SingleQuotedSegment, DoubleQuotedSegment,
 } from "../parser/index.js";
 import { $ } from "../variables/index.js";
 import { getParam, getAllParams, getParamCount } from "../variables/positional.js";
 import * as os from "node:os";
 
-export function expandWord(word: Word): string {
+// Registered by the executor to avoid a circular import.
+type CaptureFunc = (body: string) => Promise<string>;
+let captureImpl: CaptureFunc = async () => "";
+
+export function registerCaptureImpl(fn: CaptureFunc): void {
+    captureImpl = fn;
+}
+
+export async function expandWord(word: Word): Promise<string> {
     const segs = word.segments;
     if (segs.length === 0) return "";
 
-    // Tilde expansion: first segment is a Literal starting with ~
+    // Tilde expansion on first literal segment.
     const first = segs[0]!;
     if (first.type === "Literal" && (first.value === "~" || first.value.startsWith("~/"))) {
         const home = String($["HOME"] ?? os.homedir());
-        const rest = first.value.slice(1); // strip leading ~
-        return home + rest + segs.slice(1).map(expandSegment).join("");
+        const rest = first.value.slice(1);
+        const tail = (await Promise.all(segs.slice(1).map(expandSegment))).join("");
+        return home + rest + tail;
     }
 
-    return segs.map(expandSegment).join("");
+    return (await Promise.all(segs.map(expandSegment))).join("");
 }
 
-function expandSegment(seg: WordSegment): string {
+async function expandSegment(seg: WordSegment): Promise<string> {
     switch (seg.type) {
-        case "Literal":
-            return (seg as LiteralSegment).value;
-        case "SingleQuoted":
-            return (seg as SingleQuotedSegment).value;
+        case "Literal":        return (seg as LiteralSegment).value;
+        case "SingleQuoted":   return (seg as SingleQuotedSegment).value;
         case "DoubleQuoted":
-            return (seg as DoubleQuotedSegment).segments.map(expandSegment).join("");
+            return (await Promise.all((seg as DoubleQuotedSegment).segments.map(expandSegment))).join("");
         case "VariableExpansion":
             return expandVariable(seg as VariableExpansion);
         case "CommandSubstitution":
-            // TODO
-            return "";
+            return captureImpl((seg as CommandSubstitution).body);
         case "ArithmeticExpansion":
-            // TODO
-            return "";
+            return ""; // TODO
         case "Glob":
-            // TODO: pathname expansion — pass through for now
-            return seg.pattern;
+            return seg.pattern; // TODO: pathname expansion
         default:
             return "";
     }
@@ -62,17 +66,13 @@ function expandVariable(seg: VariableExpansion): string {
     const raw = $[seg.name];
     const val = raw !== undefined ? String(raw) : undefined;
 
-    if (!seg.operator) {
-        return val ?? "";
-    }
+    if (!seg.operator) return val ?? "";
 
     switch (seg.operator) {
         case ":-":
-        case "-":
-            return (val !== undefined && val !== "") ? val : expandOperand(seg);
+        case "-":   return (val !== undefined && val !== "") ? val : expandOperand(seg);
         case ":+":
-        case "+":
-            return (val !== undefined && val !== "") ? expandOperand(seg) : "";
+        case "+":   return (val !== undefined && val !== "") ? expandOperand(seg) : "";
         case ":=":
         case "=":
             if (val === undefined || val === "") {
@@ -89,21 +89,17 @@ function expandVariable(seg: VariableExpansion): string {
             }
             return val;
         }
-        case "#":
-            return String((val ?? "").length);
-        case "##":
-        case "%":
-        case "%%":
-        case "/":
-        case "//":
-            // TODO: pattern operations
-            return val ?? "";
-        default:
-            return val ?? "";
+        case "#":  return String((val ?? "").length);
+        default:   return val ?? "";
     }
 }
 
 function expandOperand(seg: VariableExpansion): string {
     if (!seg.operand) return "";
-    return seg.operand.map(expandSegment).join("");
+    // operand segments are sync-only in practice (no command substitution in operands for now)
+    return seg.operand.map(s => {
+        if (s.type === "Literal") return (s as LiteralSegment).value;
+        if (s.type === "SingleQuoted") return (s as SingleQuotedSegment).value;
+        return "";
+    }).join("");
 }

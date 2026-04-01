@@ -20,11 +20,20 @@ struct SpawnCtx {
     Napi::Promise::Deferred deferred;
     Napi::ThreadSafeFunction tsfn;
     int exitCode = -1;
+    bool captureOutput = false;
+    std::string capturedOutput;
 };
 
 static void OnSpawnDone(Napi::Env env, Napi::Function, SpawnCtx* ctx) {
     Napi::HandleScope scope(env);
-    ctx->deferred.Resolve(Napi::Number::New(env, ctx->exitCode));
+    if (ctx->captureOutput) {
+        Napi::Object result = Napi::Object::New(env);
+        result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
+        result.Set("output",   Napi::String::New(env, ctx->capturedOutput));
+        ctx->deferred.Resolve(result);
+    } else {
+        ctx->deferred.Resolve(Napi::Number::New(env, ctx->exitCode));
+    }
     ctx->tsfn.Release();
     delete ctx;
 }
@@ -47,6 +56,7 @@ struct PipelineRequest {
     std::vector<StageSpec> stages;
     std::vector<std::string> pipeOps;
     SpawnCtx* ctx;
+    bool captureOutput = false;
 };
 
 // ---- Helpers used in the child (post-fork, pre-exec) --------------------
@@ -185,6 +195,19 @@ struct ExecutorState {
             }
         }
 
+        // Capture pipe: capturePipe[0]=read, capturePipe[1]=write.
+        // The last stage's stdout is redirected to capturePipe[1].
+        int capturePipe[2] = {-1, -1};
+        if (req->captureOutput) {
+            if (pipe(capturePipe) != 0) {
+                for (auto& p : pipes) { close(p[0]); close(p[1]); }
+                req->ctx->exitCode = 1;
+                req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+                delete req;
+                return;
+            }
+        }
+
         pid_t pgid = -1;
         std::vector<pid_t> pids;
 
@@ -219,6 +242,9 @@ struct ExecutorState {
                     if (i < static_cast<int>(pipeOps.size()) && pipeOps[i] == "|&") {
                         dup2(pipes[i][1], STDERR_FILENO);
                     }
+                } else if (capturePipe[1] != -1) {
+                    // Last stage: redirect stdout to capture pipe.
+                    dup2(capturePipe[1], STDOUT_FILENO);
                 }
 
                 // Close all pipe fds — child only needs the two it dup2'd.
@@ -226,6 +252,8 @@ struct ExecutorState {
                     close(pipes[j][0]);
                     close(pipes[j][1]);
                 }
+                if (capturePipe[0] != -1) close(capturePipe[0]);
+                if (capturePipe[1] != -1) close(capturePipe[1]);
 
                 // Apply redirections (after pipe setup so 2>&1 sees pipe stdout).
                 if (!applyRedirections(stages[i].redirs)) {
@@ -287,8 +315,20 @@ struct ExecutorState {
             close(p[1]);
         }
 
-        if (g_interactive && pgid > 0) {
+        if (!req->captureOutput && g_interactive && pgid > 0) {
             tcsetpgrp(STDIN_FILENO, pgid);
+        }
+
+        // For capture mode: close write end, drain read end before waitpid.
+        // Draining first avoids deadlock when the pipe buffer fills.
+        if (req->captureOutput && capturePipe[1] != -1) {
+            close(capturePipe[1]);
+            char buf[4096];
+            ssize_t nread;
+            while ((nread = read(capturePipe[0], buf, sizeof(buf))) > 0) {
+                req->ctx->capturedOutput.append(buf, static_cast<size_t>(nread));
+            }
+            close(capturePipe[0]);
         }
 
         // Wait for all children; use the last stage's exit status.
@@ -303,7 +343,7 @@ struct ExecutorState {
             }
         }
 
-        if (g_interactive && pgid > 0) {
+        if (!req->captureOutput && g_interactive && pgid > 0) {
             tcsetpgrp(STDIN_FILENO, getpgrp());
         }
 
@@ -348,64 +388,81 @@ static Napi::Value InitExecutor_(const Napi::CallbackInfo& info) {
     return info.Env().Undefined();
 }
 
-static Napi::Value SpawnPipeline(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-
-    if (!g_executor) {
-        Napi::Error::New(env, "Executor not initialized").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    if (info.Length() < 2 || !info[0].IsArray() || !info[1].IsArray()) {
-        Napi::TypeError::New(env, "spawnPipeline(stages: object[], pipeOps: string[])")
-            .ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-
-    Napi::Array jsStages  = info[0].As<Napi::Array>();
-    Napi::Array jsPipeOps = info[1].As<Napi::Array>();
-
-    std::vector<StageSpec> stages;
+// Parse JS stages/pipeOps arrays — shared by SpawnPipeline and CaptureOutput.
+static bool parseStages(Napi::Env env, Napi::Array jsStages, Napi::Array jsPipeOps,
+                        std::vector<StageSpec>& stages, std::vector<std::string>& pipeOps) {
     for (uint32_t i = 0; i < jsStages.Length(); i++) {
         Napi::Object jsStage = jsStages.Get(i).As<Napi::Object>();
         StageSpec stage;
         stage.cmd = jsStage.Get("cmd").As<Napi::String>().Utf8Value();
 
         Napi::Array jsArgs = jsStage.Get("args").As<Napi::Array>();
-        for (uint32_t j = 0; j < jsArgs.Length(); j++) {
+        for (uint32_t j = 0; j < jsArgs.Length(); j++)
             stage.args.push_back(jsArgs.Get(j).As<Napi::String>().Utf8Value());
-        }
 
         Napi::Array jsRedirs = jsStage.Get("redirs").As<Napi::Array>();
         for (uint32_t j = 0; j < jsRedirs.Length(); j++) {
-            Napi::Object jsRedir = jsRedirs.Get(j).As<Napi::Object>();
+            Napi::Object r = jsRedirs.Get(j).As<Napi::Object>();
             RedirSpec redir;
-            redir.op     = jsRedir.Get("op").As<Napi::String>().Utf8Value();
-            Napi::Value fdVal = jsRedir.Get("fd");
+            redir.op     = r.Get("op").As<Napi::String>().Utf8Value();
+            Napi::Value fdVal = r.Get("fd");
             redir.fd     = fdVal.IsNumber() ? fdVal.As<Napi::Number>().Int32Value() : -1;
-            redir.target = jsRedir.Get("target").As<Napi::String>().Utf8Value();
+            redir.target = r.Get("target").As<Napi::String>().Utf8Value();
             stage.redirs.push_back(std::move(redir));
         }
-
         stages.push_back(std::move(stage));
     }
-
-    std::vector<std::string> pipeOps;
-    for (uint32_t i = 0; i < jsPipeOps.Length(); i++) {
+    for (uint32_t i = 0; i < jsPipeOps.Length(); i++)
         pipeOps.push_back(jsPipeOps.Get(i).As<Napi::String>().Utf8Value());
-    }
+    return true;
+}
 
+static SpawnCtx* makeCtx(Napi::Env env, bool capture) {
     auto deferred = Napi::Promise::Deferred::New(env);
     auto* ctx = new SpawnCtx { deferred };
+    ctx->captureOutput = capture;
     ctx->tsfn = Napi::ThreadSafeFunction::New(
         env,
         Napi::Function::New(env, [](const Napi::CallbackInfo&) {}),
-        "spawn_complete",
-        0, 1
+        "spawn_complete", 0, 1
     );
+    return ctx;
+}
 
-    g_executor->enqueue(new PipelineRequest { std::move(stages), std::move(pipeOps), ctx });
+static Napi::Value SpawnPipeline(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (!g_executor) {
+        Napi::Error::New(env, "Executor not initialized").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (info.Length() < 2 || !info[0].IsArray() || !info[1].IsArray()) {
+        Napi::TypeError::New(env, "spawnPipeline(stages, pipeOps)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    std::vector<StageSpec> stages;
+    std::vector<std::string> pipeOps;
+    parseStages(env, info[0].As<Napi::Array>(), info[1].As<Napi::Array>(), stages, pipeOps);
+    auto* ctx = makeCtx(env, false);
+    g_executor->enqueue(new PipelineRequest { std::move(stages), std::move(pipeOps), ctx, false });
+    return ctx->deferred.Promise();
+}
 
-    return deferred.Promise();
+static Napi::Value CaptureOutput(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (!g_executor) {
+        Napi::Error::New(env, "Executor not initialized").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (info.Length() < 2 || !info[0].IsArray() || !info[1].IsArray()) {
+        Napi::TypeError::New(env, "captureOutput(stages, pipeOps)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    std::vector<StageSpec> stages;
+    std::vector<std::string> pipeOps;
+    parseStages(env, info[0].As<Napi::Array>(), info[1].As<Napi::Array>(), stages, pipeOps);
+    auto* ctx = makeCtx(env, true);
+    g_executor->enqueue(new PipelineRequest { std::move(stages), std::move(pipeOps), ctx, true });
+    return ctx->deferred.Promise();
 }
 
 static Napi::Value GetEAGAIN(const Napi::CallbackInfo& info) {
@@ -415,6 +472,7 @@ static Napi::Value GetEAGAIN(const Napi::CallbackInfo& info) {
 Napi::Object InitExecutor(Napi::Env env, Napi::Object exports) {
     exports.Set("initExecutor",   Napi::Function::New(env, InitExecutor_));
     exports.Set("spawnPipeline",  Napi::Function::New(env, SpawnPipeline));
+    exports.Set("captureOutput",  Napi::Function::New(env, CaptureOutput));
     exports.Set("EAGAIN",         Napi::Function::New(env, GetEAGAIN));
     return exports;
 }
