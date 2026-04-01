@@ -88,23 +88,34 @@ Handles word expansion before command execution:
 
 Returns `string[]` per word to support brace, glob, and IFS expansion producing multiple results.
 
-**4. Line Editor (linenoise, N-API binding)**
+**4. Terminal UI (Custom InputEngine + TS Renderer)**
 
-[antirez/linenoise](https://github.com/jhanssen/linenoise) (forked at jhanssen/linenoise) via N-API.
+A custom C++ input engine (`src/native/input-engine.cc`) handles raw terminal I/O, keystroke reading, buffer editing, and history. A TypeScript rendering layer (`src/terminal/`) owns the screen layout with header/footer regions, widget system, and synchronized rendering.
 
-The non-blocking multiplexed API is used:
-- `linenoiseEditStart` initializes state and sets raw mode
-- `linenoiseEditFeed` is called each time stdin is readable (via `uv_poll_t`)
-- `linenoiseEditStop` restores the terminal when a line is complete
+Architecture:
+- **C++ InputEngine**: raw mode (termios), non-blocking keystroke reading via `uv_poll_t`, input buffer editing, history navigation, completion dispatch. Calls a TS `onRender` callback after each buffer mutation.
+- **TS Renderer**: assembles frames from header widgets + input line + footer widgets. Writes the full frame as one synchronized batch (`CSI ?2026 h/l`). Handles cursor positioning across regions.
+- **Widget System**: JS functions registered for header/footer zones with optional auto-refresh intervals. Supports live-updating widgets (e.g., clock) that refresh while the user types.
 
-This keeps the Node.js event loop running while the user is typing, so timers and background tasks fire normally.
+The input line is rendered by `inputRenderLine()` in C++ (handles horizontal scroll, cursor math, ANSI-aware width). Header/footer content is fully controlled by JS — every character.
+
+Features:
+- Syntax highlighting via colorize callback (lexer-based, true color RGB)
+- Command-exists detection (green for valid, red+curly underline for invalid)
+- Right-aligned prompt
+- Async prompt support (`jsh.setPrompt(async fn)`)
+- OSC 133 shell integration marks (prompt/command/output boundaries)
+- OSC 7 working directory reporting
+- Color helpers (`jsh.colors`, `jsh.makeFgColor()`, `jsh.style` tagged template)
 
 **5. JS Runtime / .jshrc**
 
-`.jshrc` is an ES module loaded at startup via dynamic `import()`. Exported functions are automatically registered as `@` pipeline functions. The `jsh` global object provides the shell API.
+`.jshrc` is an ES module loaded at startup via dynamic `import()`. Exported functions are automatically registered as `@` pipeline functions. The `jsh` global object provides the shell API. Custom path via `jsh --jshrc /path/to/file.mjs`.
 
 ```js
 // ~/.jshrc
+const { bold, green, cyan, yellow, red, reset } = jsh.colors;
+const orange = jsh.makeFgColor(255, 165, 0);
 
 // Environment
 jsh.$.PATH = `/usr/local/bin:${jsh.$.PATH}`;
@@ -114,11 +125,32 @@ jsh.$.EDITOR = 'nvim';
 jsh.alias('ll', 'ls -la');
 jsh.alias('gs', 'git status');
 
-// Prompt
-jsh.setPrompt(() => {
+// Async prompt with git branch
+jsh.setPrompt(async () => {
     const cwd = String(jsh.$.PWD ?? '~').replace(String(jsh.$.HOME ?? ''), '~');
-    return `${cwd} $ `;
+    const branch = await jsh.exec('git branch --show-current 2>/dev/null');
+    return jsh.style`${bold}${yellow}${cwd} ${cyan}${branch.ok ? branch.stdout : ''}${reset}$ `;
 });
+
+// Theme
+jsh.setTheme({
+    command:         [130, 224, 170],
+    commandNotFound: [255, 85, 85],
+    keyword:         [255, 203, 107],
+    string:          [195, 232, 141],
+    variable:        [137, 221, 255],
+});
+
+// Widgets: header and footer
+jsh.addWidget("git", "header", async () => {
+    const branch = await jsh.exec('git branch --show-current 2>/dev/null');
+    return branch.ok ? jsh.style`  ${cyan}${branch.stdout}` : '';
+});
+
+jsh.addWidget("clock", "footer", () => {
+    const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+    return jsh.style`  ${orange}${time}`;
+}, 0, 1000);
 
 // Custom pipeline functions (auto-registered from exports)
 export async function* filter(args, stdin) {
@@ -260,10 +292,10 @@ Builtins execute in-process (no fork):
 | `fg` | ✅ | Resume job in foreground |
 | `bg` | ✅ | Resume stopped job in background |
 | `wait` | ✅ | Wait for background jobs |
-| `eval` | ❌ | Parse and execute string |
-| `printf` | ❌ | Formatted output |
+| `eval` | ✅ | Parse and execute string |
+| `printf` | ✅ | Formatted output (`%s`, `%d`, `%x`, `%b`, `%q`, etc.) |
+| `trap` | ✅ | Signal/pseudo-signal trapping (EXIT, INT, TERM, etc.) |
 | `hash` | ❌ | Command hash table |
-| `trap` | ❌ | Signal trapping |
 
 ---
 

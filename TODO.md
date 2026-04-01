@@ -134,28 +134,28 @@
 
 ## Pending
 
-### Lower priority / quality of life
+### Shell features
 
-- [ ] **Async `setPrompt`** — allow async functions (e.g. git branch); currently sync only
 - [ ] **`PS2` customization** — continuation prompt hardcoded as `"> "`
-- [ ] **Here-doc full expansion** — `$()` and `$((...))` inside here-doc bodies
-- [ ] **Glob in directory components** — `src/*/index.ts` (currently only last component)
 - [ ] **Recursive glob `**` in brace expansion** — e.g. `{src,test}/**/*.ts`
 - [ ] **`hash` builtin** — command hash table for PATH lookup caching
-- [ ] **`printf` builtin**
-- [ ] **`trap`** — signal trapping
-- [ ] **Process substitution** `<(cmd)` and `>(cmd)`
 - [ ] **Named pipes / coprocesses**
-- [ ] **History expansion** `!!`, `!$`, `!n`
-- [ ] **Tab completion: async handlers** — currently sync only
+- [ ] **`echo -n`** — suppress trailing newline
+
+### Terminal / UI
+
+- [ ] **Async tab completion** — completion callback returns `Promise<string[]>`, engine pauses editing while awaiting. Enables `command --help` parsing on Tab.
 - [ ] **Tab completion: PATH caching invalidation on PATH change**
-- [ ] **Syntax highlighting** — via linenoise hints callback
+- [ ] **Kitty keyboard protocol** — progressive enhancement for proper modifier detection
+- [ ] **OSC 8 hyperlinks** — clickable file paths and URLs in output
+- [ ] **OSC 9/99 notifications** — desktop notification on background job completion
+- [ ] **Kitty graphics protocol** — inline image display (`@img` pipeline function)
+- [ ] **Terminal capability detection** — auto-detect truecolor, kitty keyboard, graphics support
 
 ### `@` JS syntax
 
 - [ ] **`$(@func)`** — command substitution from JS function (in-process, no fork)
 - [ ] **AbortSignal on pipe close** — propagate EPIPE to JS generator as cancellation
-- [ ] **`jsh.complete()` async support** — currently synchronous callbacks only
 
 ### Not planned (initial scope)
 
