@@ -15,6 +15,7 @@ import { colorize, getCurrentTheme } from "../colorize/index.js";
 import { runTrap } from "../trap/index.js";
 import { addHistoryEntry, expandHistory } from "../history/index.js";
 import { TerminalUI } from "../terminal/index.js";
+import { colors, makeFgColor, makeBgColor, makeUlColor, style } from "../terminal/colors.js";
 import type { JsPipelineFunction } from "../jsfunctions/index.js";
 
 const require = createRequire(import.meta.url);
@@ -38,10 +39,14 @@ const native = require("../../build/Release/jsh_native.node") as {
 
 let ui: TerminalUI | null = null;
 
-export async function startRepl(): Promise<void> {
+export interface ReplOptions {
+    jshrc?: string;
+}
+
+export async function startRepl(opts?: ReplOptions): Promise<void> {
     native.initExecutor();
 
-    await loadRc();
+    await loadRc(opts?.jshrc);
 
     if (process.stdin.isTTY) {
         const historyFile = join(String($["HOME"] ?? homedir()), ".jsh_history");
@@ -78,19 +83,25 @@ export async function startRepl(): Promise<void> {
     }
 }
 
-async function loadRc(): Promise<void> {
-    const rcPath = join(String($["HOME"] ?? homedir()), ".jshrc");
+async function loadRc(customPath?: string): Promise<void> {
+    const rcPath = customPath ?? join(String($["HOME"] ?? homedir()), ".jshrc");
 
     const jshApi = {
         $, setPrompt, setRightPrompt, setColorize, setTheme,
         alias, unalias, registerJsFunction, exec,
         complete: registerCompletion,
-        // New TerminalUI APIs
+        // Terminal UI
         setHeader: (fn: (() => string[] | Promise<string[]>) | null) => ui?.setHeader(fn),
         setFooter: (fn: (() => string[] | Promise<string[]>) | null) => ui?.setFooter(fn),
         addWidget: (id: string, zone: "header" | "footer", render: () => string | string[] | Promise<string | string[]>, order?: number, interval?: number) =>
             ui?.addWidget(id, zone, render, order, interval),
         removeWidget: (id: string) => ui?.removeWidget(id),
+        // Colors
+        colors,
+        makeFgColor,
+        makeBgColor,
+        makeUlColor,
+        style,
     };
     (globalThis as Record<string, unknown>)["jsh"] = jshApi;
 

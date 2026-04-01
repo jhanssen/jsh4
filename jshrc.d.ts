@@ -3,13 +3,21 @@
  *
  * @example
  * // ~/.jshrc
+ * const { bold, green, cyan, reset } = jsh.colors;
+ * const orange = jsh.makeFgColor(255, 165, 0);
+ *
  * jsh.$.EDITOR = 'nvim';
  * jsh.alias('ll', 'ls -la');
+ *
  * jsh.setPrompt(async () => {
  *     const branch = await jsh.exec('git branch --show-current');
  *     const cwd = String(jsh.$.PWD ?? '~').replace(String(jsh.$.HOME ?? ''), '~');
- *     return `${cwd} ${branch.ok ? branch.stdout : ''} $ `;
+ *     return jsh.style`${green}${bold}${cwd} ${cyan}${branch.ok ? branch.stdout : ''}${reset}$ `;
  * });
+ *
+ * jsh.addWidget("clock", "footer", () => {
+ *     return jsh.style`${orange}${new Date().toLocaleTimeString()}`;
+ * }, 0, 1000);
  *
  * // Exported functions are auto-registered as @name pipeline functions.
  * export async function* upper(args: string[], stdin: AsyncIterable<string>) {
@@ -17,36 +25,18 @@
  * }
  */
 
-/**
- * Calling convention for @ pipeline functions.
- *
- * Streaming (default): receives lines one at a time via stdin iterable.
- * Buffered (@!name):   receives the full stdin as a single string.
- *
- * Return types handled by the executor:
- *   string | Buffer             → written to stdout
- *   AsyncGenerator<string>      → each yielded value written to stdout
- *   Generator<string>           → same
- *   Promise<...>                → awaited, then above rules applied
- *   { exitCode: number }        → exits with the given code
- *   void / undefined            → nothing written, exit 0
- *   throw / reject              → exit 1, error message to stderr
- */
+// ---- Pipeline functions -----------------------------------------------------
+
 type JsPipelineFunction = (
     args: string[],
     stdin: AsyncIterable<string> | string | null
 ) => unknown;
 
-/**
- * Shell variable store. Reading or writing any property accesses the
- * shell's variable namespace, which is also used for environment
- * variables after `export`.
- *
- * @example
- * jsh.$.PATH = `/usr/local/bin:${jsh.$.PATH}`;
- * jsh.$.MY_VAR = 'hello';
- */
+// ---- Shell variables --------------------------------------------------------
+
 declare const $: Record<string, unknown>;
+
+// ---- Exec -------------------------------------------------------------------
 
 interface ExecResult {
     stdout: string;
@@ -56,213 +46,243 @@ interface ExecResult {
 }
 
 interface ExecOptions {
-    /** Feed data to the command's stdin. */
     stdin?: string | AsyncIterable<string>;
-    /**
-     * What to do with stderr:
-     *   "inherit" (default) — stderr goes to the shell's stderr
-     *   "pipe"              — capture stderr separately (available in ExecResult.stderr)
-     *   "merge"             — merge stderr into stdout (2>&1)
-     */
     stderr?: "inherit" | "pipe" | "merge";
 }
 
-/**
- * Returned by jsh.exec(). Usable as both a Promise and an AsyncIterable.
- *
- * @example
- * // Await for buffered result:
- * const { stdout, exitCode } = await jsh.exec('git log --oneline -5');
- *
- * // Iterate for streaming:
- * for await (const line of jsh.exec('tail -f /var/log/syslog')) {
- *     if (line.includes('ERROR')) yield line;
- * }
- */
 interface ExecHandle extends PromiseLike<ExecResult>, AsyncIterable<string> {}
 
-/** Completion context passed to completion handlers. */
+// ---- Completion -------------------------------------------------------------
+
 interface CompletionCtx {
-    /** All words on the current line, split by whitespace. */
     words: string[];
-    /** The word currently being completed. */
     current: string;
 }
 
-/**
- * Color specification for theme colors.
- *
- * Supported formats:
- *   [r, g, b]     — RGB tuple (0-255 each), renders as true color
- *   "#rrggbb"     — hex color, renders as true color
- *   "bold green"  — named color with optional modifiers (bold, italic, underline)
- *
- * Named colors: black, red, green, yellow, blue, magenta, cyan, white.
- */
+// ---- Theme ------------------------------------------------------------------
+
 type Color = [number, number, number] | `#${string}` | string;
 
-/**
- * Syntax highlighting theme.
- *
- * All fields are optional — unset fields use the default theme colors.
- *
- * @example
- * jsh.setTheme({
- *     command:         [130, 224, 170],  // green
- *     commandNotFound: [255, 85, 85],    // red
- *     keyword:         "#ffcb6b",
- *     string:          "green",
- *     variable:        "bold cyan",
- * });
- */
 interface Theme {
-    /** Valid command (builtin, PATH executable, alias, function). Default: green. */
     command?: Color;
-    /** Invalid/not-found command. Default: red with curly underline. */
     commandNotFound?: Color;
-    /** Shell keywords (if, then, fi, for, while, do, done, case, esac). Default: yellow. */
     keyword?: Color;
-    /** Operators (|, &&, ||, ;, &, !). Default: purple. */
     operator?: Color;
-    /** Redirections (>, >>, <, <<, etc.). Default: purple. */
     redirect?: Color;
-    /** Quoted strings (single and double). Default: light green. */
     string?: Color;
-    /** Variable expansions ($VAR, ${VAR}). Default: cyan. */
     variable?: Color;
-    /** Comments (# ...). Default: grey. */
     comment?: Color;
-    /** Regular arguments (non-command words). Default: uncolored. */
     argument?: Color;
-    /** Parentheses and braces ((), {}). Default: yellow. */
     paren?: Color;
-    /** Inline JS blocks (@{ }, @!{ }). Default: yellow. */
     jsInline?: Color;
 }
 
+// ---- Color constants --------------------------------------------------------
+
+interface Colors {
+    // Reset
+    readonly reset: string;
+    // Modifiers
+    readonly bold: string;
+    readonly dim: string;
+    readonly italic: string;
+    readonly underline: string;
+    readonly blink: string;
+    readonly inverse: string;
+    readonly hidden: string;
+    readonly strikethrough: string;
+    // Underline styles
+    readonly underlineCurly: string;
+    readonly underlineDotted: string;
+    readonly underlineDashed: string;
+    readonly underlineDouble: string;
+    // Foreground
+    readonly black: string;
+    readonly red: string;
+    readonly green: string;
+    readonly yellow: string;
+    readonly blue: string;
+    readonly magenta: string;
+    readonly cyan: string;
+    readonly white: string;
+    // Bright foreground
+    readonly brightBlack: string;
+    readonly brightRed: string;
+    readonly brightGreen: string;
+    readonly brightYellow: string;
+    readonly brightBlue: string;
+    readonly brightMagenta: string;
+    readonly brightCyan: string;
+    readonly brightWhite: string;
+    // Background
+    readonly bgBlack: string;
+    readonly bgRed: string;
+    readonly bgGreen: string;
+    readonly bgYellow: string;
+    readonly bgBlue: string;
+    readonly bgMagenta: string;
+    readonly bgCyan: string;
+    readonly bgWhite: string;
+    // Bright background
+    readonly bgBrightBlack: string;
+    readonly bgBrightRed: string;
+    readonly bgBrightGreen: string;
+    readonly bgBrightYellow: string;
+    readonly bgBrightBlue: string;
+    readonly bgBrightMagenta: string;
+    readonly bgBrightCyan: string;
+    readonly bgBrightWhite: string;
+}
+
+// ---- jsh global object ------------------------------------------------------
+
 declare const jsh: {
-    /** Shell variable store — same object as the bare `$` in shell. */
+    /** Shell variable store. */
     $: typeof $;
 
+    // ---- Prompt ----
+
     /**
-     * Define or redefine the interactive prompt.
-     * The function is called before each new input line.
-     * Supports async functions for dynamic content (e.g., git branch).
-     *
+     * Set the interactive prompt. Supports async (e.g., for git branch).
      * @example
-     * jsh.setPrompt(() => `${jsh.$.PWD} $ `);
-     *
-     * // Async prompt with git branch:
+     * jsh.setPrompt(() => `$ `);
      * jsh.setPrompt(async () => {
-     *     const branch = await jsh.exec('git branch --show-current');
-     *     return `${branch.ok ? branch.stdout + ' ' : ''}$ `;
+     *     const b = await jsh.exec('git branch --show-current');
+     *     return `${b.ok ? b.stdout + ' ' : ''}$ `;
      * });
      */
     setPrompt(fn: () => string | Promise<string>): void;
 
     /**
-     * Define a right-aligned prompt.
-     * Rendered on the right edge of the terminal, disappears if the
-     * input line would overlap it. Supports async functions.
-     *
+     * Set a right-aligned prompt. Supports async.
+     * Disappears if the input line would overlap it.
      * @example
      * jsh.setRightPrompt(() => new Date().toLocaleTimeString());
-     *
-     * jsh.setRightPrompt(async () => {
-     *     const branch = await jsh.exec('git branch --show-current');
-     *     return branch.ok ? branch.stdout : '';
-     * });
      */
     setRightPrompt(fn: (() => string | Promise<string>) | null): void;
 
-    /**
-     * Set the syntax highlighting theme.
-     * Merges with the default theme — only provided fields are overridden.
-     *
-     * @example
-     * jsh.setTheme({
-     *     keyword: [255, 203, 107],
-     *     string:  "#c3e88d",
-     *     command: "bold green",
-     * });
-     */
+    // ---- Syntax highlighting ----
+
+    /** Set the syntax highlighting theme (merges with defaults). */
     setTheme(theme: Partial<Theme>): void;
 
-    /**
-     * Override the syntax highlighting function entirely.
-     * The function receives the raw input line and must return an
-     * ANSI-colored string. Set to null to restore the default colorizer.
-     *
-     * @example
-     * jsh.setColorize((input) => `\x1b[31m${input}\x1b[0m`);  // all red
-     * jsh.setColorize(null);  // restore default
-     */
+    /** Override syntax highlighting entirely. Null restores the default. */
     setColorize(fn: ((input: string) => string) | null): void;
 
+    // ---- Layout regions ----
+
     /**
-     * Define a shell alias. When `name` is used as a command, it is
-     * replaced with `expansion` before execution.
+     * Set header content (lines rendered above the input line).
+     * @example
+     * jsh.setHeader(() => ["  git: main ●3 ↑1"]);
+     */
+    setHeader(fn: (() => string[] | Promise<string[]>) | null): void;
+
+    /**
+     * Set footer content (lines rendered below the input line).
+     * @example
+     * jsh.setFooter(() => ["  12:34 PM"]);
+     */
+    setFooter(fn: (() => string[] | Promise<string[]>) | null): void;
+
+    // ---- Widgets ----
+
+    /**
+     * Register a widget that renders content in a header or footer zone.
+     * Widgets with an interval auto-refresh while the user is typing.
+     *
+     * @param id      Unique identifier (used for removeWidget)
+     * @param zone    "header" or "footer"
+     * @param render  Function returning a line or lines (may be async)
+     * @param order   Sort order within the zone (default 0)
+     * @param interval Auto-refresh interval in ms (omit for static)
      *
      * @example
-     * jsh.alias('ll', 'ls -la');
-     * jsh.alias('gs', 'git status');
+     * jsh.addWidget("clock", "footer", () => {
+     *     return jsh.style`${jsh.colors.dim}${new Date().toLocaleTimeString()}`;
+     * }, 0, 1000);
+     *
+     * jsh.addWidget("git", "header", async () => {
+     *     const b = await jsh.exec("git branch --show-current");
+     *     return b.ok ? jsh.style`${jsh.colors.cyan}${b.stdout}` : "";
+     * });
      */
-    alias(name: string, expansion: string): void;
+    addWidget(
+        id: string,
+        zone: "header" | "footer",
+        render: () => string | string[] | Promise<string | string[]>,
+        order?: number,
+        interval?: number,
+    ): void;
 
-    /** Remove a previously defined alias. */
+    /** Remove a previously registered widget. */
+    removeWidget(id: string): void;
+
+    // ---- Colors ----
+
+    /** Pre-built ANSI color/modifier escape strings. */
+    colors: Colors;
+
+    /**
+     * Create a custom foreground color from RGB values or hex string.
+     * Returns an ANSI escape string that can be concatenated or used in templates.
+     * @example
+     * const orange = jsh.makeFgColor(255, 165, 0);
+     * const brand = jsh.makeFgColor("#ff6600");
+     */
+    makeFgColor(r: number | string, g?: number, b?: number): string;
+
+    /**
+     * Create a custom background color from RGB values or hex string.
+     * @example
+     * const bgOrange = jsh.makeBgColor(255, 165, 0);
+     */
+    makeBgColor(r: number | string, g?: number, b?: number): string;
+
+    /**
+     * Create a custom underline color from RGB values or hex string.
+     * @example
+     * const ulRed = jsh.makeUlColor(255, 0, 0);
+     */
+    makeUlColor(r: number | string, g?: number, b?: number): string;
+
+    /**
+     * Tagged template for styled strings. Auto-appends reset at the end.
+     * @example
+     * const { bold, green } = jsh.colors;
+     * const line = jsh.style`${bold}${green}hello world`;
+     * // → "\x1b[1m\x1b[32mhello world\x1b[0m"
+     */
+    style(strings: TemplateStringsArray, ...values: unknown[]): string;
+
+    // ---- Aliases ----
+
+    alias(name: string, expansion: string): void;
     unalias(name: string): void;
 
+    // ---- Command execution ----
+
     /**
-     * Run a shell command string and return an ExecHandle that is both
-     * awaitable (buffered result) and async-iterable (streaming lines).
-     *
+     * Run a shell command. Returns an ExecHandle: awaitable or async-iterable.
      * @example
-     * // Buffered
      * const { stdout, ok } = await jsh.exec('git rev-parse HEAD');
-     *
-     * // Streaming inside a @function
-     * export async function* errors(args, stdin) {
-     *     for await (const line of jsh.exec('journalctl -n 100')) {
-     *         if (line.includes('ERROR')) yield line;
-     *     }
-     * }
-     *
-     * // With options
-     * const r = await jsh.exec('grep pattern', {
-     *     stdin: 'line one\nline two\n',
-     *     stderr: 'pipe',
-     * });
+     * for await (const line of jsh.exec('tail -f log')) { ... }
      */
     exec(cmd: string, options?: ExecOptions): ExecHandle;
 
-    /**
-     * Register a JavaScript function as an @ pipeline function.
-     * After registration, `@name` can be used in pipelines.
-     *
-     * Alternatively, simply export the function from .jshrc — exported
-     * functions are auto-registered under their export name.
-     *
-     * @example
-     * jsh.registerJsFunction('filter', async function*(args, stdin) {
-     *     const pattern = new RegExp(args[0] ?? '');
-     *     for await (const line of stdin) {
-     *         if (pattern.test(line)) yield line;
-     *     }
-     * });
-     */
+    // ---- Functions ----
+
+    /** Register a JS function as an @ pipeline function. */
     registerJsFunction(name: string, fn: JsPipelineFunction): void;
 
+    // ---- Completion ----
+
     /**
-     * Register a tab completion handler for a specific command.
-     * The handler is called when the user presses Tab after typing the
-     * command name. Must return an array of completion strings synchronously.
-     *
+     * Register a tab completion handler for a command.
      * @example
      * jsh.complete('git', (ctx) => {
-     *     if (ctx.words.length === 2) {
-     *         return ['add', 'commit', 'push', 'pull', 'status', 'log']
-     *             .filter(s => s.startsWith(ctx.current));
-     *     }
+     *     if (ctx.words.length === 2)
+     *         return ['add','commit','push','pull','status'].filter(s => s.startsWith(ctx.current));
      *     return [];
      * });
      */
