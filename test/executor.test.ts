@@ -343,6 +343,73 @@ describe("executor — source / . builtin", () => {
     });
 });
 
+describe("executor — local builtin", () => {
+    it("should scope variable to function", () => {
+        assert.strictEqual(
+            run('X=global\nmyfunc() { local X=local; echo $X; }\nmyfunc\necho $X'),
+            "local\nglobal"
+        );
+    });
+    it("should restore unset variable after function", () => {
+        assert.strictEqual(
+            run('unset LOCALTEST\nmyfunc() { local LOCALTEST=val; echo $LOCALTEST; }\nmyfunc\necho "after:$LOCALTEST"'),
+            "val\nafter:"
+        );
+    });
+    it("should allow local without assignment", () => {
+        assert.strictEqual(
+            run('X=global\nmyfunc() { local X; X=local; echo $X; }\nmyfunc\necho $X'),
+            "local\nglobal"
+        );
+    });
+    it("should handle multiple local declarations", () => {
+        assert.strictEqual(
+            run('A=1\nB=2\nmyfunc() { local A=x B=y; echo $A $B; }\nmyfunc\necho $A $B'),
+            "x y\n1 2"
+        );
+    });
+    it("should warn when used outside function", () => {
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: "local X=1\n",
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        assert.ok(r.stderr.includes("can only be used in a function"));
+    });
+});
+
+describe("executor — set builtin", () => {
+    it("should enable errexit with set -e", () => {
+        assert.strictEqual(run("set -e\nfalse\necho should not print"), "");
+    });
+    it("should disable errexit with set +e", () => {
+        assert.strictEqual(run("set -e\nset +e\nfalse\necho ok"), "ok");
+    });
+    it("should enable xtrace with set -x", () => {
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: "set -x\necho hello\n",
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        assert.ok(r.stderr.includes("+ echo hello"), `expected trace, got stderr: ${r.stderr}`);
+        assert.ok(r.stdout.includes("hello"));
+    });
+    it("should error on unset variable with set -u", () => {
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: "set -u\necho $UNSETVAR_JSH_TEST\n",
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        assert.ok(r.stderr.includes("unbound variable"), `expected error, got stderr: ${r.stderr}`);
+    });
+    it("should enable pipefail with set -o pipefail", () => {
+        assert.strictEqual(ec("set -o pipefail"), 0);
+    });
+    it("should combine short flags", () => {
+        assert.strictEqual(run("set -eu\nset +eu\necho ok"), "ok");
+    });
+});
+
 describe("executor — expansion", () => {
     it("variable expansion", () => {
         assert.strictEqual(run("X=hello; echo $X"), "hello");

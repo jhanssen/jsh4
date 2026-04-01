@@ -7,6 +7,43 @@ for (const [key, value] of Object.entries(process.env)) {
     }
 }
 
+// ---- local variable scoping -------------------------------------------------
+// Each frame records the original values of variables declared `local`.
+// On scope exit, these are restored (or deleted if they didn't exist).
+
+const UNSET = Symbol("unset");
+type SavedFrame = Map<string, unknown>; // value or UNSET
+const scopeStack: SavedFrame[] = [];
+
+export function pushScope(): void {
+    scopeStack.push(new Map());
+}
+
+export function popScope(): void {
+    const frame = scopeStack.pop();
+    if (!frame) return;
+    for (const [name, prev] of frame) {
+        if (prev === UNSET) {
+            store.delete(name);
+        } else {
+            store.set(name, prev);
+        }
+    }
+}
+
+export function declareLocal(name: string): void {
+    const frame = scopeStack[scopeStack.length - 1];
+    if (!frame) {
+        // Not inside a function — local is a no-op (bash prints a warning; we match that)
+        process.stderr.write(`local: can only be used in a function\n`);
+        return;
+    }
+    // Only save the first time this name is declared local in this scope
+    if (!frame.has(name)) {
+        frame.set(name, store.has(name) ? store.get(name) : UNSET);
+    }
+}
+
 export const $: Record<string, unknown> = new Proxy(
     {} as Record<string, unknown>,
     {

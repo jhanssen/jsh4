@@ -11,10 +11,11 @@ import type {
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl } from "../expander/index.js";
-import { $ } from "../variables/index.js";
+import { $, pushScope, popScope, declareLocal } from "../variables/index.js";
 import { pushParams, popParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { getAlias } from "../api/index.js";
+import { shellOpts } from "../shellopts/index.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
@@ -163,12 +164,19 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     if (!stage) return { exitCode: 0 };
     const { cmd: command, args, redirs } = stage;
 
+    // xtrace: print command before execution
+    if (shellOpts.xtrace) {
+        const trace = [command, ...args].join(" ");
+        process.stderr.write(`+ ${trace}\n`);
+    }
+
     // Shell functions take priority.
     const func = shellFunctions.get(command);
     if (func) {
         pushParams(args);
+        pushScope();
         try { return await executeNode(func); }
-        finally { popParams(); }
+        finally { popScope(); popParams(); }
     }
 
     // read builtin
@@ -448,6 +456,7 @@ async function executeList(node: List): Promise<ExecResult> {
         }
         last = await executeNode(entry.node);
         $["?"] = last.exitCode;
+        if (shellOpts.errexit && last.exitCode !== 0) return last;
     }
     return last;
 }
@@ -858,7 +867,85 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             }
             return runTest(args.slice(0, -1));
         }
+        case "set":
+            return runSet(args);
+        case "local": {
+            for (const arg of args) {
+                const eq = arg.indexOf("=");
+                if (eq > 0) {
+                    const key = arg.slice(0, eq);
+                    const val = arg.slice(eq + 1);
+                    declareLocal(key);
+                    $[key] = val;
+                } else if (arg) {
+                    declareLocal(arg);
+                }
+            }
+            return { exitCode: 0 };
+        }
         default:
             return null;
     }
+}
+
+// ---- set builtin ------------------------------------------------------------
+
+const shortOptMap: Record<string, keyof typeof shellOpts> = {
+    e: "errexit",
+    u: "nounset",
+    x: "xtrace",
+};
+
+const longOptMap: Record<string, keyof typeof shellOpts> = {
+    errexit: "errexit",
+    nounset: "nounset",
+    xtrace: "xtrace",
+    pipefail: "pipefail",
+};
+
+function runSet(args: string[]): ExecResult {
+    if (args.length === 0) {
+        // Print all shell options
+        for (const [name, val] of Object.entries(shellOpts)) {
+            process.stdout.write(`${name}\t${val ? "on" : "off"}\n`);
+        }
+        return { exitCode: 0 };
+    }
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i]!;
+        if (arg === "-o" || arg === "+o") {
+            const enable = arg[0] === "-";
+            const name = args[++i];
+            if (!name || !(name in longOptMap)) {
+                process.stderr.write(`set: ${name ?? ""}: invalid option\n`);
+                return { exitCode: 1 };
+            }
+            shellOpts[longOptMap[name]!] = enable;
+        } else if (arg.startsWith("-") && arg.length > 1 && arg[1] !== "-") {
+            for (let j = 1; j < arg.length; j++) {
+                const ch = arg[j]!;
+                const opt = shortOptMap[ch];
+                if (!opt) {
+                    process.stderr.write(`set: -${ch}: invalid option\n`);
+                    return { exitCode: 1 };
+                }
+                shellOpts[opt] = true;
+            }
+        } else if (arg.startsWith("+") && arg.length > 1) {
+            for (let j = 1; j < arg.length; j++) {
+                const ch = arg[j]!;
+                const opt = shortOptMap[ch];
+                if (!opt) {
+                    process.stderr.write(`set: +${ch}: invalid option\n`);
+                    return { exitCode: 1 };
+                }
+                shellOpts[opt] = false;
+            }
+        } else {
+            process.stderr.write(`set: ${arg}: invalid argument\n`);
+            return { exitCode: 1 };
+        }
+    }
+    return { exitCode: 0 };
 }

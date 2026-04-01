@@ -4,6 +4,7 @@ import type {
 } from "../parser/index.js";
 import { $ } from "../variables/index.js";
 import { getParam, getAllParams, getParamCount } from "../variables/positional.js";
+import { shellOpts } from "../shellopts/index.js";
 import { glob } from "node:fs/promises";
 import * as os from "node:os";
 
@@ -84,7 +85,12 @@ function expandVariable(seg: VariableExpansion): string {
 
     const raw = $[seg.name];
     const val = raw !== undefined ? String(raw) : undefined;
-    if (!seg.operator) return val ?? "";
+    if (!seg.operator) {
+        if (val === undefined && shellOpts.nounset) {
+            throw new Error(`${seg.name}: unbound variable`);
+        }
+        return val ?? "";
+    }
 
     switch (seg.operator) {
         case ":-": case "-":
