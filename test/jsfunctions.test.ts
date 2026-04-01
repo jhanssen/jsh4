@@ -24,46 +24,46 @@ function run(cmd: string): string {
 }
 
 describe("@ syntax — parser", () => {
-    it("parses @name as JsFunction node", () => {
+    it("should parse @name as JsFunction node", () => {
         const ast = parse("@upper") as JsFunction;
         assert.strictEqual(ast.type, "JsFunction");
         assert.strictEqual(ast.name, "upper");
         assert.strictEqual(ast.buffered, false);
     });
 
-    it("parses @!name as buffered JsFunction", () => {
+    it("should parse @!name as buffered JsFunction", () => {
         const ast = parse("@!parse") as JsFunction;
         assert.strictEqual(ast.type, "JsFunction");
         assert.strictEqual(ast.name, "parse");
         assert.strictEqual(ast.buffered, true);
     });
 
-    it("parses @name with args", () => {
+    it("should parse @name with args", () => {
         const ast = parse("@filter pattern") as JsFunction;
         assert.strictEqual(ast.type, "JsFunction");
         assert.strictEqual(ast.args.length, 1);
     });
 
-    it("parses @{ expr } as inline JsFunction", () => {
+    it("should parse @{ expr } as inline JsFunction", () => {
         const ast = parse('@{ (args, stdin) => "ok" }') as JsFunction;
         assert.strictEqual(ast.type, "JsFunction");
         assert.strictEqual(ast.name, "");
         assert.ok(ast.inlineBody !== undefined);
     });
 
-    it("parses @!{ expr } as buffered inline JsFunction", () => {
+    it("should parse @!{ expr } as buffered inline JsFunction", () => {
         const ast = parse("@!{ (args, s) => s }") as JsFunction;
         assert.strictEqual(ast.type, "JsFunction");
         assert.strictEqual(ast.buffered, true);
     });
 
-    it("parses @{ expr } with nested braces", () => {
+    it("should parse @{ expr } with nested braces", () => {
         const ast = parse("@{ x => ({ key: x }) }") as JsFunction;
         assert.strictEqual(ast.type, "JsFunction");
         assert.ok(ast.inlineBody!.includes("key"));
     });
 
-    it("parses @{ } with JS string containing closing brace", () => {
+    it("should parse @{ } with JS string containing closing brace", () => {
         const ast = parse('@{ x => "hello}" }') as JsFunction;
         assert.strictEqual(ast.type, "JsFunction");
         assert.ok(ast.inlineBody!.includes("hello}"));
@@ -71,27 +71,27 @@ describe("@ syntax — parser", () => {
 });
 
 describe("@ syntax — inline execution", () => {
-    it("@{ } returning string", () => {
+    it("should return string from @{ }", () => {
         assert.strictEqual(run('@{ () => "hello" }'), "hello");
     });
 
-    it("@{ } in pipeline — transform", () => {
+    it("should transform in @{ } pipeline", () => {
         assert.strictEqual(run('echo hello | @{ (args, stdin) => "world" }'), "world");
     });
 
-    it("@{ } async generator — even number filter", () => {
+    it("should filter with @{ } async generator", () => {
         const out = run("seq 6 | @{ async function*(args, stdin) { for await (const l of stdin) { if (parseInt(l) % 2 === 0) yield l; } } }");
         assert.deepStrictEqual(out.split("\n"), ["2", "4", "6"]);
     });
 
-    it("@{ } in three-stage pipeline", () => {
+    it("should handle @{ } in three-stage pipeline", () => {
         const out = run("seq 5 | @{ async function*(a, s) { for await (const l of s) yield l; } } | head -3");
         assert.deepStrictEqual(out.split("\n"), ["1", "2", "3"]);
     });
 });
 
 describe("@ syntax — named functions via .jshrc", () => {
-    it("calls a registered function via .jshrc", () => {
+    it("should call a registered function", () => {
         // Register in-process for the parser test; execution tests use subprocess
         registerJsFunction("__test_upper", async function* (_args, stdin) {
             if (!stdin) return;
@@ -105,7 +105,7 @@ describe("@ syntax — named functions via .jshrc", () => {
         assert.ok(true);
     });
 
-    it("named function works via jshrc temp file", () => {
+    it("should work with named function via temp file", () => {
         const rc = `/tmp/jsh_test_rc_${Date.now()}.js`;
         require("fs").writeFileSync(rc, `
 registerJsFunction('upper2', async function*(args, stdin) {
@@ -129,7 +129,7 @@ registerJsFunction('upper2', async function*(args, stdin) {
 });
 
 describe("@ syntax — buffered mode", () => {
-    it("@!{ } receives full input as string", () => {
+    it("should receive full input as string with @!{ }", () => {
         // Count words — buffered mode joins all input into one string
         const out = run('printf "hello world\\nfoo bar\\n" | @!{ (args, text) => String(text.trim().split(/\\s+/).length) }');
         assert.strictEqual(out, "4");

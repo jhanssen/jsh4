@@ -9,32 +9,32 @@ import type { JsPipelineFunction } from "../src/jsfunctions/index.js";
 describe("alias", () => {
     after(() => { unalias("__test_ll"); unalias("__test_gs"); });
 
-    it("alias() registers an expansion", () => {
+    it("should register an expansion", () => {
         alias("__test_ll", "ls -la");
         assert.strictEqual(getAlias("__test_ll"), "ls -la");
     });
 
-    it("alias() overwrites existing alias", () => {
+    it("should overwrite existing alias", () => {
         alias("__test_ll", "ls -la");
         alias("__test_ll", "ls -lah");
         assert.strictEqual(getAlias("__test_ll"), "ls -lah");
     });
 
-    it("getAlias() returns undefined for unknown name", () => {
+    it("should return undefined for unknown alias", () => {
         assert.strictEqual(getAlias("__no_such_alias__"), undefined);
     });
 
-    it("unalias() removes the alias", () => {
+    it("should remove alias with unalias", () => {
         alias("__test_gs", "git status");
         unalias("__test_gs");
         assert.strictEqual(getAlias("__test_gs"), undefined);
     });
 
-    it("unalias() on non-existent alias is a no-op", () => {
+    it("should not throw on unalias of non-existent alias", () => {
         assert.doesNotThrow(() => unalias("__never_existed__"));
     });
 
-    it("multiple aliases coexist", () => {
+    it("should support multiple coexisting aliases", () => {
         alias("__test_ll", "ls -la");
         alias("__test_gs", "git status");
         assert.strictEqual(getAlias("__test_ll"), "ls -la");
@@ -58,24 +58,24 @@ describe("setPrompt / getPrompt", () => {
         if (savedPrompt) setPrompt(savedPrompt);
     });
 
-    it("getPrompt() returns '$ ' by default", () => {
+    it("should return '$ ' by default", () => {
         setPrompt(() => "$ "); // ensure default
         assert.strictEqual(getPrompt(), "$ ");
     });
 
-    it("setPrompt() changes the prompt string", () => {
+    it("should change the prompt string", () => {
         setPrompt(() => "test> ");
         assert.strictEqual(getPrompt(), "test> ");
     });
 
-    it("setPrompt() with dynamic content", () => {
+    it("should support dynamic prompt content", () => {
         let n = 0;
         setPrompt(() => `${++n}> `);
         assert.strictEqual(getPrompt(), "1> ");
         assert.strictEqual(getPrompt(), "2> ");
     });
 
-    it("getPrompt() returns '$ ' when prompt function throws", () => {
+    it("should return '$ ' when prompt function throws", () => {
         setPrompt(() => { throw new Error("oops"); });
         assert.strictEqual(getPrompt(), "$ ");
     });
@@ -92,16 +92,16 @@ describe("registerJsFunction / lookupJsFunction", () => {
         // Clean up — no unregister API, but that's acceptable
     });
 
-    it("registerJsFunction() makes function available by name", () => {
+    it("should make function available by name", () => {
         registerJsFunction("__test_passthrough", testFn);
         assert.strictEqual(lookupJsFunction("__test_passthrough"), testFn);
     });
 
-    it("lookupJsFunction() returns undefined for unknown name", () => {
+    it("should return undefined for unknown function", () => {
         assert.strictEqual(lookupJsFunction("__no_such_fn__"), undefined);
     });
 
-    it("registerJsFunction() overwrites existing registration", () => {
+    it("should overwrite existing registration", () => {
         const fn1: JsPipelineFunction = () => "a";
         const fn2: JsPipelineFunction = () => "b";
         registerJsFunction("__test_overwrite", fn1);
@@ -109,13 +109,13 @@ describe("registerJsFunction / lookupJsFunction", () => {
         assert.strictEqual(lookupJsFunction("__test_overwrite"), fn2);
     });
 
-    it("listJsFunctions() includes registered functions", () => {
+    it("should include registered functions in list", () => {
         registerJsFunction("__test_listed", testFn);
         const list = listJsFunctions();
         assert.ok(list.includes("__test_listed"));
     });
 
-    it("registered function is callable", async () => {
+    it("should produce callable registered function", async () => {
         const fn: JsPipelineFunction = async function* (_args, _stdin) {
             yield "hello\n";
         };

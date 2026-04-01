@@ -27,41 +27,41 @@ function ec(cmd: string): number {
 }
 
 describe("executor — simple commands", () => {
-    it("runs a command and captures stdout", () => {
+    it("should run a command and capture stdout", () => {
         assert.strictEqual(run("echo hello"), "hello");
     });
 
-    it("passes arguments correctly", () => {
+    it("should pass arguments correctly", () => {
         assert.strictEqual(run("echo foo bar baz"), "foo bar baz");
     });
 
-    it("exit code 0 on success", () => {
+    it("should return exit code 0 on success", () => {
         assert.strictEqual(ec("true"), 0);
     });
 
-    it("exit code 1 on failure", () => {
+    it("should return exit code 1 on failure", () => {
         assert.strictEqual(ec("false"), 1);
     });
 
-    it("command not found returns 127", () => {
+    it("should return 127 for command not found", () => {
         assert.strictEqual(ec("__no_such_command__"), 127);
     });
 });
 
 describe("executor — pipelines", () => {
-    it("pipes stdout between commands", () => {
+    it("should pipe stdout between commands", () => {
         assert.strictEqual(run("echo hello | cat"), "hello");
     });
 
-    it("multi-stage pipeline", () => {
+    it("should handle multi-stage pipeline", () => {
         assert.strictEqual(run("echo hello | cat | cat"), "hello");
     });
 
-    it("pipeline with transformation", () => {
+    it("should transform in pipeline", () => {
         assert.strictEqual(run("echo hello | tr a-z A-Z"), "HELLO");
     });
 
-    it("exit code from last stage", () => {
+    it("should return exit code from last stage", () => {
         assert.strictEqual(ec("echo hi | false"), 1);
     });
 });
@@ -71,20 +71,20 @@ describe("executor — redirections", () => {
     before(() => { tmp = mkdtempSync(join(tmpdir(), "jsh-test-")); });
     after(() => { rmSync(tmp, { recursive: true }); });
 
-    it("redirects stdout to file", () => {
+    it("should redirect stdout to file", () => {
         const f = join(tmp, "out.txt");
         run(`echo hello > ${f}`);
         assert.strictEqual(run(`cat ${f}`), "hello");
     });
 
-    it("appends with >>", () => {
+    it("should append with >>", () => {
         const f = join(tmp, "append.txt");
         run(`echo a > ${f}`);
         run(`echo b >> ${f}`);
         assert.strictEqual(run(`cat ${f}`), "a\nb");
     });
 
-    it("reads stdin from file", () => {
+    it("should read stdin from file", () => {
         const f = join(tmp, "in.txt");
         run(`echo world > ${f}`);
         assert.strictEqual(run(`cat < ${f}`), "world");
@@ -92,179 +92,179 @@ describe("executor — redirections", () => {
 });
 
 describe("executor — logical operators", () => {
-    it("&& executes right side on success", () => {
+    it("should execute right side of && on success", () => {
         assert.strictEqual(run("echo a && echo b"), "a\nb");
     });
 
-    it("&& skips right side on failure", () => {
+    it("should skip right side of && on failure", () => {
         assert.strictEqual(run("false && echo b"), "");
     });
 
-    it("|| skips right side on success", () => {
+    it("should skip right side of || on success", () => {
         assert.strictEqual(run("true || echo b"), "");
     });
 
-    it("|| executes right side on failure", () => {
+    it("should execute right side of || on failure", () => {
         assert.strictEqual(run("false || echo b"), "b");
     });
 });
 
 describe("executor — builtins", () => {
-    it("echo builtin", () => {
+    it("should handle echo builtin", () => {
         assert.strictEqual(run("echo hi"), "hi");
     });
 
-    it("true and false", () => {
+    it("should handle true and false", () => {
         assert.strictEqual(ec("true"), 0);
         assert.strictEqual(ec("false"), 1);
     });
 
-    it("cd changes directory and PWD is updated", () => {
+    it("should change directory and update PWD", () => {
         assert.strictEqual(run("cd /tmp && echo $PWD"), realpathSync("/tmp"));
     });
 
-    it("export makes variable visible to children", () => {
+    it("should make exported variable visible to children", () => {
         assert.strictEqual(run("export MYJSHVAR=hello && env | grep MYJSHVAR"), "MYJSHVAR=hello");
     });
 });
 
 describe("executor — control flow", () => {
-    it("if true executes consequent", () => {
+    it("should execute consequent when if condition is true", () => {
         assert.strictEqual(run("if true; then echo yes; fi"), "yes");
     });
 
-    it("if false executes else", () => {
+    it("should execute else when if condition is false", () => {
         assert.strictEqual(run("if false; then echo no; else echo yes; fi"), "yes");
     });
 
-    it("if with elif", () => {
+    it("should handle elif", () => {
         assert.strictEqual(
             run("if false; then echo a; elif true; then echo b; else echo c; fi"),
             "b"
         );
     });
 
-    it("for loop iterates over items", () => {
+    it("should iterate for loop over items", () => {
         assert.deepStrictEqual(run("for i in 1 2 3; do echo $i; done").split("\n"), ["1", "2", "3"]);
     });
 
-    it("while loop exits when condition is false", () => {
+    it("should exit while loop when condition is false", () => {
         assert.strictEqual(run("while false; do echo x; done; echo done"), "done");
     });
 });
 
 describe("executor — shell functions", () => {
-    it("defines and calls a function", () => {
+    it("should define and call a function", () => {
         assert.strictEqual(run("greet() { echo hello; }; greet"), "hello");
     });
 
-    it("function receives positional params", () => {
+    it("should pass positional params to function", () => {
         assert.strictEqual(run("greet() { echo hello $1; }; greet world"), "hello world");
     });
 
-    it("function with multiple params", () => {
+    it("should handle function with multiple params", () => {
         assert.strictEqual(run("add() { echo $1 $2; }; add foo bar"), "foo bar");
     });
 });
 
 describe("executor — test / [ builtin", () => {
     // String tests
-    it("test with no args returns false", () => {
+    it("should return false with no args", () => {
         assert.strictEqual(ec("test"), 1);
     });
-    it("test non-empty string is true", () => {
+    it("should return true for non-empty string", () => {
         assert.strictEqual(ec("test hello"), 0);
     });
-    it("test empty string is false", () => {
+    it("should return false for empty string", () => {
         assert.strictEqual(ec('test ""'), 1);
     });
-    it("-z empty string", () => {
+    it("should return true for -z with empty string", () => {
         assert.strictEqual(ec('test -z ""'), 0);
     });
-    it("-z non-empty string", () => {
+    it("should return false for -z with non-empty string", () => {
         assert.strictEqual(ec("test -z hello"), 1);
     });
-    it("-n non-empty string", () => {
+    it("should return true for -n with non-empty string", () => {
         assert.strictEqual(ec("test -n hello"), 0);
     });
-    it("-n empty string", () => {
+    it("should return false for -n with empty string", () => {
         assert.strictEqual(ec('test -n ""'), 1);
     });
 
     // String comparison
-    it("string equality", () => {
+    it("should test string equality", () => {
         assert.strictEqual(ec('test foo = foo'), 0);
     });
-    it("string inequality", () => {
+    it("should test string inequality", () => {
         assert.strictEqual(ec('test foo = bar'), 1);
     });
-    it("string !=", () => {
+    it("should test string != operator", () => {
         assert.strictEqual(ec('test foo != bar'), 0);
     });
 
     // Integer comparison
-    it("-eq", () => {
+    it("should test -eq", () => {
         assert.strictEqual(ec("test 5 -eq 5"), 0);
     });
-    it("-ne", () => {
+    it("should test -ne", () => {
         assert.strictEqual(ec("test 5 -ne 3"), 0);
     });
-    it("-lt", () => {
+    it("should test -lt", () => {
         assert.strictEqual(ec("test 3 -lt 5"), 0);
     });
-    it("-gt", () => {
+    it("should test -gt", () => {
         assert.strictEqual(ec("test 5 -gt 3"), 0);
     });
-    it("-le equal", () => {
+    it("should test -le with equal values", () => {
         assert.strictEqual(ec("test 5 -le 5"), 0);
     });
-    it("-ge less", () => {
+    it("should test -ge with lesser value", () => {
         assert.strictEqual(ec("test 3 -ge 5"), 1);
     });
 
     // File tests
-    it("-f on existing file", () => {
+    it("should return true for -f on existing file", () => {
         assert.strictEqual(ec("test -f package.json"), 0);
     });
-    it("-f on nonexistent file", () => {
+    it("should return false for -f on nonexistent file", () => {
         assert.strictEqual(ec("test -f __nope__"), 1);
     });
-    it("-d on directory", () => {
+    it("should return true for -d on directory", () => {
         assert.strictEqual(ec("test -d src"), 0);
     });
-    it("-d on file", () => {
+    it("should return false for -d on file", () => {
         assert.strictEqual(ec("test -d package.json"), 1);
     });
-    it("-e on existing file", () => {
+    it("should return true for -e on existing file", () => {
         assert.strictEqual(ec("test -e package.json"), 0);
     });
 
     // Negation
-    it("! inverts result", () => {
+    it("should invert result with !", () => {
         assert.strictEqual(ec("test ! -f __nope__"), 0);
     });
 
     // [ ] syntax
-    it("[ ] syntax works", () => {
+    it("should support [ ] syntax", () => {
         assert.strictEqual(ec('[ foo = foo ]'), 0);
     });
-    it("[ ] missing ] is error", () => {
+    it("should error on [ ] with missing ]", () => {
         assert.strictEqual(ec('[ foo = foo'), 2);
     });
 
     // Used with if
-    it("if [ -f file ] works", () => {
+    it("should work with if [ -f file ]", () => {
         assert.strictEqual(run('if [ -f package.json ]; then echo yes; else echo no; fi'), "yes");
     });
-    it("if test string = string", () => {
+    it("should work with if test string = string", () => {
         assert.strictEqual(run('if test foo = foo; then echo match; fi'), "match");
     });
 
     // Logical operators
-    it("-a (and)", () => {
+    it("should support -a (and)", () => {
         assert.strictEqual(ec('test -f package.json -a -d src'), 0);
     });
-    it("-o (or)", () => {
+    it("should support -o (or)", () => {
         assert.strictEqual(ec('test -f __nope__ -o -d src'), 0);
     });
 });
@@ -298,7 +298,7 @@ describe("executor — source / . builtin", () => {
     before(() => { tmp = mkdtempSync(join(tmpdir(), "jsh-source-")); });
     after(() => { rmSync(tmp, { recursive: true }); });
 
-    it("source executes file in current context", () => {
+    it("should execute file in current context", () => {
         const f = join(tmp, "vars.sh");
         const r = spawnSync("node", ["dist/index.js"], {
             input: `echo 'MYVAR=hello' > ${f}\nsource ${f}\necho $MYVAR\nexit\n`,
@@ -308,7 +308,7 @@ describe("executor — source / . builtin", () => {
         assert.ok(r.stdout.includes("hello"), `expected hello, got: ${r.stdout}`);
     });
 
-    it(". is alias for source", () => {
+    it("should support . as alias for source", () => {
         const f = join(tmp, "dot.sh");
         const r = spawnSync("node", ["dist/index.js"], {
             input: `echo 'DOTVAR=world' > ${f}\n. ${f}\necho $DOTVAR\nexit\n`,
@@ -318,11 +318,11 @@ describe("executor — source / . builtin", () => {
         assert.ok(r.stdout.includes("world"), `expected world, got: ${r.stdout}`);
     });
 
-    it("source with missing file returns error", () => {
+    it("should return error for missing file", () => {
         assert.strictEqual(ec("source /tmp/__no_such_file_jsh__"), 1);
     });
 
-    it("source executes functions defined in file", () => {
+    it("should execute functions defined in sourced file", () => {
         const f = join(tmp, "func.sh");
         const r = spawnSync("node", ["dist/index.js"], {
             input: `echo 'greet() { echo hi $1; }' > ${f}\nsource ${f}\ngreet world\nexit\n`,
@@ -332,7 +332,7 @@ describe("executor — source / . builtin", () => {
         assert.ok(r.stdout.includes("hi world"), `expected "hi world", got: ${r.stdout}`);
     });
 
-    it("source with extra args sets positional params", () => {
+    it("should set positional params from extra args", () => {
         const f = join(tmp, "params.sh");
         const r = spawnSync("node", ["dist/index.js"], {
             input: `echo 'echo $1 $2' > ${f}\nsource ${f} foo bar\nexit\n`,
@@ -484,38 +484,38 @@ describe("executor — brace expansion", () => {
 });
 
 describe("executor — expansion", () => {
-    it("variable expansion", () => {
+    it("should expand variables", () => {
         assert.strictEqual(run("X=hello; echo $X"), "hello");
     });
 
-    it("arithmetic expansion", () => {
+    it("should expand arithmetic", () => {
         assert.strictEqual(run("echo $((2 + 3))"), "5");
     });
 
-    it("arithmetic with variable", () => {
+    it("should expand arithmetic with variable", () => {
         assert.strictEqual(run("X=7; echo $((X * 2))"), "14");
     });
 
-    it("command substitution", () => {
+    it("should expand command substitution", () => {
         assert.strictEqual(run("echo $(echo inner)"), "inner");
     });
 
-    it("command substitution in pipeline", () => {
+    it("should expand command substitution in pipeline", () => {
         assert.strictEqual(run("echo $(echo hello | tr a-z A-Z)"), "HELLO");
     });
 
-    it("glob expansion", () => {
+    it("should expand globs", () => {
         const out = run("echo test/*.test.ts");
         assert.ok(out.includes("lexer.test.ts"), `expected glob match, got: ${out}`);
     });
 
-    it("tilde expansion", () => {
+    it("should expand tilde", () => {
         const out = run("echo ~/foo");
         assert.ok(out.startsWith("/"), `expected absolute path, got: ${out}`);
         assert.ok(out.endsWith("/foo"));
     });
 
-    it("default parameter expansion", () => {
+    it("should expand default parameter", () => {
         assert.strictEqual(run("unset NOVAR; echo ${NOVAR:-fallback}"), "fallback");
     });
 });

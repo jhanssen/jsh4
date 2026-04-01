@@ -12,23 +12,23 @@ before(() => {
 });
 
 describe("completion — file/directory", () => {
-    it("completes files in current directory", () => {
+    it("should complete files in current directory", () => {
         const completions = getCompletions("echo test/");
         assert.ok(completions.some(c => c.includes("lexer.test.ts")), `got: ${completions.slice(0,5)}`);
     });
 
-    it("completes with directory trailing slash", () => {
+    it("should complete with directory trailing slash", () => {
         const completions = getCompletions("ls src/");
         assert.ok(completions.some(c => c.includes("executor")));
     });
 
-    it("returns full input replacements", () => {
+    it("should return full input replacements", () => {
         const completions = getCompletions("cat test/lex");
         assert.ok(completions.every(c => c.startsWith("cat test/")), `got: ${completions}`);
         assert.ok(completions.some(c => c.includes("lexer")));
     });
 
-    it("completes dotfiles only when prefix starts with dot", () => {
+    it("should complete dotfiles only when prefix starts with dot", () => {
         const noDot = getCompletions("ls ./");
         const withDot = getCompletions("ls ./.git");
         // .git shouldn't appear without dot prefix
@@ -39,23 +39,23 @@ describe("completion — file/directory", () => {
 });
 
 describe("completion — command", () => {
-    it("completes builtin commands", () => {
+    it("should complete builtin commands", () => {
         const completions = getCompletions("ec");
         assert.ok(completions.includes("echo"), `got: ${completions}`);
     });
 
-    it("completes from beginning of line", () => {
+    it("should complete from beginning of line", () => {
         const completions = getCompletions("exi");
         assert.ok(completions.includes("exit"), `got: ${completions}`);
     });
 
-    it("completes @ function names", () => {
+    it("should complete @ function names", () => {
         registerJsFunction("__test_complete_fn", async function* () { yield ""; });
         const completions = getCompletions("@__test_complete");
         assert.ok(completions.includes("@__test_complete_fn"), `got: ${completions}`);
     });
 
-    it("falls back to file completion for non-first words", () => {
+    it("should fall back to file completion for non-first words", () => {
         const completions = getCompletions("cat src/");
         assert.ok(completions.some(c => c.startsWith("cat src/")));
     });
@@ -72,18 +72,18 @@ describe("completion — user-defined handlers", () => {
         });
     });
 
-    it("calls registered handler for matching command", () => {
+    it("should call registered handler for matching command", () => {
         const completions = getCompletions("git co");
         assert.ok(completions.includes("git commit"), `got: ${completions}`);
     });
 
-    it("returns all subcommands when prefix is empty", () => {
+    it("should return all subcommands when prefix is empty", () => {
         const completions = getCompletions("git ");
         assert.ok(completions.includes("git add"));
         assert.ok(completions.includes("git push"));
     });
 
-    it("filters by prefix", () => {
+    it("should filter by prefix", () => {
         const completions = getCompletions("git p");
         assert.ok(completions.includes("git push"));
         assert.ok(completions.includes("git pull"));

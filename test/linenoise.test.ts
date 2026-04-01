@@ -28,7 +28,7 @@ before(() => {
 });
 
 describe("linenoise native binding", () => {
-    it("exports all expected functions", () => {
+    it("should export all expected functions", () => {
         assert.strictEqual(typeof native.linenoiseStart, "function");
         assert.strictEqual(typeof native.linenoiseStop, "function");
         assert.strictEqual(typeof native.linenoiseSetCompletion, "function");
@@ -40,7 +40,7 @@ describe("linenoise native binding", () => {
         assert.strictEqual(typeof native.linenoiseHistoryLoad, "function");
     });
 
-    it("reads a line from a pipe", () => new Promise<void>((resolve, reject) => {
+    it("should read a line from a pipe", () => new Promise<void>((resolve, reject) => {
         const [readFd, writeFd] = native.createPipe();
         const savedStdin = native.dupFd(0);
 
@@ -62,7 +62,7 @@ describe("linenoise native binding", () => {
         native.writeFd(writeFd, "hello world\n");
     }));
 
-    it("returns null on EOF", () => new Promise<void>((resolve, reject) => {
+    it("should return null on EOF", () => new Promise<void>((resolve, reject) => {
         const [readFd, writeFd] = native.createPipe();
         const savedStdin = native.dupFd(0);
 
@@ -83,7 +83,7 @@ describe("linenoise native binding", () => {
         });
     }));
 
-    it("calls completion callback with input and uses returned completions", () => new Promise<void>((resolve, reject) => {
+    it("should call completion callback without crashing", () => new Promise<void>((resolve, reject) => {
         const [readFd, writeFd] = native.createPipe();
         const savedStdin = native.dupFd(0);
         let completionCalled = false;
@@ -115,7 +115,7 @@ describe("linenoise native binding", () => {
         native.writeFd(writeFd, "foo\n");
     }));
 
-    it("historyAdd does not throw", () => {
+    it("should not throw on historyAdd", () => {
         native.linenoiseHistoryAdd("ls -la");
         native.linenoiseHistoryAdd("git status");
         native.linenoiseHistorySetMaxLen(100);

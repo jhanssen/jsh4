@@ -14,45 +14,45 @@ function run(cmd: string): string {
 }
 
 describe("case/esac — parser", () => {
-    it("parses a simple case statement", () => {
+    it("should parse a simple case statement", () => {
         const ast = parse("case x in a) echo a;; b) echo b;; esac") as CaseClause;
         assert.strictEqual(ast.type, "CaseClause");
         assert.strictEqual(ast.items.length, 2);
     });
 
-    it("parses patterns with wildcards", () => {
+    it("should parse patterns with wildcards", () => {
         const ast = parse("case $x in h*) echo hello;; *) echo other;; esac") as CaseClause;
         assert.strictEqual(ast.items.length, 2);
     });
 
-    it("parses multi-pattern items with |", () => {
+    it("should parse multi-pattern items with |", () => {
         const ast = parse("case x in a|b) echo ab;; esac") as CaseClause;
         assert.strictEqual(ast.items[0]!.patterns.length, 2);
     });
 });
 
 describe("case/esac — execution", () => {
-    it("matches exact string", () => {
+    it("should match exact string", () => {
         assert.strictEqual(run("case hello in hello) echo yes;; esac"), "yes");
     });
 
-    it("falls through to * wildcard", () => {
+    it("should fall through to * wildcard", () => {
         assert.strictEqual(run("case foo in bar) echo no;; *) echo yes;; esac"), "yes");
     });
 
-    it("matches glob pattern", () => {
+    it("should match glob pattern", () => {
         assert.strictEqual(run("case hello in h*) echo matched;; *) echo nope;; esac"), "matched");
     });
 
-    it("multi-pattern with |", () => {
+    it("should match multi-pattern with |", () => {
         assert.strictEqual(run("case b in a|b) echo yes;; esac"), "yes");
     });
 
-    it("uses variable as case word", () => {
+    it("should use variable as case word", () => {
         assert.strictEqual(run("X=world; case $X in world) echo ok;; esac"), "ok");
     });
 
-    it("returns exit code 0 when no pattern matches", () => {
+    it("should return exit code 0 when no pattern matches", () => {
         const r = spawnSync("node", ["dist/index.js"], {
             input: "case foo in bar) echo no;; esac\necho $?\nexit\n",
             encoding: "utf8",
@@ -61,45 +61,45 @@ describe("case/esac — execution", () => {
         assert.strictEqual(r.stdout.trim(), "0");
     });
 
-    it("empty body with ;; is valid", () => {
+    it("should accept empty body with ;;", () => {
         assert.strictEqual(run("case foo in foo) ;; esac; echo done"), "done");
     });
 });
 
 describe("here-docs — parser", () => {
-    it("parses << heredoc as a redirection", () => {
+    it("should parse << heredoc as a redirection", () => {
         const ast = parse("cat << EOF\nhello\nEOF") as any;
         assert.ok(ast.redirections?.length > 0 || ast.type !== undefined);
     });
 });
 
 describe("here-docs — execution", () => {
-    it("feeds here-doc body to stdin", () => {
+    it("should feed here-doc body to stdin", () => {
         assert.strictEqual(run("cat << EOF\nhello world\nEOF"), "hello world");
     });
 
-    it("multi-line here-doc", () => {
+    it("should handle multi-line here-doc", () => {
         const out = run("cat << END\nline1\nline2\nline3\nEND");
         assert.deepStrictEqual(out.split("\n"), ["line1", "line2", "line3"]);
     });
 
-    it("here-doc with variable expansion", () => {
+    it("should expand variables in here-doc", () => {
         assert.strictEqual(run("X=world; cat << EOF\nhello $X\nEOF"), "hello world");
     });
 
-    it("here-string feeds single line to stdin", () => {
+    it("should feed here-string to stdin", () => {
         assert.strictEqual(run("cat <<< hello"), "hello");
     });
 
-    it("here-string with variable", () => {
+    it("should expand variable in here-string", () => {
         assert.strictEqual(run("X=test; cat <<< $X"), "test");
     });
 
-    it("here-doc with pipe", () => {
+    it("should pipe here-doc output", () => {
         assert.strictEqual(run("cat << EOF | tr a-z A-Z\nhello\nEOF"), "HELLO");
     });
 
-    it("here-doc with quoted delimiter suppresses expansion", () => {
+    it("should suppress expansion with quoted delimiter", () => {
         assert.strictEqual(run('cat << "EOF"\nhello $USER\nEOF'), "hello $USER");
     });
 });
