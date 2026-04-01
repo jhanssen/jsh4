@@ -13,6 +13,7 @@ import { expandWord, expandWordToStr, registerCaptureImpl } from "../expander/in
 import { $ } from "../variables/index.js";
 import { pushParams, popParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
+import { getAlias } from "../api/index.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
@@ -54,6 +55,26 @@ export async function execute(node: ASTNode): Promise<ExecResult> {
 }
 
 async function executeNode(node: ASTNode): Promise<ExecResult> {
+    // Alias expansion: if this is a simple command whose first word is an alias,
+    // re-parse and execute the expansion.  Done here so it applies in pipelines too.
+    if (node.type === "SimpleCommand") {
+        const cmd = node as SimpleCommand;
+        if (cmd.words.length > 0) {
+            const firstWords = await expandWord(cmd.words[0]!);
+            const name = firstWords[0];
+            if (name) {
+                const expansion = getAlias(name);
+                if (expansion) {
+                    const restWords = (await Promise.all(cmd.words.slice(1).map(expandWord))).flat();
+                    const expanded = [expansion, ...restWords].join(" ").trim();
+                    const ast = parse(expanded);
+                    if (ast) return executeNode(ast);
+                    return { exitCode: 0 };
+                }
+            }
+        }
+    }
+
     switch (node.type) {
         case "SimpleCommand":  return executeSimple(node as SimpleCommand);
         case "Pipeline":       return executePipeline(node as Pipeline);
@@ -150,6 +171,28 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     return { exitCode };
 }
 
+// Resolve aliases in pipeline stage list — returns expanded command list.
+async function expandAliasesInPipeline(commands: ASTNode[]): Promise<ASTNode[] | null> {
+    const result: ASTNode[] = [];
+    for (const cmd of commands) {
+        if (cmd.type !== "SimpleCommand") { result.push(cmd); continue; }
+        const sc = cmd as SimpleCommand;
+        if (sc.words.length === 0) { result.push(cmd); continue; }
+        const firstWords = await expandWord(sc.words[0]!);
+        const name = firstWords[0];
+        if (!name) { result.push(cmd); continue; }
+        const expansion = getAlias(name);
+        if (!expansion) { result.push(cmd); continue; }
+        const restWords = (await Promise.all(sc.words.slice(1).map(expandWord))).flat();
+        const expanded = [expansion, ...restWords].join(" ").trim();
+        const ast = parse(expanded);
+        if (!ast) { process.stderr.write(`jsh: bad alias expansion: ${expanded}\n`); return null; }
+        // Inline the expanded command (may itself be a pipeline segment).
+        result.push(ast);
+    }
+    return result;
+}
+
 async function executePipeline(node: Pipeline): Promise<ExecResult> {
     const hasJs = node.commands.some(c => c.type === "JsFunction");
     if (hasJs) {
@@ -159,8 +202,12 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
     }
 
     // Pure external pipeline — fast path via native spawnPipeline.
+    // Expand aliases in the command list first.
+    const resolvedCommands = await expandAliasesInPipeline(node.commands);
+    if (resolvedCommands === null) return { exitCode: 1 };
+
     const stages: Stage[] = [];
-    for (const stageNode of node.commands) {
+    for (const stageNode of resolvedCommands) {
         if (stageNode.type !== "SimpleCommand") {
             process.stderr.write(`jsh: unsupported pipeline stage: ${stageNode.type}\n`);
             return { exitCode: 1 };

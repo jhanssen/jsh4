@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { parse, IncompleteInputError } from "../parser/index.js";
 import { execute } from "../executor/index.js";
 import { $ } from "../variables/index.js";
+import { getPrompt, setPrompt, alias, unalias, registerJsFunction } from "../api/index.js";
+import type { JsPipelineFunction } from "../jsfunctions/index.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
@@ -18,7 +20,7 @@ const native = require("../../build/Release/jsh_native.node") as {
 
 const EAGAIN = native.EAGAIN();
 
-export function startRepl(): void {
+export async function startRepl(): Promise<void> {
     native.initExecutor();
 
     const historyFile = join(String($["HOME"] ?? homedir()), ".jsh_history");
@@ -29,11 +31,35 @@ export function startRepl(): void {
         native.linenoiseHistorySave(historyFile);
     });
 
+    await loadRc();
     promptLoop("");
 }
 
+async function loadRc(): Promise<void> {
+    const rcPath = join(String($["HOME"] ?? homedir()), ".jshrc");
+
+    // Expose the jsh API as a single global object.
+    const jshApi = { $, setPrompt, alias, unalias, registerJsFunction };
+    (globalThis as Record<string, unknown>)["jsh"] = jshApi;
+
+    try {
+        const rc = await import(rcPath);
+        // Auto-register any exported functions as @ pipeline functions.
+        for (const [name, value] of Object.entries(rc)) {
+            if (name === "default") continue;
+            if (typeof value === "function") {
+                registerJsFunction(name, value as JsPipelineFunction);
+            }
+        }
+    } catch (e: unknown) {
+        if ((e as NodeJS.ErrnoException)?.code !== "ERR_MODULE_NOT_FOUND") {
+            process.stderr.write(`jsh: .jshrc: ${e instanceof Error ? e.message : e}\n`);
+        }
+    }
+}
+
 function promptLoop(buffer: string): void {
-    const prompt = buffer ? "> " : "$ ";
+    const prompt = buffer ? "> " : getPrompt();
 
     native.linenoiseStart(prompt, async (line, errno) => {
         if (line === null) {

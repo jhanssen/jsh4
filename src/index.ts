@@ -5,8 +5,7 @@ import { startRepl } from "./repl/index.js";
 import { $ } from "./variables/index.js";
 
 async function main(): Promise<void> {
-    // TODO: load .jshrc, initialize native addon, start REPL
-    startRepl();
+    await startRepl();
 }
 
 main().catch((err) => {
