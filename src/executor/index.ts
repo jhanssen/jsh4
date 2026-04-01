@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
-import { createReadStream, createWriteStream, read as fsRead, readFileSync } from "node:fs";
+import { createReadStream, createWriteStream, read as fsRead, readFileSync, readSync } from "node:fs";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -169,6 +169,11 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         pushParams(args);
         try { return await executeNode(func); }
         finally { popParams(); }
+    }
+
+    // read builtin
+    if (command === "read") {
+        return runRead(args, redirs);
     }
 
     // source / . — read file, parse, execute in current context
@@ -523,6 +528,113 @@ function expandHereDocVars(body: string): string {
             return val !== undefined ? String(val) : "";
         }
     );
+}
+
+// ---- read builtin -----------------------------------------------------------
+
+function readLineFromFd(fd: number): string | null {
+    const buf = Buffer.alloc(1);
+    let line = "";
+    while (true) {
+        let n: number;
+        try { n = readSync(fd, buf, 0, 1, null); }
+        catch { return line.length > 0 ? line : null; }
+        if (n === 0) return line.length > 0 ? line : null;
+        const ch = buf.toString("utf8", 0, 1);
+        if (ch === "\n") return line;
+        line += ch;
+    }
+}
+
+function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
+    // Parse options
+    let raw = false;
+    let prompt = "";
+    const varNames: string[] = [];
+    let i = 0;
+    while (i < args.length) {
+        const arg = args[i]!;
+        if (arg === "-r") {
+            raw = true;
+            i++;
+        } else if (arg === "-p" && i + 1 < args.length) {
+            prompt = args[i + 1]!;
+            i += 2;
+        } else if (arg.startsWith("-")) {
+            process.stderr.write(`read: ${arg}: unsupported option\n`);
+            return { exitCode: 2 };
+        } else {
+            varNames.push(arg);
+            i++;
+        }
+    }
+
+    if (prompt) process.stderr.write(prompt);
+
+    // Handle stdin redirections (here-strings, here-docs, file input)
+    let line: string | null;
+    const stdinRedir = redirs.find(r => r.op === "<<<" || r.op === "<<" || r.op === "<");
+    if (stdinRedir && (stdinRedir.op === "<<<" || (stdinRedir.op === "<<" && stdinRedir.isHereDoc))) {
+        // Here-string or here-doc: target contains the text
+        const text = stdinRedir.target;
+        const nl = text.indexOf("\n");
+        line = nl >= 0 ? text.slice(0, nl) : text;
+        if (line.length === 0 && text.length === 0) line = null;
+    } else if (stdinRedir && stdinRedir.op === "<") {
+        // File redirect
+        const fs = require("node:fs") as typeof import("node:fs");
+        let fd: number;
+        try { fd = fs.openSync(stdinRedir.target, "r"); }
+        catch (e) {
+            process.stderr.write(`read: ${e instanceof Error ? e.message : e}\n`);
+            return { exitCode: 1 };
+        }
+        try { line = readLineFromFd(fd); }
+        finally { fs.closeSync(fd); }
+    } else {
+        line = readLineFromFd(0);
+    }
+    if (line === null) return { exitCode: 1 };
+
+    // Process backslash escapes unless -r
+    let processed = line;
+    if (!raw) {
+        processed = processed.replace(/\\(.)/g, "$1");
+    }
+
+    // If no variable names, use REPLY
+    if (varNames.length === 0) {
+        $["REPLY"] = processed;
+        return { exitCode: 0 };
+    }
+
+    // Split on IFS (default: space/tab/newline)
+    const ifs = String($["IFS"] ?? " \t\n");
+    const parts = splitOnIfs(processed, ifs, varNames.length);
+
+    for (let j = 0; j < varNames.length; j++) {
+        $[varNames[j]!] = parts[j] ?? "";
+    }
+    return { exitCode: 0 };
+}
+
+function splitOnIfs(str: string, ifs: string, maxParts: number): string[] {
+    if (maxParts <= 1) return [str];
+    const parts: string[] = [];
+    let i = 0;
+    while (parts.length < maxParts - 1 && i < str.length) {
+        // Skip leading IFS whitespace
+        while (i < str.length && ifs.includes(str[i]!)) i++;
+        if (i >= str.length) break;
+        // Collect non-IFS chars
+        let word = "";
+        while (i < str.length && !ifs.includes(str[i]!)) word += str[i++];
+        parts.push(word);
+    }
+    // Last var gets the rest (trimmed of leading IFS)
+    while (i < str.length && ifs.includes(str[i]!)) i++;
+    parts.push(str.slice(i));
+    return parts;
 }
 
 // ---- source / . builtin -----------------------------------------------------

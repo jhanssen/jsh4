@@ -269,6 +269,30 @@ describe("executor — test / [ builtin", () => {
     });
 });
 
+describe("executor — read builtin", () => {
+    it("should read into REPLY with no var name", () => {
+        assert.strictEqual(run('read <<< hello; echo $REPLY'), "hello");
+    });
+    it("should read into named variable", () => {
+        assert.strictEqual(run('read X <<< world; echo $X'), "world");
+    });
+    it("should split into multiple variables", () => {
+        assert.strictEqual(run('read X Y Z <<< "a b c"; echo $X $Y $Z'), "a b c");
+    });
+    it("should assign remainder to last variable", () => {
+        assert.strictEqual(run('read X Y <<< "a b c d"; echo "$X:$Y"'), "a:b c d");
+    });
+    it("should return 1 on EOF with empty input", () => {
+        assert.strictEqual(ec('read X < /dev/null'), 1);
+    });
+    it("should strip backslash escapes without -r", () => {
+        assert.strictEqual(run("read X <<< 'hello\\_world'; echo $X"), "hello_world");
+    });
+    it("should preserve backslashes with -r", () => {
+        assert.strictEqual(run("read -r X <<< 'hello\\_world'; echo $X"), "hello\\_world");
+    });
+});
+
 describe("executor — source / . builtin", () => {
     let tmp: string;
     before(() => { tmp = mkdtempSync(join(tmpdir(), "jsh-source-")); });
