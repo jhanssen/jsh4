@@ -22,6 +22,7 @@ struct SpawnCtx {
     int exitCode = -1;
     bool captureOutput = false;
     std::string capturedOutput;
+    std::vector<int> pipeStatus;  // per-stage exit codes
 };
 
 static void OnSpawnDone(Napi::Env env, Napi::Function, SpawnCtx* ctx) {
@@ -32,7 +33,14 @@ static void OnSpawnDone(Napi::Env env, Napi::Function, SpawnCtx* ctx) {
         result.Set("output",   Napi::String::New(env, ctx->capturedOutput));
         ctx->deferred.Resolve(result);
     } else {
-        ctx->deferred.Resolve(Napi::Number::New(env, ctx->exitCode));
+        Napi::Object result = Napi::Object::New(env);
+        result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
+        Napi::Array ps = Napi::Array::New(env, ctx->pipeStatus.size());
+        for (size_t i = 0; i < ctx->pipeStatus.size(); i++) {
+            ps.Set(static_cast<uint32_t>(i), Napi::Number::New(env, ctx->pipeStatus[i]));
+        }
+        result.Set("pipeStatus", ps);
+        ctx->deferred.Resolve(result);
     }
     ctx->tsfn.Release();
     delete ctx;
@@ -185,11 +193,13 @@ struct WaitRequest {
 
 static void processWait(WaitRequest* req) {
     int lastCode = 0;
+    req->ctx->pipeStatus.resize(req->pids.size(), 0);
     for (size_t i = 0; i < req->pids.size(); i++) {
         int status = 0;
         waitpid(req->pids[i], &status, 0);
         int code = WIFEXITED(status)   ? WEXITSTATUS(status) :
                    WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+        req->ctx->pipeStatus[i] = code;
         if (i == req->pids.size() - 1) lastCode = code;
     }
     if (g_interactive && req->pgid > 0)
@@ -411,13 +421,15 @@ struct ExecutorState {
             close(capturePipe[0]);
         }
 
-        // Wait for all children; use the last stage's exit status.
+        // Wait for all children; collect per-stage exit codes.
         int lastExitCode = 0;
+        req->ctx->pipeStatus.resize(pids.size(), 0);
         for (size_t i = 0; i < pids.size(); i++) {
             int status = 0;
             waitpid(pids[i], &status, 0);
             int code = WIFEXITED(status)  ? WEXITSTATUS(status) :
                        WIFSIGNALED(status)? 128 + WTERMSIG(status) : 1;
+            req->ctx->pipeStatus[i] = code;
             if (i == pids.size() - 1) {
                 lastExitCode = code;
             }

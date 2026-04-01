@@ -13,7 +13,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     clearCloexec: (fd: number) => void;
     closeFd: (fd: number) => void;
     forkExec: (cmd: string, args: string[], stdinFd?: number, stdoutFd?: number, stderrFd?: number, pgid?: number) => number;
-    waitForPids: (pids: number[], pgid?: number) => Promise<number>;
+    waitForPids: (pids: number[], pgid?: number) => Promise<{ exitCode: number; pipeStatus: number[] }>;
 };
 
 export interface ExecResult {
@@ -205,7 +205,7 @@ export class ExecHandle implements PromiseLike<ExecResult> {
             native.closeFd(stderrR);
         })() : Promise.resolve();
 
-        const [exitCode] = await Promise.all([
+        const [waitResult] = await Promise.all([
             native.waitForPids(pids, pgid),
             readStdout,
             readStderr,
@@ -215,8 +215,8 @@ export class ExecHandle implements PromiseLike<ExecResult> {
         return {
             stdout:   stdoutStr.replace(/\n+$/, ""),
             stderr:   stderrStr.replace(/\n+$/, ""),
-            exitCode: exitCode as number,
-            ok:       (exitCode as number) === 0,
+            exitCode: waitResult.exitCode,
+            ok:       waitResult.exitCode === 0,
         };
     }
 

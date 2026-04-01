@@ -23,7 +23,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     spawnPipeline: (
         stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
         pipeOps: string[]
-    ) => Promise<number>;
+    ) => Promise<{ exitCode: number; pipeStatus: number[] }>;
     captureOutput: (
         stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
         pipeOps: string[]
@@ -32,7 +32,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     clearCloexec: (fd: number) => void;
     closeFd: (fd: number) => void;
     forkExec: (cmd: string, args: string[], stdinFd?: number, stdoutFd?: number, stderrFd?: number, pgid?: number) => number;
-    waitForPids: (pids: number[], pgid?: number) => Promise<number>;
+    waitForPids: (pids: number[], pgid?: number) => Promise<{ exitCode: number; pipeStatus: number[] }>;
     execvp: (cmd: string, args: string[]) => number;
     dupFd: (fd: number) => number;
     dup2Fd: (oldFd: number, newFd: number) => number;
@@ -332,30 +332,43 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     if (func) {
         pushParams(args);
         pushScope();
-        try { return await executeNode(func); }
+        try {
+            const r = await executeNode(func);
+            $["PIPESTATUS"] = [r.exitCode];
+            return r;
+        }
         finally { popScope(); popParams(); }
     }
 
     // read builtin
     if (command === "read") {
-        return runRead(args, redirs);
+        const r = runRead(args, redirs);
+        $["PIPESTATUS"] = [r.exitCode];
+        return r;
     }
 
     // source / . — read file, parse, execute in current context
     if (command === "source" || command === ".") {
         if (args.length === 0) {
             process.stderr.write(`${command}: filename argument required\n`);
+            $["PIPESTATUS"] = [2];
             return { exitCode: 2 };
         }
-        return runSource(args[0]!, args.slice(1));
+        const r = await runSource(args[0]!, args.slice(1));
+        $["PIPESTATUS"] = [r.exitCode];
+        return r;
     }
 
     // Builtins only run in-process when there are no redirections.
     const builtin = redirs.length === 0 ? runBuiltin(command, args) : null;
-    if (builtin !== null) return builtin;
+    if (builtin !== null) {
+        $["PIPESTATUS"] = [builtin.exitCode];
+        return builtin;
+    }
 
-    const exitCode = await native.spawnPipeline([{ cmd: command, args, redirs }], []);
-    return { exitCode };
+    const result = await native.spawnPipeline([{ cmd: command, args, redirs }], []);
+    $["PIPESTATUS"] = result.pipeStatus;
+    return { exitCode: result.exitCode };
 }
 
 // Resolve aliases in pipeline stage list — returns expanded command list.
@@ -403,7 +416,15 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
         if (!stage) { process.stderr.write("jsh: empty pipeline stage\n"); return { exitCode: 1 }; }
         stages.push(stage);
     }
-    let exitCode = await native.spawnPipeline(stages, node.pipeOps);
+    const result = await native.spawnPipeline(stages, node.pipeOps);
+    $["PIPESTATUS"] = result.pipeStatus;
+    let exitCode = result.exitCode;
+    if (shellOpts.pipefail) {
+        // pipefail: use rightmost non-zero exit code, or 0 if all succeeded.
+        for (let i = result.pipeStatus.length - 1; i >= 0; i--) {
+            if (result.pipeStatus[i] !== 0) { exitCode = result.pipeStatus[i]!; break; }
+        }
+    }
     if (node.negated) exitCode = exitCode === 0 ? 1 : 0;
     return { exitCode };
 }
@@ -412,6 +433,7 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
 
 async function executeMixedPipeline(node: Pipeline): Promise<number> {
     const n = node.commands.length;
+    const stageExitCodes = new Array<number>(n).fill(0);
 
     // Create cloexec pipes between all adjacent stages.
     // pipes[i] = [readFd, writeFd] connecting stage i → stage i+1.
@@ -424,6 +446,8 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
     const stdoutFd = (i: number) => i === n - 1 ? 1 : pipes[i]![1];
 
     const pids: number[] = [];
+    // Map from pids index to pipeline stage index.
+    const pidToStage: number[] = [];
     let pgid = 0;
 
     // Fork all external stages first so they're running while JS stages process.
@@ -437,15 +461,10 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         const sin  = stdinFd(i);
         const sout = stdoutFd(i);
 
-        // pipe fds have CLOEXEC — forkExec dup2s them to STDIN/STDOUT without CLOEXEC.
-
         const pid = native.forkExec(stage.cmd, stage.args, sin, sout, -1, pgid);
         if (pgid === 0) pgid = pid;
         pids.push(pid);
-
-        // Re-seal after fork (parent won't exec, so CLOEXEC doesn't matter
-        // here, but it's tidy).
-        // (No need to re-set CLOEXEC — the parent won't exec these fds.)
+        pidToStage.push(i);
     }
 
     // Close write ends that external stages are now writing into, and read ends
@@ -454,33 +473,40 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         const [r, w] = pipes[i]!;
         const prevIsJs = node.commands[i]!.type === "JsFunction";
         const nextIsJs = node.commands[i + 1]!.type === "JsFunction";
-        // Close the read end if the next stage is external (it dup2'd it).
         if (!nextIsJs) native.closeFd(r);
-        // Close the write end if the previous stage is external (it dup2'd it).
         if (!prevIsJs) native.closeFd(w);
     }
 
     // Run JS function stages in-process.
-    let lastJsExit = 0;
     for (let i = 0; i < n; i++) {
         const stageNode = node.commands[i]!;
         if (stageNode.type !== "JsFunction") continue;
         const sin  = stdinFd(i);
         const sout = stdoutFd(i);
-        lastJsExit = await executeJsStageRaw(stageNode as JsFunction, sin, sout);
-        // Close the write end after the JS function finishes so downstream sees EOF.
+        stageExitCodes[i] = await executeJsStageRaw(stageNode as JsFunction, sin, sout);
         if (sout !== 1) native.closeFd(sout);
         if (sin  !== 0) native.closeFd(sin);
     }
 
     // Wait for all external processes.
-    const lastExternalExit = pids.length > 0
-        ? await native.waitForPids(pids, pgid)
-        : 0;
+    if (pids.length > 0) {
+        const waitResult = await native.waitForPids(pids, pgid);
+        // Map external exit codes back to pipeline stage positions.
+        for (let i = 0; i < waitResult.pipeStatus.length; i++) {
+            stageExitCodes[pidToStage[i]!] = waitResult.pipeStatus[i]!;
+        }
+    }
 
-    // Use last stage's exit code.
-    const lastStage = node.commands[n - 1]!;
-    return lastStage.type === "JsFunction" ? lastJsExit : lastExternalExit;
+    $["PIPESTATUS"] = stageExitCodes;
+
+    // Determine final exit code.
+    let exitCode = stageExitCodes[n - 1]!;
+    if (shellOpts.pipefail) {
+        for (let i = n - 1; i >= 0; i--) {
+            if (stageExitCodes[i] !== 0) { exitCode = stageExitCodes[i]!; break; }
+        }
+    }
+    return exitCode;
 }
 
 // ---- JS stage execution -----------------------------------------------------

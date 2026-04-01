@@ -390,6 +390,29 @@ async function expandSegment(seg: WordSegment): Promise<string> {
     }
 }
 
+// Resolve a variable value, handling array indexing if seg.index is set.
+function resolveVariable(seg: VariableExpansion): { raw: unknown; val: string | undefined } {
+    const raw = $[seg.name];
+    if (seg.index !== undefined && Array.isArray(raw)) {
+        if (seg.index === "@" || seg.index === "*") {
+            const joined = raw.map(String).join(" ");
+            return { raw: joined, val: joined };
+        }
+        const idx = parseInt(seg.index, 10);
+        const elem = raw[idx];
+        const val = elem !== undefined ? String(elem) : undefined;
+        return { raw: elem, val };
+    }
+    // ${VAR} where VAR is an array but no index → first element (bash compat)
+    if (Array.isArray(raw) && seg.index === undefined) {
+        const elem = raw[0];
+        const val = elem !== undefined ? String(elem) : undefined;
+        return { raw: elem, val };
+    }
+    const val = raw !== undefined ? String(raw) : undefined;
+    return { raw, val };
+}
+
 function expandVariable(seg: VariableExpansion): string {
     if (/^\d+$/.test(seg.name)) {
         const n = parseInt(seg.name, 10);
@@ -400,8 +423,7 @@ function expandVariable(seg: VariableExpansion): string {
     if (seg.name === "#") return String(getParamCount());
     if (seg.name === "@" || seg.name === "*") return getAllParams().join(" ");
 
-    const raw = $[seg.name];
-    const val = raw !== undefined ? String(raw) : undefined;
+    const { val } = resolveVariable(seg);
     if (!seg.operator) {
         if (val === undefined && shellOpts.nounset) {
             throw new Error(`${seg.name}: unbound variable`);
@@ -433,8 +455,58 @@ function expandVariable(seg: VariableExpansion): string {
 }
 
 function evalArithmetic(expr: string): string {
+    let e = expr;
+
+    // Handle assignment operators: VAR=expr, VAR+=expr, VAR-=expr, VAR*=expr, VAR/=expr, VAR%=expr
+    const assignMatch = e.match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([-+*/%]?)=\s*(.+)$/);
+    if (assignMatch && assignMatch[2] !== "=") {
+        const [, name, op, rhs] = assignMatch as [string, string, string, string];
+        const rhsVal = Number(evalArithmetic(rhs));
+        let result: number;
+        if (op === "") {
+            result = rhsVal;
+        } else {
+            const cur = Number($[name] ?? 0);
+            switch (op) {
+                case "+": result = cur + rhsVal; break;
+                case "-": result = cur - rhsVal; break;
+                case "*": result = cur * rhsVal; break;
+                case "/": result = rhsVal !== 0 ? Math.trunc(cur / rhsVal) : 0; break;
+                case "%": result = rhsVal !== 0 ? cur % rhsVal : 0; break;
+                default: result = rhsVal;
+            }
+        }
+        const truncated = Math.trunc(result);
+        $[name] = String(truncated);
+        return String(truncated);
+    }
+
+    // Handle pre-increment/decrement: ++VAR, --VAR
+    e = e.replace(/\+\+([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name) => {
+        const val = Math.trunc(Number($[name] ?? 0)) + 1;
+        $[name] = String(val);
+        return String(val);
+    });
+    e = e.replace(/--([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name) => {
+        const val = Math.trunc(Number($[name] ?? 0)) - 1;
+        $[name] = String(val);
+        return String(val);
+    });
+
+    // Handle post-increment/decrement: VAR++, VAR--
+    e = e.replace(/([a-zA-Z_][a-zA-Z0-9_]*)\+\+/g, (_, name) => {
+        const val = Math.trunc(Number($[name] ?? 0));
+        $[name] = String(val + 1);
+        return String(val);
+    });
+    e = e.replace(/([a-zA-Z_][a-zA-Z0-9_]*)--/g, (_, name) => {
+        const val = Math.trunc(Number($[name] ?? 0));
+        $[name] = String(val - 1);
+        return String(val);
+    });
+
     // Substitute $var and bare variable names with their values.
-    let e = expr.replace(/\$([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name) =>
+    e = e.replace(/\$([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name) =>
         String($[name] ?? 0)
     );
     e = e.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_, name) =>

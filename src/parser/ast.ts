@@ -18,6 +18,7 @@ export interface DoubleQuotedSegment {
 export interface VariableExpansion {
     type: "VariableExpansion";
     name: string;
+    index?: string;      // array subscript: "0", "1", "@", "*"
     operator?: string;   // e.g. ":-", ":+", "%%", "#", etc.
     operand?: WordSegment[];
 }

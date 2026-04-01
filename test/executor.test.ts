@@ -750,3 +750,94 @@ describe("executor — IFS word splitting", () => {
         assert.strictEqual(run("echo $(for i in a b c; do echo $i; done)"), "a b c");
     });
 });
+
+describe("executor — PIPESTATUS", () => {
+    it("should set PIPESTATUS for single command", () => {
+        assert.strictEqual(run("true; echo ${PIPESTATUS[0]}"), "0");
+    });
+
+    it("should set PIPESTATUS for failing single command", () => {
+        assert.strictEqual(run("false; echo ${PIPESTATUS[0]}"), "1");
+    });
+
+    it("should set PIPESTATUS for pipeline", () => {
+        assert.strictEqual(
+            run("true | false | true; echo ${PIPESTATUS[0]} ${PIPESTATUS[1]} ${PIPESTATUS[2]}"),
+            "0 1 0"
+        );
+    });
+
+    it("should expand ${PIPESTATUS[@]} to all elements", () => {
+        assert.strictEqual(
+            run("true | false | true; echo ${PIPESTATUS[@]}"),
+            "0 1 0"
+        );
+    });
+
+    it("should expand ${PIPESTATUS} to first element", () => {
+        assert.strictEqual(run("true | false; echo ${PIPESTATUS}"), "0");
+    });
+
+    it("should work with pipefail", () => {
+        assert.strictEqual(ec("set -o pipefail; true | false | true"), 1);
+    });
+
+    it("should return rightmost failure with pipefail", () => {
+        // Pipeline: exit 2 | exit 3 | true
+        // pipefail should return 3 (rightmost non-zero)
+        assert.strictEqual(
+            ec("set -o pipefail; sh -c 'exit 2' | sh -c 'exit 3' | true"),
+            3
+        );
+    });
+});
+
+describe("executor — arithmetic ++/--", () => {
+    it("should pre-increment", () => {
+        assert.strictEqual(run("x=5; echo $((++x)); echo $x"), "6\n6");
+    });
+
+    it("should post-increment", () => {
+        assert.strictEqual(run("x=5; echo $((x++)); echo $x"), "5\n6");
+    });
+
+    it("should pre-decrement", () => {
+        assert.strictEqual(run("x=5; echo $((--x)); echo $x"), "4\n4");
+    });
+
+    it("should post-decrement", () => {
+        assert.strictEqual(run("x=5; echo $((x--)); echo $x"), "5\n4");
+    });
+
+    it("should handle += assignment", () => {
+        assert.strictEqual(run("x=10; echo $((x += 5)); echo $x"), "15\n15");
+    });
+
+    it("should handle -= assignment", () => {
+        assert.strictEqual(run("x=10; echo $((x -= 3)); echo $x"), "7\n7");
+    });
+
+    it("should handle *= assignment", () => {
+        assert.strictEqual(run("x=4; echo $((x *= 3)); echo $x"), "12\n12");
+    });
+
+    it("should handle /= assignment", () => {
+        assert.strictEqual(run("x=10; echo $((x /= 3)); echo $x"), "3\n3");
+    });
+
+    it("should handle %= assignment", () => {
+        assert.strictEqual(run("x=10; echo $((x %= 3)); echo $x"), "1\n1");
+    });
+
+    it("should handle simple = assignment", () => {
+        assert.strictEqual(run("echo $((x = 42)); echo $x"), "42\n42");
+    });
+
+    it("should increment unset variable from 0", () => {
+        assert.strictEqual(run("unset y; echo $((++y)); echo $y"), "1\n1");
+    });
+
+    it("should use increment in expression", () => {
+        assert.strictEqual(run("x=3; echo $((++x + 10))"), "14");
+    });
+});

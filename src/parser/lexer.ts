@@ -542,11 +542,24 @@ export class Lexer {
         let operand: WordSegment[] | undefined;
 
         // Read the variable name
+        let index: string | undefined;
         while (this.pos < this.input.length) {
             const ch = this.input[this.pos]!;
             if (ch === "}") {
                 this.pos++;
-                return { type: "VariableExpansion", name, operator, operand };
+                return { type: "VariableExpansion", name, index, operator, operand };
+            }
+            // Array subscript: ${VAR[idx]}
+            if (ch === "[" && name.length > 0) {
+                this.pos++;
+                let idx = "";
+                while (this.pos < this.input.length && this.input[this.pos] !== "]") {
+                    idx += this.input[this.pos];
+                    this.pos++;
+                }
+                if (this.pos < this.input.length) this.pos++; // skip ]
+                index = idx;
+                continue;
             }
             // Check for operators
             if (ch === ":" && this.pos + 1 < this.input.length) {
@@ -555,7 +568,7 @@ export class Lexer {
                     operator = ":" + next;
                     this.pos += 2;
                     operand = this.readBraceOperand();
-                    return { type: "VariableExpansion", name, operator, operand };
+                    return { type: "VariableExpansion", name, index, operator, operand };
                 }
             }
             if ((ch === "%" || ch === "#") && name.length > 0) {
@@ -567,7 +580,7 @@ export class Lexer {
                     this.pos++;
                 }
                 operand = this.readBraceOperand();
-                return { type: "VariableExpansion", name, operator, operand };
+                return { type: "VariableExpansion", name, index, operator, operand };
             }
             if ((ch === "/" || ch === "^" || ch === ",") && name.length > 0) {
                 if (this.pos + 1 < this.input.length && this.input[this.pos + 1] === ch) {
@@ -578,14 +591,14 @@ export class Lexer {
                     this.pos++;
                 }
                 operand = this.readBraceOperand();
-                return { type: "VariableExpansion", name, operator, operand };
+                return { type: "VariableExpansion", name, index, operator, operand };
             }
             // Also handle - + = ? without colon prefix
             if ((ch === "-" || ch === "+" || ch === "=" || ch === "?") && name.length > 0) {
                 operator = ch;
                 this.pos++;
                 operand = this.readBraceOperand();
-                return { type: "VariableExpansion", name, operator, operand };
+                return { type: "VariableExpansion", name, index, operator, operand };
             }
             name += ch;
             this.pos++;
