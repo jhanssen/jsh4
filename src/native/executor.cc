@@ -675,6 +675,38 @@ static Napi::Value WaitForPids(const Napi::CallbackInfo& info) {
     return ctx->deferred.Promise();
 }
 
+// dup / dup2 wrappers for fd-level stdout redirection in captureAst.
+static Napi::Value DupFd(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "dupFd(fd)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    int fd = dup(info[0].As<Napi::Number>().Int32Value());
+    if (fd == -1) {
+        Napi::Error::New(env, std::string("dup: ") + strerror(errno))
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    return Napi::Number::New(env, fd);
+}
+
+static Napi::Value Dup2Fd(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "dup2Fd(oldFd, newFd)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    int result = dup2(info[0].As<Napi::Number>().Int32Value(),
+                      info[1].As<Napi::Number>().Int32Value());
+    if (result == -1) {
+        Napi::Error::New(env, std::string("dup2: ") + strerror(errno))
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    return Napi::Number::New(env, result);
+}
+
 // exec builtin: replace the current process with the given command.
 // Resets signals, then calls execvp.  Only returns on error.
 static Napi::Value Execvp(const Napi::CallbackInfo& info) {
@@ -729,6 +761,8 @@ Napi::Object InitExecutor(Napi::Env env, Napi::Object exports) {
     exports.Set("waitForPids",      Napi::Function::New(env, WaitForPids));
     exports.Set("EAGAIN",           Napi::Function::New(env, GetEAGAIN));
     exports.Set("execvp",           Napi::Function::New(env, Execvp));
+    exports.Set("dupFd",            Napi::Function::New(env, DupFd));
+    exports.Set("dup2Fd",           Napi::Function::New(env, Dup2Fd));
     return exports;
 }
 

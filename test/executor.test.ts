@@ -590,3 +590,58 @@ describe("executor — expansion", () => {
         assert.strictEqual(run("unset NOVAR; echo ${NOVAR:-fallback}"), "fallback");
     });
 });
+
+describe("executor — subshells", () => {
+    it("should execute commands in a subshell", () => {
+        assert.strictEqual(run("(echo hello)"), "hello");
+    });
+
+    it("should isolate variable assignments", () => {
+        assert.strictEqual(run("X=outer; (X=inner); echo $X"), "outer");
+    });
+
+    it("should isolate working directory", () => {
+        assert.strictEqual(run("ORIG=$(pwd); (cd /tmp); echo $(pwd)"), run("echo $(pwd)"));
+    });
+
+    it("should isolate shell options", () => {
+        // set -x inside subshell should not persist outside
+        assert.strictEqual(run("(set -x; true); echo ok"), "ok");
+    });
+
+    it("should support pipelines in subshells", () => {
+        assert.strictEqual(run("(echo hello | cat)"), "hello");
+    });
+
+    it("should support control flow in subshells", () => {
+        assert.strictEqual(run("(if true; then echo yes; fi)"), "yes");
+    });
+
+    it("should return exit code from last command", () => {
+        assert.strictEqual(ec("(false)"), 1);
+    });
+
+    it("should return exit code 0 on success", () => {
+        assert.strictEqual(ec("(true)"), 0);
+    });
+
+    it("should support nested subshells", () => {
+        assert.strictEqual(run("(echo $(echo nested))"), "nested");
+    });
+
+    it("should capture subshell output in command substitution", () => {
+        assert.strictEqual(run("echo $(echo hello)"), "hello");
+    });
+
+    it("should capture subshell with if in command substitution", () => {
+        assert.strictEqual(run("echo $(if true; then echo yes; fi)"), "yes");
+    });
+
+    it("should capture subshell with for loop in command substitution", () => {
+        assert.strictEqual(run("X=$(for i in a b c; do echo $i; done); echo \"$X\""), "a\nb\nc");
+    });
+
+    it("should not leak export from subshell", () => {
+        assert.strictEqual(run("(export SUBVAR=leaked); echo ${SUBVAR:-empty}"), "empty");
+    });
+});

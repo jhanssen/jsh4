@@ -31,6 +31,25 @@ export function popScope(): void {
     }
 }
 
+// ---- subshell snapshot/restore ------------------------------------------------
+// Snapshots the entire variable store so subshells get an isolated copy.
+// On popSnapshot the store is completely replaced with the saved state.
+
+const snapshotStack: Map<string, unknown>[] = [];
+
+export function pushSnapshot(): void {
+    snapshotStack.push(new Map(store));
+}
+
+export function popSnapshot(): void {
+    const saved = snapshotStack.pop();
+    if (!saved) return;
+    store.clear();
+    for (const [k, v] of saved) {
+        store.set(k, v);
+    }
+}
+
 export function declareLocal(name: string): void {
     const frame = scopeStack[scopeStack.length - 1];
     if (!frame) {

@@ -5,3 +5,11 @@ export const shellOpts = {
     xtrace: false,    // -x: print commands before execution
     pipefail: false,  // -o pipefail: pipeline fails if any stage fails
 };
+
+export function saveShellOpts(): typeof shellOpts {
+    return { ...shellOpts };
+}
+
+export function restoreShellOpts(saved: typeof shellOpts): void {
+    Object.assign(shellOpts, saved);
+}

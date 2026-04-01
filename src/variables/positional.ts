@@ -24,6 +24,16 @@ export function getParamCount(): number {
     return stack[stack.length - 1]!.length;
 }
 
+// Snapshot/restore the entire positional parameter stack for subshell isolation.
+export function snapshotParams(): string[][] {
+    return stack.map(frame => [...frame]);
+}
+
+export function restoreParams(saved: string[][]): void {
+    stack.length = 0;
+    for (const frame of saved) stack.push(frame);
+}
+
 export function shiftParams(n: number): boolean {
     const frame = stack[stack.length - 1]!;
     if (n > frame.length) return false;

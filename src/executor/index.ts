@@ -6,17 +6,17 @@ import { promisify } from "node:util";
 
 const fsReadAsync = promisify(fsRead);
 import type {
-    ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup,
+    ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup, Subshell,
     IfClause, WhileClause, ForClause, FunctionDef, JsFunction, CaseClause,
     ConditionalExpr,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl } from "../expander/index.js";
-import { $, pushScope, popScope, declareLocal } from "../variables/index.js";
-import { pushParams, popParams, shiftParams } from "../variables/positional.js";
+import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot } from "../variables/index.js";
+import { pushParams, popParams, shiftParams, snapshotParams, restoreParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { getAlias } from "../api/index.js";
-import { shellOpts } from "../shellopts/index.js";
+import { shellOpts, saveShellOpts, restoreShellOpts } from "../shellopts/index.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
@@ -34,6 +34,8 @@ const native = require("../../build/Release/jsh_native.node") as {
     forkExec: (cmd: string, args: string[], stdinFd?: number, stdoutFd?: number, stderrFd?: number, pgid?: number) => number;
     waitForPids: (pids: number[], pgid?: number) => Promise<number>;
     execvp: (cmd: string, args: string[]) => number;
+    dupFd: (fd: number) => number;
+    dup2Fd: (oldFd: number, newFd: number) => number;
 };
 
 export interface ExecResult {
@@ -85,6 +87,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         case "AndOr":          return executeAndOr(node as AndOr);
         case "List":           return executeList(node as List);
         case "BraceGroup":     return executeNode((node as BraceGroup).body);
+        case "Subshell":       return executeSubshell(node as Subshell);
         case "IfClause":       return executeIf(node as IfClause);
         case "WhileClause":    return executeWhile(node as WhileClause);
         case "ForClause":      return executeFor(node as ForClause);
@@ -95,6 +98,23 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         default:
             process.stderr.write(`jsh: unimplemented: ${node.type}\n`);
             return { exitCode: 1 };
+    }
+}
+
+// ---- Subshell execution (isolated environment) ------------------------------
+
+async function executeSubshell(node: Subshell): Promise<ExecResult> {
+    const savedCwd = process.cwd();
+    const savedOpts = saveShellOpts();
+    const savedParams = snapshotParams();
+    pushSnapshot();
+    try {
+        return await executeNode(node.body);
+    } finally {
+        popSnapshot();
+        restoreShellOpts(savedOpts);
+        restoreParams(savedParams);
+        try { process.chdir(savedCwd); } catch {}
     }
 }
 
@@ -151,8 +171,35 @@ async function captureAst(node: ASTNode): Promise<string> {
         return result.output;
     }
 
-    process.stderr.write(`jsh: $(): ${node.type} not supported in command substitution\n`);
-    return "";
+    // General fallback: redirect fd 1 to a capture pipe, run the AST in-process,
+    // then read the captured output.  Works for subshells, control flow, etc.
+    const [readFd, writeFd] = native.createCloexecPipe();
+    native.clearCloexec(writeFd);
+
+    // Save real stdout fd, then redirect fd 1 → pipe write end.
+    const savedStdout = native.dupFd(1);
+    native.dup2Fd(writeFd, 1);
+    native.closeFd(writeFd);
+
+    // Read captured output concurrently while the node executes.
+    const chunks: string[] = [];
+    const reader = (async () => {
+        for await (const line of fdLineReader(readFd)) {
+            chunks.push(line);
+        }
+    })();
+
+    try {
+        await executeNode(node);
+    } finally {
+        // Restore stdout before reading remaining output.
+        native.dup2Fd(savedStdout, 1);
+        native.closeFd(savedStdout);
+    }
+
+    await reader;
+    native.closeFd(readFd);
+    return chunks.join("");
 }
 
 // ---- Command execution -------------------------------------------------------
