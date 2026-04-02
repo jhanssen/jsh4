@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 const fsReadAsync = promisify(fsRead);
 import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup, Subshell, Redirection,
-    IfClause, WhileClause, ForClause, SelectClause, FunctionDef, JsFunction, CaseClause,
+    IfClause, WhileClause, ForClause, ArithmeticFor, SelectClause, FunctionDef, JsFunction, CaseClause,
     ConditionalExpr,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
@@ -196,6 +196,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         case "IfClause":       return executeIf(node as IfClause);
         case "WhileClause":    return executeWhile(node as WhileClause);
         case "ForClause":      return executeFor(node as ForClause);
+        case "ArithmeticFor":  return executeArithmeticFor(node as ArithmeticFor);
         case "SelectClause":   return executeSelect(node as SelectClause);
         case "FunctionDef":    return executeFunctionDef(node as FunctionDef);
         case "CaseClause":     return executeCase(node as CaseClause);
@@ -1083,6 +1084,90 @@ async function executeFor(node: ForClause): Promise<ExecResult> {
     return last;
 }
 
+async function executeArithmeticFor(node: ArithmeticFor): Promise<ExecResult> {
+    // Evaluate arithmetic expressions using the same approach as $(()).
+    const evalArith = (expr: string): number => {
+        if (!expr.trim()) return 1; // Empty condition = true
+        // Handle assignment operators: VAR=expr, VAR+=expr etc.
+        const assignMatch = expr.match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([-+*/%]?)=\s*(.+)$/);
+        if (assignMatch && assignMatch[2] !== "=") {
+            const [, name, op, rhs] = assignMatch as [string, string, string, string];
+            const rhsVal = evalArith(rhs);
+            let result: number;
+            if (op === "") { result = rhsVal; }
+            else {
+                const cur = Number($[name] ?? 0);
+                switch (op) {
+                    case "+": result = cur + rhsVal; break;
+                    case "-": result = cur - rhsVal; break;
+                    case "*": result = cur * rhsVal; break;
+                    case "/": result = rhsVal !== 0 ? Math.trunc(cur / rhsVal) : 0; break;
+                    case "%": result = rhsVal !== 0 ? cur % rhsVal : 0; break;
+                    default: result = rhsVal;
+                }
+            }
+            $[name] = String(Math.trunc(result));
+            return result;
+        }
+        // Handle ++/--
+        let e = expr;
+        e = e.replace(/\+\+([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name) => {
+            const val = Math.trunc(Number($[name] ?? 0)) + 1;
+            $[name] = String(val);
+            return String(val);
+        });
+        e = e.replace(/--([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name) => {
+            const val = Math.trunc(Number($[name] ?? 0)) - 1;
+            $[name] = String(val);
+            return String(val);
+        });
+        e = e.replace(/([a-zA-Z_][a-zA-Z0-9_]*)\+\+/g, (_, name) => {
+            const val = Math.trunc(Number($[name] ?? 0));
+            $[name] = String(val + 1);
+            return String(val);
+        });
+        e = e.replace(/([a-zA-Z_][a-zA-Z0-9_]*)--/g, (_, name) => {
+            const val = Math.trunc(Number($[name] ?? 0));
+            $[name] = String(val - 1);
+            return String(val);
+        });
+        // Substitute variables
+        e = e.replace(/\$([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name) => String($[name] ?? 0));
+        e = e.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_, name) => String($[name] ?? 0));
+        try {
+            const result = new Function(`"use strict"; return (${e})`)();
+            return Math.trunc(typeof result === "number" ? result : Number(result));
+        } catch { return 0; }
+    };
+
+    // Execute init.
+    evalArith(node.init);
+
+    let last: ExecResult = { exitCode: 0 };
+    while (true) {
+        // Evaluate condition.
+        if (node.condition.trim() && evalArith(node.condition) === 0) break;
+        // Execute body.
+        try {
+            last = await executeNode(node.body);
+        } catch (e) {
+            if (e instanceof ShellBreak) {
+                if (e.levels > 1) throw new ShellBreak(e.levels - 1);
+                break;
+            }
+            if (e instanceof ShellContinue) {
+                if (e.levels > 1) throw new ShellContinue(e.levels - 1);
+                // Fall through to update step.
+            } else {
+                throw e;
+            }
+        }
+        // Execute update step.
+        evalArith(node.update);
+    }
+    return last;
+}
+
 async function executeSelect(node: SelectClause): Promise<ExecResult> {
     const itemArrays = await Promise.all(node.items.map(expandWord));
     const items = itemArrays.flat();
@@ -1295,6 +1380,7 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
     // Parse options
     let raw = false;
     let silent = false;
+    let timeout = -1;
     let prompt = "";
     let delimiter: string | null = null;
     let nchars = -1;
@@ -1305,6 +1391,7 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
         const arg = args[i]!;
         if (arg === "-r") { raw = true; i++; }
         else if (arg === "-s") { silent = true; i++; }
+        else if (arg === "-t" && i + 1 < args.length) { timeout = parseInt(args[i + 1]!, 10); i += 2; }
         else if (arg === "-p" && i + 1 < args.length) { prompt = args[i + 1]!; i += 2; }
         else if (arg === "-d" && i + 1 < args.length) { delimiter = args[i + 1]!; i += 2; }
         else if (arg === "-n" && i + 1 < args.length) { nchars = parseInt(args[i + 1]!, 10); i += 2; }
@@ -1319,6 +1406,16 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
     }
 
     if (prompt) process.stderr.write(prompt);
+
+    // For -s (silent): disable terminal echo while reading.
+    let savedTermios: Buffer | null = null;
+    if (silent && !redirs.length) {
+        try {
+            const { execSync } = require("node:child_process") as typeof import("node:child_process");
+            savedTermios = execSync("stty -g", { encoding: "buffer", stdio: ["inherit", "pipe", "pipe"] });
+            execSync("stty -echo", { stdio: "inherit" });
+        } catch {}
+    }
 
     // Handle stdin redirections (here-strings, here-docs, file input)
     let line: string | null;
@@ -1371,6 +1468,15 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
             line = readLineFromFd(0);
         }
     }
+    // Restore terminal echo if -s was used.
+    if (savedTermios) {
+        try {
+            const { execSync } = require("node:child_process") as typeof import("node:child_process");
+            execSync(`stty ${savedTermios.toString().trim()}`, { stdio: "inherit" });
+        } catch {}
+        process.stderr.write("\n"); // Echo the newline that was suppressed.
+    }
+
     if (line === null) return { exitCode: 1 };
 
     // Process backslash escapes unless -r
@@ -1575,8 +1681,8 @@ function evalBinaryOp(left: string, op: string, right: string | undefined, _pos:
     if (right === undefined) return null;
     switch (op) {
         // String comparison
-        case "=": case "==": return left === right;
-        case "!=": return left !== right;
+        case "=": case "==": return matchGlob(left, right);
+        case "!=": return !matchGlob(left, right);
         // Integer comparison
         case "-eq": return toInt(left) === toInt(right);
         case "-ne": return toInt(left) !== toInt(right);

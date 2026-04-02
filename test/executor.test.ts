@@ -1185,3 +1185,58 @@ describe("executor — basename/dirname builtins", () => {
         assert.strictEqual(run("basename /path/to/file.txt .txt"), "file");
     });
 });
+
+describe("executor — [[ glob matching ]]", () => {
+    it("should match with trailing *", () => {
+        assert.strictEqual(ec('[[ "hello" == hel* ]]'), 0);
+    });
+
+    it("should match with leading *", () => {
+        assert.strictEqual(ec('[[ "hello.txt" == *.txt ]]'), 0);
+    });
+
+    it("should fail on no match", () => {
+        assert.strictEqual(ec('[[ "hello" == world* ]]'), 1);
+    });
+
+    it("should match exact string", () => {
+        assert.strictEqual(ec('[[ "hello" == "hello" ]]'), 0);
+    });
+
+    it("should handle != with globs", () => {
+        assert.strictEqual(ec('[[ "hello" != world* ]]'), 0);
+    });
+});
+
+describe("executor — arithmetic for loop", () => {
+    it("should count up", () => {
+        assert.strictEqual(run("for ((i=0; i<5; i++)); do echo $i; done"), "0\n1\n2\n3\n4");
+    });
+
+    it("should count down", () => {
+        assert.strictEqual(run("for ((i=3; i>0; i--)); do echo $i; done"), "3\n2\n1");
+    });
+
+    it("should handle step increment", () => {
+        assert.strictEqual(run("for ((i=0; i<10; i+=3)); do echo $i; done"), "0\n3\n6\n9");
+    });
+
+    it("should support break", () => {
+        assert.strictEqual(run("for ((i=0; i<10; i++)); do if [ $i = 3 ]; then break; fi; echo $i; done"), "0\n1\n2");
+    });
+
+    it("should support continue", () => {
+        assert.strictEqual(run("for ((i=0; i<5; i++)); do if [ $i = 2 ]; then continue; fi; echo $i; done"), "0\n1\n3\n4");
+    });
+});
+
+describe("executor — builtins in pipelines", () => {
+    it("should pipe export -p to head", () => {
+        const out = run("export TEST_PIPE_VAR=hello; export -p | grep TEST_PIPE_VAR");
+        assert.match(out, /TEST_PIPE_VAR/);
+    });
+
+    it("should pipe echo through cat as builtin", () => {
+        assert.strictEqual(run("echo hello | cat"), "hello");
+    });
+});

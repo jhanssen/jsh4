@@ -138,6 +138,14 @@ export interface ForClause extends ASTNode {
     body: ASTNode;
 }
 
+export interface ArithmeticFor extends ASTNode {
+    type: "ArithmeticFor";
+    init: string;
+    condition: string;
+    update: string;
+    body: ASTNode;
+}
+
 export interface SelectClause extends ASTNode {
     type: "SelectClause";
     name: string;

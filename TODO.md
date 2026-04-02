@@ -33,6 +33,8 @@
 - [x] Command lists (`;`)
 - [x] Brace groups (with redirections)
 - [x] Subshells `(...)` with full isolation (variables, cwd, shell options, positional params)
+- [x] Arithmetic `for ((init; cond; step))` loops
+- [x] Process substitution `<(cmd)` and `>(cmd)`
 - [x] `if`/`elif`/`else`
 - [x] `while`/`until` loops
 - [x] `for` loops with glob/word expansion
@@ -63,14 +65,31 @@
 - [x] `shift` — shift positional parameters by N
 - [x] `exec` — replace shell process via native `execvp`
 - [x] `type` / `which` — command lookup (alias, builtin, function, PATH)
-- [x] `[[ ]]` — extended conditional: `=~` regex, `<`/`>` string comparison, `&&`/`||`/`!`/`()`
+- [x] `[[ ]]` — extended conditional: `=~` regex, `<`/`>`, `==`/`!=` glob matching, `&&`/`||`/`!`/`()`
 - [x] `jobs` — list background/stopped jobs
 - [x] `fg` — resume job in foreground (SIGCONT + tcsetpgrp + wait)
 - [x] `bg` — resume stopped job in background (SIGCONT)
 - [x] `wait` — wait for background jobs
+- [x] `eval` — parse and execute string in current context
+- [x] `printf` — formatted output (`%s`, `%d`, `%x`, `%b`, `%q`, etc.)
+- [x] `trap` — signal/pseudo-signal trapping (EXIT, INT, TERM, etc.)
+- [x] `return` — exit from shell function with code
+- [x] `command` — `-v` checks existence, bypasses functions/aliases
+- [x] `readonly` — mark variables as read-only
+- [x] `getopts` — POSIX option parsing
+- [x] `break` / `continue` — loop flow control with optional N levels
+- [x] `pushd` / `popd` / `dirs` — directory stack
+- [x] `basename` / `dirname` — path manipulation builtins
+- [x] `select` — interactive menu loop
+- [x] `echo -n` / `-e` / `-E` — suppress newline, enable/disable escapes
+- [x] `read -s` / `-d` / `-n` / `-a` — silent, delimiter, nchars, array
+- [x] Builtins in pipelines — builtin-only commands run in-process with pipe fd redirection
 
 ### Expansion
-- [x] Variable expansion with all operators (`:-`, `:+`, `:=`, `:?`, `#`, `##`, `%`, `%%`)
+- [x] Variable expansion with all operators (`:-`, `:+`, `:=`, `:?`, `#`, `##`, `%`, `%%`, `/`, `//`)
+- [x] Case modification `${VAR^^}`, `${VAR,,}`, `${VAR^}`, `${VAR,}`
+- [x] Substring extraction `${VAR:offset}`, `${VAR:offset:length}`
+- [x] Length `${#VAR}`
 - [x] Array subscript syntax `${VAR[n]}`, `${VAR[@]}`, `${VAR[*]}`
 - [x] Tilde expansion (`~`, `~/path`)
 - [x] Command substitution `$()` (fork + pipe capture, supports arbitrary ASTs including control flow)
@@ -89,14 +108,23 @@
 - [x] Return type dispatch: string, Buffer, Generator, AsyncGenerator, Promise, `{ exitCode }`, void
 - [x] Automatic pipe close on function completion (finally block)
 
-### REPL
-- [x] Non-blocking linenoise integration via libuv `uv_poll`
+### REPL / Terminal UI
+- [x] Custom InputEngine (replaced linenoise) with non-blocking uv_poll
 - [x] Multi-line continuation prompt (`> `) for incomplete input
 - [x] History (in-memory + persist to `~/.jsh_history`)
 - [x] Non-interactive stdin mode (script execution via `readFileSync`)
 - [x] Tab completion: files/dirs, commands, `@` functions, user-defined handlers
 - [x] Ctrl-C clears current line/buffer
 - [x] Ctrl-D exits
+- [x] Ctrl-R reverse history search
+- [x] Syntax highlighting (lexer-based, true color RGB, command-exists green/red)
+- [x] Right-aligned prompt
+- [x] Async prompt support (`jsh.setPrompt(async fn)`)
+- [x] Header/footer widget regions with live timer updates
+- [x] OSC 133 shell integration marks
+- [x] OSC 7 cwd reporting
+- [x] Synchronized rendering (CSI 2026)
+- [x] History expansion (`!!`, `!$`, `!^`, `!n`, `!-n`, `!string`)
 
 ### `.jshrc` / API
 - [x] `.jshrc` loading (ESM dynamic import from `~/.jshrc`)
@@ -104,7 +132,15 @@
 - [x] `jsh` global object with full API
 - [x] `jsh.$` — variable store proxy
 - [x] `jsh.alias(name, expansion)` / `jsh.unalias(name)`
-- [x] `jsh.setPrompt(fn)` — sync prompt function
+- [x] `jsh.setPrompt(fn)` — sync or async prompt function
+- [x] `jsh.setRightPrompt(fn)` — right-aligned prompt
+- [x] `jsh.setColorize(fn)` — custom syntax highlighting override
+- [x] `jsh.setTheme(theme)` — syntax highlighting theme with RGB/hex/named colors
+- [x] `jsh.setHeader(fn)` / `jsh.setFooter(fn)` — header/footer region content
+- [x] `jsh.addWidget(id, zone, render, order, interval)` — live-updating widgets
+- [x] `jsh.colors` — ANSI color constants
+- [x] `jsh.makeFgColor()` / `jsh.makeBgColor()` / `jsh.makeUlColor()` — RGB color builders
+- [x] `jsh.style` — tagged template for styled strings with auto-reset
 - [x] `jsh.registerJsFunction(name, fn)`
 - [x] `jsh.complete(cmd, fn)` — sync completion handler
 - [x] `jsh.exec(cmd, opts?)` — dual-mode: await (buffered) or iterate (streaming)
@@ -129,6 +165,20 @@
 - [x] `$PIPESTATUS` and array subscript tests
 - [x] Arithmetic `++`/`--` and assignment operator tests
 - [x] Job control tests (background, jobs, wait, $!)
+- [x] eval, printf, trap tests
+- [x] return, command -v, readonly tests
+- [x] break/continue tests
+- [x] String operations tests (`^^`, `,,`, `:offset:length`, `#`, `##`, `%`, `%%`, `/`, `//`)
+- [x] pushd/popd/dirs, basename/dirname tests
+- [x] echo -n/-e tests
+- [x] Colorizer tests
+- [x] History expansion tests
+- [x] Input engine binding tests
+- [x] Process substitution tests
+- [x] `[[ ]]` glob matching tests
+- [x] Arithmetic for loop tests
+- [x] Builtins in pipelines tests
+- [x] Here-doc `$()` and `$(())` expansion tests
 
 ---
 
@@ -140,7 +190,7 @@
 - [ ] **Recursive glob `**` in brace expansion** — e.g. `{src,test}/**/*.ts`
 - [ ] **`hash` builtin** — command hash table for PATH lookup caching
 - [ ] **Named pipes / coprocesses**
-- [ ] **`echo -n`** — suppress trailing newline
+- [ ] **`read -t`** — timeout flag (requires async I/O changes)
 
 ### Terminal / UI
 

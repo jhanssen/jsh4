@@ -3,7 +3,7 @@ export type {
     Subshell, BraceGroup, Redirection, Word, WordSegment,
     LiteralSegment, SingleQuotedSegment, DoubleQuotedSegment,
     VariableExpansion, CommandSubstitution, ArithmeticExpansion, GlobSegment, ProcessSubstitution,
-    IfClause, WhileClause, ForClause, SelectClause, FunctionDef, JsFunction, CaseClause,
+    IfClause, WhileClause, ForClause, ArithmeticFor, SelectClause, FunctionDef, JsFunction, CaseClause,
     ConditionalExpr,
 } from "./ast.js";
 

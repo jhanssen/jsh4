@@ -276,18 +276,18 @@ Builtins execute in-process (no fork):
 | `exit` | ✅ | Exit shell |
 | `export` | ✅ | Mark variable for child env |
 | `unset` | ✅ | Remove variable |
-| `echo` | ✅ | Output (builtin for performance) |
+| `echo` | ✅ | Output with `-n`, `-e`, `-E` flags |
 | `true` / `false` | ✅ | Exit status |
 | `alias` / `unalias` | ✅ | Define/remove aliases |
 | `test` / `[` | ✅ | Conditional expressions (string, integer, file tests, logical ops) |
 | `source` / `.` | ✅ | Execute file in current shell context |
-| `read` | ✅ | Read line from stdin/here-strings, IFS splitting, `-r` flag |
+| `read` | ✅ | Read line with `-r`, `-p`, `-s`, `-n`, `-d`, `-a` flags |
 | `set` | ✅ | Shell options: `-e`, `-u`, `-x`, `-o pipefail` |
 | `local` | ✅ | Function-scoped variables with save/restore |
 | `shift` | ✅ | Shift positional parameters |
 | `exec` | ✅ | Replace shell with command (native `execvp`) |
 | `type` / `which` | ✅ | Command lookup (alias, builtin, function, PATH) |
-| `[[ ]]` | ✅ | Extended conditional (`=~` regex, `<`/`>`, `&&`/`||`) |
+| `[[ ]]` | ✅ | Extended conditional (`=~` regex, `==`/`!=` glob, `<`/`>`, `&&`/`||`) |
 | `jobs` | ✅ | List background/stopped jobs |
 | `fg` | ✅ | Resume job in foreground |
 | `bg` | ✅ | Resume stopped job in background |
@@ -295,6 +295,14 @@ Builtins execute in-process (no fork):
 | `eval` | ✅ | Parse and execute string |
 | `printf` | ✅ | Formatted output (`%s`, `%d`, `%x`, `%b`, `%q`, etc.) |
 | `trap` | ✅ | Signal/pseudo-signal trapping (EXIT, INT, TERM, etc.) |
+| `return` | ✅ | Exit from shell function with code |
+| `command` | ✅ | `-v` check existence, bypass functions/aliases |
+| `readonly` | ✅ | Mark variables as read-only |
+| `getopts` | ✅ | POSIX option parsing |
+| `break` / `continue` | ✅ | Loop flow control with optional N levels |
+| `pushd` / `popd` / `dirs` | ✅ | Directory stack |
+| `basename` / `dirname` | ✅ | Path manipulation |
+| `select` | ✅ | Interactive menu loop |
 | `hash` | ❌ | Command hash table |
 
 ---

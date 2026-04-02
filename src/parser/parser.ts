@@ -1,7 +1,7 @@
 import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List,
     Subshell, BraceGroup, Redirection, Word, WordSegment,
-    IfClause, WhileClause, ForClause, SelectClause, FunctionDef, CaseClause, CaseItem,
+    IfClause, WhileClause, ForClause, ArithmeticFor, SelectClause, FunctionDef, CaseClause, CaseItem,
     ConditionalExpr,
 } from "./ast.js";
 import { Lexer, TokenType } from "./lexer.js";
@@ -337,9 +337,15 @@ export class Parser {
     }
 
     // for name [in word*]; do list done
-    private parseFor(): ForClause {
+    // for ((init; cond; step)); do list done
+    private parseFor(): ForClause | ArithmeticFor {
         this.lexer.next(); // consume 'for'
         this.skipNewlines();
+
+        // Check for arithmetic for: for ((
+        if (this.lexer.peek().type === TokenType.LParen && this.lexer.peekAt(1).type === TokenType.LParen) {
+            return this.parseArithmeticFor();
+        }
 
         const nameTok = this.lexer.peek();
         const name = this.literalValue(nameTok);
@@ -408,6 +414,45 @@ export class Parser {
         this.expectKeyword("done");
 
         return { type: "SelectClause", name, items, body };
+    }
+
+    private parseArithmeticFor(): ArithmeticFor {
+        this.lexer.next(); // consume first (
+        this.lexer.next(); // consume second (
+        // Read raw tokens until )) — collect as text.
+        // The content is arithmetic expressions separated by ;
+        const parts: string[] = ["", "", ""];
+        let partIdx = 0;
+        let depth = 2; // We're inside ((
+        while (depth > 0) {
+            const tok = this.lexer.peek();
+            if (tok.type === TokenType.EOF) throw new ParseError("Unclosed (( in for loop");
+            if (tok.type === TokenType.RParen) {
+                depth--;
+                if (depth === 0) { this.lexer.next(); break; }
+                if (depth === 1) { this.lexer.next(); break; }
+            }
+            if (tok.type === TokenType.Semi && depth === 2) {
+                partIdx++;
+                this.lexer.next();
+                continue;
+            }
+            parts[partIdx] = (parts[partIdx]! + " " + tok.value).trim();
+            this.lexer.next();
+        }
+        // Consume the second ) if we only consumed one.
+        if (this.lexer.peek().type === TokenType.RParen) this.lexer.next();
+
+        if (this.lexer.peek().type === TokenType.Semi) this.lexer.next();
+        this.skipNewlines();
+
+        this.expectKeyword("do");
+        this.skipNewlines();
+        const body = this.parseList();
+        this.skipNewlines();
+        this.expectKeyword("done");
+
+        return { type: "ArithmeticFor", init: parts[0]!, condition: parts[1]!, update: parts[2]!, body };
     }
 
     // case word in [pattern) list ;;]* esac
