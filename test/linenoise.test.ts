@@ -12,7 +12,7 @@ const native = require("../build/Release/jsh_native.node") as {
     inputStop: () => void;
     inputGetCols: () => number;
     inputWriteRaw: (data: string) => void;
-    inputRenderLine: (prompt: string, colorized: string, rprompt: string, cols: number) => { line: string; cursorCol: number };
+    inputRenderLine: (prompt: string, colorized: string, rprompt: string, cols: number, rawBuf: string, rawPos: number) => { line: string; cursorCol: number };
     inputHistoryAdd: (line: string) => void;
     inputHistorySetMaxLen: (len: number) => void;
     inputHistorySave: (path: string) => number;
@@ -92,7 +92,7 @@ describe("input engine native binding", () => {
     });
 
     it("should render a line with prompt and cursor position", () => {
-        const result = native.inputRenderLine("$ ", "hello", "", 80);
+        const result = native.inputRenderLine("$ ", "hello", "", 80, "hello", 5);
         assert.ok(result.line.includes("$ "));
         assert.ok(result.line.includes("hello"));
         assert.strictEqual(typeof result.cursorCol, "number");

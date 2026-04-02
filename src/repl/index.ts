@@ -30,7 +30,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputStop: () => void;
     inputGetCols: () => number;
     inputWriteRaw: (data: string) => void;
-    inputRenderLine: (prompt: string, colorized: string, rprompt: string, cols: number) => { line: string; cursorCol: number };
+    inputRenderLine: (prompt: string, colorized: string, rprompt: string, cols: number, rawBuf: string, rawPos: number) => { line: string; cursorCol: number };
     inputHistoryAdd: (line: string) => void;
     inputHistorySetMaxLen: (len: number) => void;
     inputHistorySave: (path: string) => number;
@@ -69,12 +69,20 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         ui!.historyLoad(historyFile);
 
         // Set up syntax highlighting.
-        // In continuation mode, pass previous lines as context so the lexer sees
-        // the full input (e.g. an open string from a prior line).
-        ui!.setColorize((input: string): string => {
+        // Context comes from two sources:
+        // 1. continuationBuffer — accumulated lines from previous REPL sessions (real continuation)
+        // 2. bufContext — previous lines within a multi-line buffer (e.g. history recall)
+        ui!.setColorize((input: string, bufContext?: string): string => {
             const userFn = getColorize();
             if (userFn) return userFn(input);
-            return colorize(input, getCurrentTheme(), continuationBuffer || undefined);
+            // Combine both contexts: continuation buffer + buffer-internal context.
+            let fullContext: string | undefined;
+            if (continuationBuffer && bufContext) {
+                fullContext = continuationBuffer + "\n" + bufContext;
+            } else {
+                fullContext = continuationBuffer || bufContext;
+            }
+            return colorize(input, getCurrentTheme(), fullContext || undefined);
         });
 
         // Set up tab completion.
@@ -185,13 +193,13 @@ async function promptLoop(buffer: string): Promise<void> {
 
     await ui.start(continuation, async (line, errno) => {
         if (line === null) {
+            ui!.clearFrame();
             if (errno === ui!.eagain) {
-                // Ctrl-C — C++ already wrote \r\n
+                // Ctrl-C
                 process.stdout.write(`\x1b]133;D;130\x07`);
                 promptLoop("");
             } else {
                 // Ctrl-D / EOF
-                process.stdout.write("\n");
                 await runTrap("EXIT", executeString);
                 process.exit(0);
             }
@@ -202,7 +210,7 @@ async function promptLoop(buffer: string): Promise<void> {
         const trimmed = input.trim();
 
         if (!trimmed) {
-            // C++ already wrote \r\n
+            ui!.clearFrame();
             process.stdout.write(`\x1b]133;D;0\x07`);
             promptLoop("");
             return;
@@ -211,22 +219,27 @@ async function promptLoop(buffer: string): Promise<void> {
         // History expansion.
         const expanded = expandHistory(trimmed);
         if (expanded === null) {
+            ui!.clearFrame();
             promptLoop("");
             return;
         }
         const finalInput = expanded;
-        if (finalInput !== trimmed) {
-            process.stdout.write(finalInput + "\n");
-        }
 
         try {
             const ast = parse(finalInput);
             if (ast) {
+                // Successful parse — clear frame before executing.
+                ui!.clearFrame();
                 ui!.historyAdd(finalInput);
                 addHistoryEntry(finalInput);
                 setCommandText(finalInput);
+                if (finalInput !== trimmed) {
+                    process.stdout.write(finalInput + "\n");
+                }
                 process.stdout.write("\x1b]133;C\x07");
                 await execute(ast);
+            } else {
+                ui!.clearFrame();
             }
             const exitCode = String($["?"] ?? "0");
             process.stdout.write(`\x1b]133;D;${exitCode}\x07`);
@@ -234,9 +247,11 @@ async function promptLoop(buffer: string): Promise<void> {
             promptLoop("");
         } catch (e: unknown) {
             if (e instanceof IncompleteInputError) {
+                // Don't clear frame — start(true) will overwrite it in place.
                 promptLoop(input);
                 return;
             }
+            ui!.clearFrame();
             const msg = e instanceof Error ? e.message : String(e);
             process.stderr.write(`jsh: ${msg}\n`);
             process.stdout.write(`\x1b]133;D;1\x07`);

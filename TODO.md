@@ -122,16 +122,19 @@
 ### REPL / Terminal UI
 - [x] Custom InputEngine (replaced linenoise) with non-blocking uv_poll
 - [x] Multi-line continuation prompt (`> `) for incomplete input
-- [x] History (in-memory + persist to `~/.jsh_history`)
+- [x] History (in-memory + persist to `~/.jsh_history`, multi-line entries with `\` continuation)
 - [x] Non-interactive stdin mode (script execution via `readFileSync`)
 - [x] Tab completion: files/dirs, commands, `@` functions, user-defined handlers
 - [x] Ctrl-C clears current line/buffer
 - [x] Ctrl-D exits
 - [x] Ctrl-R reverse history search
 - [x] Syntax highlighting (lexer-based, true color RGB, command-exists green/red)
-- [x] Multi-line syntax highlighting — continuation lines colorized with context from previous lines
+- [x] Multi-line syntax highlighting — continuation and multi-line buffer lines colorized with context
+- [x] Multi-line editing — Up/Down navigate between lines, Home/End are line-aware, history fallback at edges
 - [x] Unified widget system — prompt, rprompt, PS2, header, footer are all widgets in zones
 - [x] Widget handles with `update()` / `remove()` — intervals are userland, not baked in
+- [x] Frozen lines — PS1 + previous PS2 lines stay visible during continuation, header renders above all
+- [x] Flicker-free continuation — renderer overwrites old frame in place, no clear/redraw gap
 - [x] OSC 133 shell integration marks
 - [x] OSC 7 cwd reporting
 - [x] Synchronized rendering (CSI 2026)
@@ -160,11 +163,11 @@
 ### Tests
 - [x] Lexer tests (90 cases)
 - [x] Parser tests
-- [x] linenoise binding tests
+- [x] Input engine binding tests
 - [x] Executor integration tests (via jsh subprocess)
 - [x] `@` syntax tests
 - [x] `jsh.exec()` tests
-- [x] jsh API tests (alias, setPrompt, registerJsFunction)
+- [x] jsh API tests (alias, registerJsFunction)
 - [x] Tab completion tests
 - [x] `case`/`esac` and here-doc tests
 - [x] Subshell isolation tests

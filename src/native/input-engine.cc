@@ -187,8 +187,26 @@ int historySetMaxLen(int len) {
 int historySave(const char *filename) {
     FILE *fp = fopen(filename, "w");
     if (!fp) return -1;
-    for (int j = 0; j < history_len; j++)
-        fprintf(fp, "%s\n", history[j]);
+    for (int j = 0; j < history_len; j++) {
+        const char *entry = history[j];
+        // Multi-line entries: write each line with trailing backslash for continuation.
+        const char *p = entry;
+        while (*p) {
+            const char *nl = strchr(p, '\n');
+            if (nl) {
+                fwrite(p, 1, nl - p, fp);
+                fputs("\\\n", fp); // trailing \ indicates continuation
+                p = nl + 1;
+            } else {
+                fputs(p, fp);
+                fputc('\n', fp);
+                break;
+            }
+        }
+        if (entry[0] == '\0' || (strlen(entry) > 0 && entry[strlen(entry)-1] == '\n')) {
+            fputc('\n', fp);
+        }
+    }
     fclose(fp);
     return 0;
 }
@@ -197,12 +215,34 @@ int historyLoad(const char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) return -1;
     char buf[4096];
+    std::string entry;
+    bool continuation = false;
     while (fgets(buf, sizeof(buf), fp)) {
-        char *p = strchr(buf, '\n');
-        if (p) *p = '\0';
-        p = strchr(buf, '\r');
-        if (p) *p = '\0';
-        historyAdd(buf);
+        // Strip trailing \n and \r.
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) len--;
+        buf[len] = '\0';
+        // Check for continuation (trailing backslash).
+        if (len > 0 && buf[len-1] == '\\') {
+            buf[len-1] = '\0';
+            if (continuation) entry += '\n';
+            entry += buf;
+            continuation = true;
+        } else {
+            if (continuation) {
+                entry += '\n';
+                entry += buf;
+                historyAdd(entry.c_str());
+                entry.clear();
+                continuation = false;
+            } else {
+                historyAdd(buf);
+            }
+        }
+    }
+    // Flush any trailing continuation.
+    if (continuation && !entry.empty()) {
+        historyAdd(entry.c_str());
     }
     fclose(fp);
     return 0;
@@ -278,8 +318,75 @@ static void editMoveRight(InputState *s) {
     }
 }
 
-static void editMoveHome(InputState *s) { s->pos = 0; }
-static void editMoveEnd(InputState *s) { s->pos = s->len; }
+// Find the start of the line containing pos.
+static size_t lineStart(const char *buf, size_t pos) {
+    if (pos == 0) return 0;
+    size_t i = pos - 1;
+    while (i > 0 && buf[i] != '\n') i--;
+    return buf[i] == '\n' ? i + 1 : 0;
+}
+
+// Find the end of the line containing pos (position of \n or len).
+static size_t lineEnd(const char *buf, size_t pos, size_t len) {
+    size_t i = pos;
+    while (i < len && buf[i] != '\n') i++;
+    return i;
+}
+
+static void editMoveHome(InputState *s) {
+    s->pos = lineStart(s->buf, s->pos);
+}
+
+static void editMoveEnd(InputState *s) {
+    s->pos = lineEnd(s->buf, s->pos, s->len);
+}
+
+// Move cursor up one line. Returns true if moved, false if already on first line.
+static bool editMoveUp(InputState *s) {
+    size_t curLineStart = lineStart(s->buf, s->pos);
+    if (curLineStart == 0) return false; // Already on first line.
+    // Column position within current line.
+    size_t col = utf8StrWidth(s->buf + curLineStart, s->pos - curLineStart);
+    // Move to previous line.
+    size_t prevLineEnd = curLineStart - 1; // the \n
+    size_t prevLineStart = lineStart(s->buf, prevLineEnd);
+    // Find position at same column in previous line.
+    size_t i = prevLineStart;
+    size_t w = 0;
+    while (i < prevLineEnd) {
+        size_t clen = utf8NextCharLen(s->buf, i, prevLineEnd);
+        int cw = utf8CharWidth(utf8DecodeChar(s->buf + i, &clen));
+        if (w + cw > col) break;
+        w += cw;
+        i += clen;
+    }
+    s->pos = i;
+    return true;
+}
+
+// Move cursor down one line. Returns true if moved, false if already on last line.
+static bool editMoveDown(InputState *s) {
+    size_t curLineStart = lineStart(s->buf, s->pos);
+    size_t curLineEnd = lineEnd(s->buf, s->pos, s->len);
+    if (curLineEnd >= s->len) return false; // Already on last line.
+    // Column position within current line.
+    size_t col = utf8StrWidth(s->buf + curLineStart, s->pos - curLineStart);
+    // Move to next line.
+    size_t nextLineStart = curLineEnd + 1; // skip the \n
+    size_t nextLineEnd = lineEnd(s->buf, nextLineStart, s->len);
+    // Find position at same column in next line.
+    size_t i = nextLineStart;
+    size_t w = 0;
+    while (i < nextLineEnd) {
+        size_t clen = utf8NextCharLen(s->buf, i, nextLineEnd);
+        int cw = utf8CharWidth(utf8DecodeChar(s->buf + i, &clen));
+        if (w + cw > col) break;
+        w += cw;
+        i += clen;
+    }
+    s->pos = i;
+    return true;
+}
 
 static void editDeletePrevWord(InputState *s) {
     size_t old_pos = s->pos;
@@ -569,8 +676,14 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
 
     case CTRL_B: editMoveLeft(s); notifyRender(); break;
     case CTRL_F: editMoveRight(s); notifyRender(); break;
-    case CTRL_P: editHistoryNav(s, 1); notifyRender(); break;
-    case CTRL_N: editHistoryNav(s, -1); notifyRender(); break;
+    case CTRL_P:
+        if (!editMoveUp(s)) editHistoryNav(s, 1);
+        notifyRender();
+        break;
+    case CTRL_N:
+        if (!editMoveDown(s)) editHistoryNav(s, -1);
+        notifyRender();
+        break;
     case CTRL_A: editMoveHome(s); notifyRender(); break;
     case CTRL_E: editMoveEnd(s); notifyRender(); break;
 
@@ -617,8 +730,14 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
                 }
             } else {
                 switch (seq[1]) {
-                case 'A': editHistoryNav(s, 1); notifyRender(); break;   // Up
-                case 'B': editHistoryNav(s, -1); notifyRender(); break;  // Down
+                case 'A': // Up
+                    if (!editMoveUp(s)) editHistoryNav(s, 1);
+                    notifyRender();
+                    break;
+                case 'B': // Down
+                    if (!editMoveDown(s)) editHistoryNav(s, -1);
+                    notifyRender();
+                    break;
                 case 'C': editMoveRight(s); notifyRender(); break;       // Right
                 case 'D': editMoveLeft(s); notifyRender(); break;        // Left
                 case 'H': editMoveHome(s); notifyRender(); break;        // Home
@@ -789,12 +908,13 @@ static Napi::Value InputWriteRaw(const Napi::CallbackInfo &info) {
     return info.Env().Undefined();
 }
 
-// inputRenderLine(prompt, colorized, rprompt, cols) -> { line, cursorCol }
+// inputRenderLine(prompt, colorized, rprompt, cols, rawBuf, rawPos) -> { line, cursorCol }
 // Pure function: computes the display line with horizontal scroll.
+// rawBuf and rawPos are the plain-text buffer content and cursor position for this line.
 static Napi::Value InputRenderLine(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 4) {
-        Napi::TypeError::New(env, "inputRenderLine(prompt, colorized, rprompt, cols)")
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "inputRenderLine(prompt, colorized, rprompt, cols, rawBuf, rawPos)")
             .ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -803,13 +923,14 @@ static Napi::Value InputRenderLine(const Napi::CallbackInfo &info) {
     std::string colorized = info[1].As<Napi::String>().Utf8Value();
     std::string rprompt = info[2].As<Napi::String>().Utf8Value();
     int cols = info[3].As<Napi::Number>().Int32Value();
+    std::string rawBufStr = info[4].As<Napi::String>().Utf8Value();
+    size_t rawPos = static_cast<size_t>(info[5].As<Napi::Number>().Int64Value());
 
     size_t pwidth = utf8StrWidthAnsi(prompt.c_str(), prompt.size());
 
-    // Use raw buffer for width calculations (not colorized).
-    const char *rawBuf = g_state.buf;
-    size_t rawLen = g_state.len;
-    size_t rawPos = g_state.pos;
+    const char *rawBuf = rawBufStr.c_str();
+    size_t rawLen = rawBufStr.size();
+    if (rawPos > rawLen) rawPos = rawLen;
 
     size_t poscol = utf8StrWidth(rawBuf, rawPos);
     size_t lencol = utf8StrWidth(rawBuf, rawLen);

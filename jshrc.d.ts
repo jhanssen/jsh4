@@ -81,11 +81,14 @@ interface Theme {
 /**
  * Widget zones control where content renders in the terminal layout:
  *
- * - `"header"` — lines above the input line (multi-line, multiple widgets stack)
- * - `"prompt"` — left side of input line (single-line, multiple widgets concatenate)
- * - `"rprompt"` — right side of input line (single-line, multiple widgets concatenate)
- * - `"ps2"` — left side of continuation lines (single-line)
- * - `"footer"` — lines below the input line (multi-line, multiple widgets stack)
+ * - `"header"` — above the input line
+ * - `"prompt"` — left side of input line
+ * - `"rprompt"` — right side of input line
+ * - `"ps2"` — left side of continuation lines
+ * - `"footer"` — below the input line
+ *
+ * Multiple widgets in the same zone concatenate on one line (sorted by order).
+ * Return a multi-element array from the render function to add explicit line breaks.
  */
 type WidgetZone = "header" | "footer" | "prompt" | "rprompt" | "ps2";
 
@@ -179,9 +182,9 @@ declare const jsh: {
      * For prompt/rprompt/ps2 zones, the render function should return a string.
      * For header/footer zones, it can return a string or string[].
      *
-     * Multiple widgets in the same zone are ordered by the `order` parameter.
-     * Header/footer widgets stack (each adds lines). Prompt/rprompt/ps2 widgets
-     * concatenate their strings.
+     * Multiple widgets in the same zone are ordered by the `order` parameter
+     * and concatenate on one line. Return a multi-element array from the render
+     * function to add explicit line breaks.
      *
      * @param id      Unique identifier
      * @param zone    Where to render: "header", "footer", "prompt", "rprompt", "ps2"

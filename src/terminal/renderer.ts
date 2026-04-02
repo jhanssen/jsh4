@@ -2,8 +2,9 @@
 
 export interface Frame {
     headerLines: string[];
-    inputLine: string;
-    cursorCol: number;
+    frozenLines: string[];  // previous prompt/continuation lines (read-only, above input)
+    inputLines: string[];   // current input (may span multiple lines for multi-line buffers)
+    cursorCol: number;      // column on the last input line
     footerLines: string[];
 }
 
@@ -16,14 +17,17 @@ export class Renderer {
         this.writeRaw = writeRaw;
     }
 
-    render(frame: Frame): void {
+    render(frame: Frame, cursorLineOffset?: number): void {
         const lines = [
             ...frame.headerLines,
-            frame.inputLine,
+            ...frame.frozenLines,
+            ...frame.inputLines,
             ...frame.footerLines,
         ];
         const totalRows = lines.length;
-        const cursorRow = frame.headerLines.length;
+        // Cursor row: header + frozen + offset within input lines.
+        const inputOffset = cursorLineOffset ?? (frame.inputLines.length - 1);
+        const cursorRow = frame.headerLines.length + frame.frozenLines.length + inputOffset;
 
         let buf = "";
 
@@ -118,6 +122,10 @@ export class Renderer {
 
     getLastFooterRows(): number {
         return this.lastTotalRows - 1 - this.lastCursorRow;
+    }
+
+    getLastTotalRows(): number {
+        return this.lastTotalRows;
     }
 
     /** Reset state (after line accepted, before next prompt). */

@@ -47,31 +47,40 @@ export class WidgetManager {
         this.cache.delete(id);
     }
 
-    /** Get cached lines for a multi-line zone (header/footer), sorted by order. */
-    getZoneLines(zone: "header" | "footer"): string[] {
-        const lines: string[] = [];
+    /**
+     * Get cached content for a zone, sorted by widget order.
+     * Widgets returning a single string concatenate on the same line.
+     * Widgets returning a multi-element array add separate lines.
+     * Returns an array of lines.
+     */
+    getZoneContent(zone: WidgetZone): string[] {
         const sorted = [...this.widgets.values()]
             .filter(w => w.zone === zone)
             .sort((a, b) => a.order - b.order);
-        for (const w of sorted) {
-            const cached = this.cache.get(w.id);
-            if (cached) lines.push(...cached);
-        }
-        return lines;
-    }
 
-    /** Get cached string for a single-line zone (prompt/rprompt/ps2).
-     *  Multiple widgets in the same zone are concatenated in order. */
-    getZoneString(zone: "prompt" | "rprompt" | "ps2"): string {
-        const sorted = [...this.widgets.values()]
-            .filter(w => w.zone === zone)
-            .sort((a, b) => a.order - b.order);
-        let result = "";
+        const lines: string[] = [];
+        let currentLine = "";
+
         for (const w of sorted) {
             const cached = this.cache.get(w.id);
-            if (cached) result += cached[0] ?? "";
+            if (!cached || cached.length === 0) continue;
+
+            if (cached.length === 1) {
+                // Single string — concatenate on current line.
+                currentLine += cached[0]!;
+            } else {
+                // Multi-element — first element joins current line, rest are new lines.
+                currentLine += cached[0]!;
+                lines.push(currentLine);
+                for (let i = 1; i < cached.length - 1; i++) {
+                    lines.push(cached[i]!);
+                }
+                currentLine = cached[cached.length - 1]!;
+            }
         }
-        return result;
+
+        if (currentLine) lines.push(currentLine);
+        return lines;
     }
 
     /** Check if a zone has any widgets registered. */

@@ -46,8 +46,9 @@ const promptWidget = jsh.addWidget("prompt", "prompt", async () => {
 
 jsh.addWidget("ps2", "ps2", () => `${softGray}> ${reset}`);
 
-// ---- Header Widget ---------------------------------------------------------
+// ---- Header Widgets --------------------------------------------------------
 
+// Git info — updates on each prompt cycle.
 jsh.addWidget("gitinfo", "header", async () => {
     const branch = await jsh.exec('git branch --show-current 2>/dev/null');
     const status = await jsh.exec('git status --porcelain 2>/dev/null');
@@ -57,16 +58,24 @@ jsh.addWidget("gitinfo", "header", async () => {
     return `  ${cyan}${branch.stdout}${reset} ${dirty}${count ? ` ${yellow}${count} changed${reset}` : ''}`;
 });
 
-// ---- Footer Widget (clock with interval) -----------------------------------
+// Clock in header — live-updates every second.
+const headerClock = jsh.addWidget("header-clock", "header", () => {
+    const now = new Date();
+    const time = now.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return `  ${softGray}${time}${reset}`;
+}, 10);
 
-const clock = jsh.addWidget("clock", "footer", () => {
+setInterval(() => headerClock.update(), 1000);
+
+// ---- Footer Widget ---------------------------------------------------------
+
+const footerClock = jsh.addWidget("footer-clock", "footer", () => {
     const now = new Date();
     const time = now.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     return `  ${softGray}${time}${reset}`;
 });
 
-// Update the clock every second — intervals are userland, not baked into widgets.
-setInterval(() => clock.update(), 1000);
+setInterval(() => footerClock.update(), 1000);
 
 // ---- Theme -----------------------------------------------------------------
 

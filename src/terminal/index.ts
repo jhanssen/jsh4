@@ -30,7 +30,7 @@ interface NativeInputEngine {
     inputStop: () => void;
     inputGetCols: () => number;
     inputWriteRaw: (data: string) => void;
-    inputRenderLine: (prompt: string, colorized: string, rprompt: string, cols: number) => RenderLineResult;
+    inputRenderLine: (prompt: string, colorized: string, rprompt: string, cols: number, rawBuf: string, rawPos: number) => RenderLineResult;
     inputHistoryAdd: (line: string) => void;
     inputHistorySetMaxLen: (len: number) => void;
     inputHistorySave: (path: string) => number;
@@ -43,12 +43,15 @@ export class TerminalUI {
     private renderer: Renderer;
     private widgets: WidgetManager;
 
-    private colorizeFn: ((input: string) => string) | null = null;
+    private colorizeFn: ((input: string, context?: string) => string) | null = null;
     private completionFn: ((input: string) => string[]) | null = null;
     private lastState: InputState | null = null;
     private lineCallback: ((line: string | null, errno?: number) => void) | null = null;
     private EAGAIN: number;
     private isContinuation = false;
+    private frozenLines: string[] = [];
+    private pendingFreeze: string[] = []; // rendered lines from last session, frozen on continuation
+    private editing = false; // true while an editing session is active
 
     constructor(native: NativeInputEngine) {
         this.native = native;
@@ -63,16 +66,26 @@ export class TerminalUI {
     async start(continuation: boolean, callback: (line: string | null, errno?: number) => void): Promise<void> {
         this.isContinuation = continuation;
         this.lineCallback = callback;
-        this.renderer.reset();
+        this.editing = true;
+        // Only reset renderer for fresh prompts. For continuation, keep the old
+        // frame dimensions so the renderer can overwrite the previous frame in place.
+        if (!continuation) {
+            this.renderer.reset();
+        }
 
-        // Re-evaluate prompt/rprompt/ps2 for this editing session.
-        if (continuation) {
-            await this.widgets.refreshZone("ps2");
-        } else {
+        if (!continuation) {
+            this.frozenLines = [];
+            this.pendingFreeze = [];
             await this.widgets.refreshZone("prompt");
             await this.widgets.refreshZone("rprompt");
+        } else {
+            // Freeze the previous session's rendered lines.
+            if (this.pendingFreeze.length > 0) {
+                this.frozenLines.push(...this.pendingFreeze);
+                this.pendingFreeze = [];
+            }
+            await this.widgets.refreshZone("ps2");
         }
-        // Refresh header/footer too.
         await this.widgets.refreshZone("header");
         await this.widgets.refreshZone("footer");
 
@@ -99,7 +112,7 @@ export class TerminalUI {
 
     // ---- Configuration ----
 
-    setColorize(fn: ((input: string) => string) | null): void {
+    setColorize(fn: ((input: string, context?: string) => string) | null): void {
         this.colorizeFn = fn;
     }
 
@@ -127,7 +140,7 @@ export class TerminalUI {
     // ---- Repaint ----
 
     repaint(): void {
-        if (this.lastState) this.renderFrame(this.lastState);
+        if (this.editing && this.lastState) this.renderFrame(this.lastState);
     }
 
     get eagain(): number { return this.EAGAIN; }
@@ -142,9 +155,10 @@ export class TerminalUI {
 
     private getPrompt(): string {
         if (this.isContinuation) {
-            return this.widgets.hasZone("ps2") ? this.widgets.getZoneString("ps2") : "> ";
+            const ps2 = this.widgets.getZoneContent("ps2");
+            return ps2.length > 0 ? ps2.join("") : "> ";
         }
-        const raw = this.widgets.getZoneString("prompt") || "$ ";
+        const raw = this.widgets.getZoneContent("prompt").join("") || "$ ";
         if (this.oscMarks) {
             return `\x1b]133;A\x07${raw}\x1b]133;B\x07`;
         }
@@ -153,7 +167,7 @@ export class TerminalUI {
 
     private getRightPrompt(): string {
         if (this.isContinuation) return "";
-        return this.widgets.getZoneString("rprompt");
+        return this.widgets.getZoneContent("rprompt").join("");
     }
 
     private onRender(state: InputState): void {
@@ -162,43 +176,66 @@ export class TerminalUI {
     }
 
     private onLine(line: string | null, errno?: number): void {
-        const headerRows = this.renderer.getLastHeaderRows();
-        const footerRows = this.renderer.getLastFooterRows();
         const prompt = this.getPrompt();
+        const ps2 = this.widgets.getZoneContent("ps2").join("") || "> ";
 
-        if (headerRows > 0 || footerRows > 0) {
-            let buf = "";
-            // Move up to top of frame (header start).
-            if (headerRows > 0) {
-                buf += `\x1b[${headerRows}A`;
-            }
-            // Clear from here to end of screen (wipes header + input + footer).
-            buf += "\r\x1b[J";
-            // Rewrite just the input line.
-            if (this.lastState) {
-                const colorized = this.colorizeFn ? this.colorizeFn(this.lastState.buf) : this.lastState.buf;
-                const { line: inputLine } = this.native.inputRenderLine(
-                    prompt, colorized, "", this.lastState.cols
+        // Capture rendered input lines for potential continuation freeze.
+        this.pendingFreeze = [];
+        if (this.lastState) {
+            const bufLines = this.lastState.buf.split("\n");
+            for (let i = 0; i < bufLines.length; i++) {
+                const bufLine = bufLines[i]!;
+                const linePrompt = i === 0 ? prompt : ps2;
+                const context = i > 0 ? bufLines.slice(0, i).join("\n") : undefined;
+                const colorized = this.colorizeFn ? this.colorizeFn(bufLine, context) : bufLine;
+                const { line: rendered } = this.native.inputRenderLine(
+                    linePrompt, colorized, "", this.lastState.cols, bufLine, bufLine.length
                 );
-                buf += inputLine;
+                this.pendingFreeze.push(rendered);
             }
-            // Move to new line, reset column for correct tab alignment.
-            buf += "\r\n\x1b[G";
-            process.stdout.write(buf);
-        } else {
-            // No header/footer — just move to new line.
-            process.stdout.write("\r\n\x1b[G");
         }
 
-        this.renderer.reset();
+        // Pause repaints until next start() — prevents widget timers from
+        // rendering stale content between onLine and the next editing session.
+        this.editing = false;
+
+        // Don't clear anything yet — the REPL will call either:
+        // - start(continuation=true): renderFrame overwrites the old frame in place (no flicker)
+        // - clearFrame() then execute: explicit cleanup before command output
         if (this.lineCallback) {
             this.lineCallback(line, errno);
         }
     }
 
+    /** Clear the current frame (header/footer) and position cursor for command output. */
+    clearFrame(): void {
+        const cursorRow = this.renderer.getLastHeaderRows(); // rows above cursor in last frame
+        const totalRows = this.renderer.getLastTotalRows();
+        const allContent = [...this.frozenLines, ...this.pendingFreeze];
+
+        if (totalRows > 1 || allContent.length > 1) {
+            let buf = "";
+            // Move to top of entire frame.
+            if (cursorRow > 0) buf += `\x1b[${cursorRow}A`;
+            // Clear everything from here down.
+            buf += "\r\x1b[J";
+            // Rewrite only the content lines (no header/footer).
+            for (const line of allContent) {
+                buf += line + "\r\n";
+            }
+            buf += "\x1b[G";
+            process.stdout.write(buf);
+        } else {
+            process.stdout.write("\r\n\x1b[G");
+        }
+
+        this.renderer.reset();
+    }
+
     private renderFrame(state: InputState): void {
         const prompt = this.getPrompt();
         const rprompt = this.getRightPrompt();
+        const ps2 = this.widgets.getZoneContent("ps2").join("") || "> ";
 
         // In search mode, show the search prompt instead of the normal prompt.
         let displayPrompt = prompt;
@@ -209,19 +246,62 @@ export class TerminalUI {
             displayRightPrompt = "";
         }
 
-        // Colorize buffer.
-        const colorized = this.colorizeFn ? this.colorizeFn(state.buf) : state.buf;
+        // Split buffer on newlines for multi-line input (e.g. from history recall).
+        const bufLines = state.buf.split("\n");
 
-        // Get input line from engine (handles scroll + cursor math).
-        const { line, cursorCol } = this.native.inputRenderLine(
-            displayPrompt, colorized, displayRightPrompt, state.cols
-        );
+        // Compute which line the cursor is on and the position within that line.
+        let cursorLineIdx = 0;
+        let posInLine = state.pos;
+        {
+            let offset = 0;
+            for (let i = 0; i < bufLines.length; i++) {
+                const lineLen = bufLines[i]!.length;
+                if (state.pos <= offset + lineLen) {
+                    cursorLineIdx = i;
+                    posInLine = state.pos - offset;
+                    break;
+                }
+                offset += lineLen + 1; // +1 for \n
+            }
+        }
+
+        const inputLines: string[] = [];
+        let cursorCol = 0;
+
+        for (let i = 0; i < bufLines.length; i++) {
+            const bufLine = bufLines[i]!;
+            const isFirst = i === 0;
+            const isLast = i === bufLines.length - 1;
+            const isCursorLine = i === cursorLineIdx;
+            const linePrompt = isFirst ? displayPrompt : ps2;
+            const lineRprompt = isLast ? displayRightPrompt : "";
+
+            // Colorize with context from previous buffer lines.
+            let colorized: string;
+            if (this.colorizeFn) {
+                const context = i > 0 ? bufLines.slice(0, i).join("\n") : undefined;
+                colorized = this.colorizeFn(bufLine, context);
+            } else {
+                colorized = bufLine;
+            }
+
+            // Pass per-line raw buffer and cursor position to C++.
+            const linePos = isCursorLine ? posInLine : bufLine.length;
+            const { line, cursorCol: col } = this.native.inputRenderLine(
+                linePrompt, colorized, lineRprompt, state.cols, bufLine, linePos
+            );
+            inputLines.push(line);
+            if (isCursorLine) cursorCol = col;
+        }
 
         // Get header/footer from widgets.
-        const headerLines = this.widgets.getZoneLines("header");
-        const footerLines = this.widgets.getZoneLines("footer");
+        const headerLines = this.widgets.getZoneContent("header");
+        const footerLines = this.widgets.getZoneContent("footer");
 
-        const frame: Frame = { headerLines, inputLine: line, cursorCol, footerLines };
-        this.renderer.render(frame);
+        // Cursor row is on the cursor's line within inputLines.
+        const frame: Frame = { headerLines, frozenLines: this.frozenLines, inputLines, cursorCol, footerLines };
+
+        // Override cursor row in the renderer: it's not always the last input line.
+        this.renderer.render(frame, cursorLineIdx);
     }
 }

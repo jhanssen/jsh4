@@ -90,20 +90,23 @@ Returns `string[]` per word to support brace, glob, and IFS expansion producing 
 
 **4. Terminal UI (Custom InputEngine + TS Renderer)**
 
-A custom C++ input engine (`src/native/input-engine.cc`) handles raw terminal I/O, keystroke reading, buffer editing, and history. A TypeScript rendering layer (`src/terminal/`) owns the screen layout with header/footer regions, widget system, and synchronized rendering.
+A custom C++ input engine (`src/native/input-engine.cc`) handles raw terminal I/O, keystroke reading, buffer editing, and history. A TypeScript rendering layer (`src/terminal/`) owns the screen layout, widget system, and synchronized rendering.
 
 Architecture:
-- **C++ InputEngine**: raw mode (termios), non-blocking keystroke reading via `uv_poll_t`, input buffer editing, history navigation, completion dispatch. Calls a TS `onRender` callback after each buffer mutation.
-- **TS Renderer**: assembles frames from header widgets + input line + footer widgets. Writes the full frame as one synchronized batch (`CSI ?2026 h/l`). Handles cursor positioning across regions.
-- **Widget System**: JS functions registered for header/footer zones with optional auto-refresh intervals. Supports live-updating widgets (e.g., clock) that refresh while the user types.
+- **C++ InputEngine**: raw mode (termios), non-blocking keystroke reading via `uv_poll_t`, input buffer editing, multi-line cursor navigation (Up/Down between lines, line-aware Home/End), history navigation (falls through to history at first/last line), completion dispatch. Calls a TS `onRender` callback after each buffer mutation.
+- **TS Renderer**: assembles frames from header widgets + frozen lines + input lines + footer widgets. Writes the full frame as one synchronized batch (`CSI ?2026 h/l`). Handles cursor positioning across regions and multi-line input.
+- **Widget System**: unified zone-based system — prompt, rprompt, PS2, header, and footer are all widgets. `addWidget` returns a handle with `update()` and `remove()`. Widgets in the same zone concatenate; multi-element arrays add line breaks. Intervals are userland (`setInterval` + `handle.update()`).
 
-The input line is rendered by `inputRenderLine()` in C++ (handles horizontal scroll, cursor math, ANSI-aware width). Header/footer content is fully controlled by JS — every character.
+`inputRenderLine()` in C++ is a pure function: takes prompt, colorized text, raw buffer, and cursor position as arguments. Computes horizontal scroll, cursor math, ANSI-aware width. Called once per line for multi-line buffers.
 
 Features:
 - Syntax highlighting via colorize callback (lexer-based, true color RGB)
+- Multi-line syntax highlighting — context from previous lines passed to colorizer
 - Command-exists detection (green for valid, red+curly underline for invalid)
-- Right-aligned prompt
-- Async prompt support (`jsh.setPrompt(async fn)`)
+- Multi-line editing — history recall of multi-line entries, cursor navigation between lines
+- Frozen lines — PS1 + previous PS2 lines stay visible during continuation
+- Flicker-free continuation — renderer overwrites old frame in place
+- Multi-line history persistence — entries with `\n` saved with `\` continuation markers
 - OSC 133 shell integration marks (prompt/command/output boundaries)
 - OSC 7 working directory reporting
 - Color helpers (`jsh.colors`, `jsh.makeFgColor()`, `jsh.style` tagged template)
@@ -125,12 +128,15 @@ jsh.$.EDITOR = 'nvim';
 jsh.alias('ll', 'ls -la');
 jsh.alias('gs', 'git status');
 
-// Async prompt with git branch
-jsh.setPrompt(async () => {
+// Prompt — a widget in the "prompt" zone, re-evaluated each new line
+jsh.addWidget("ps1", "prompt", async () => {
     const cwd = String(jsh.$.PWD ?? '~').replace(String(jsh.$.HOME ?? ''), '~');
     const branch = await jsh.exec('git branch --show-current 2>/dev/null');
     return jsh.style`${bold}${yellow}${cwd} ${cyan}${branch.ok ? branch.stdout : ''}${reset}$ `;
 });
+
+// Continuation prompt
+jsh.addWidget("ps2", "ps2", () => "> ");
 
 // Theme
 jsh.setTheme({
@@ -141,16 +147,24 @@ jsh.setTheme({
     variable:        [137, 221, 255],
 });
 
-// Widgets: header and footer
+// Header — git info + clock, concatenated on one line
 jsh.addWidget("git", "header", async () => {
     const branch = await jsh.exec('git branch --show-current 2>/dev/null');
     return branch.ok ? jsh.style`  ${cyan}${branch.stdout}` : '';
 });
 
-jsh.addWidget("clock", "footer", () => {
+const clock = jsh.addWidget("clock", "header", () => {
     const time = new Date().toLocaleTimeString('en-US', { hour12: false });
     return jsh.style`  ${orange}${time}`;
-}, 0, 1000);
+}, 10);
+setInterval(() => clock.update(), 1000);
+
+// Footer
+const footerClock = jsh.addWidget("footer-clock", "footer", () => {
+    const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+    return jsh.style`  ${orange}${time}`;
+});
+setInterval(() => footerClock.update(), 1000);
 
 // Custom pipeline functions (auto-registered from exports)
 export async function* filter(args, stdin) {
