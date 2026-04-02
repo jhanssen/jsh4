@@ -8,7 +8,7 @@ import { listJsFunctions } from "../jsfunctions/index.js";
 // ---- User-defined completion handlers ---------------------------------------
 
 type CompletionCtx = { words: string[]; current: string };
-type CompletionFn = (ctx: CompletionCtx) => string[];
+type CompletionFn = (ctx: CompletionCtx) => string[] | Promise<string[]>;
 
 const handlers = new Map<string, CompletionFn>();
 
@@ -139,7 +139,7 @@ function splitWords(input: string): string[] {
     return words;
 }
 
-export function getCompletions(input: string): string[] {
+export function getCompletions(input: string): string[] | Promise<string[]> {
     const words = splitWords(input);
     const isFirstWord = words.length === 0 || (words.length === 1 && !input.endsWith(" ") && !input.endsWith("\t"));
     const current = isFirstWord ? (words[0] ?? "") : (input.endsWith(" ") || input.endsWith("\t") ? "" : (words[words.length - 1] ?? ""));
@@ -148,10 +148,9 @@ export function getCompletions(input: string): string[] {
     const prefixLen = input.length - current.length;
     const inputPrefix = input.slice(0, prefixLen);
 
-    let candidates: string[];
-
     if (isFirstWord) {
-        // Complete as a command name.
+        // Complete as a command name (always sync).
+        let candidates: string[];
         if (current.startsWith("@")) {
             candidates = listJsFunctions()
                 .map(f => "@" + f)
@@ -159,16 +158,22 @@ export function getCompletions(input: string): string[] {
         } else {
             candidates = completeCommand(current);
         }
-    } else {
-        const cmd = words[0] ?? "";
-        const handler = handlers.get(cmd);
-        if (handler) {
-            candidates = handler({ words, current });
-        } else {
-            // Default: file completion.
-            candidates = completeFile(current);
-        }
+        return candidates.map(c => inputPrefix + c);
     }
 
-    return candidates.map(c => inputPrefix + c);
+    const cmd = words[0] ?? "";
+    const handler = handlers.get(cmd);
+    if (handler) {
+        const result = handler({ words, current });
+        if (result && typeof (result as Promise<string[]>).then === "function") {
+            // Async handler — propagate the promise.
+            return (result as Promise<string[]>).then(
+                candidates => candidates.map(c => inputPrefix + c)
+            );
+        }
+        return (result as string[]).map(c => inputPrefix + c);
+    }
+
+    // Default: file completion (sync).
+    return completeFile(current).map(c => inputPrefix + c);
 }

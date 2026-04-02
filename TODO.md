@@ -247,6 +247,10 @@
 - [ ] **Keybind system** — C++ action table indexed by key enum, JS sets bindings via `jsh.bindKey("ctrl-a", "move-home")`. Custom JS callbacks for `"custom"` action. Default bindings built-in, user-overridable.
 - [ ] **Named internal widgets assignable to zones** — Allow JS to place built-in UI elements (e.g. search indicator, completion menu) into any zone via `jsh.addWidget("search-indicator", "footer")` with a name instead of a render function. The engine looks up "what zone is this element in?" and renders it there. This lets users control where Ctrl-R/Ctrl-S search text, completion candidates, etc. appear in the layout.
 
+### Testing
+
+- [ ] **Interactive terminal test framework** — Use `node-pty` + headless `xterm.js` to spawn jsh in a real PTY, send keystrokes, and assert against the virtual screen buffer. Enables testing widgets, cursor positioning, ghost text, multi-line rendering, Ctrl-R/Ctrl-S search, tab completion cycling, and other UI behavior that can't be verified via `spawnSync` + stdout capture.
+
 ### Technical debt
 
 - [ ] **Move remaining builtins to object map** — `read`, `source`, `.`, `eval`, `trap`, `return`, `command`, `break`, `continue`, `fg`, `bg`, `jobs`, `wait`, `select`, `time` are handled as special cases in `executeSimple` instead of the `builtins` map. Causes duplicate builtin name lists (executor `BUILTIN_NAMES` set and completion `BUILTINS_LIST`).

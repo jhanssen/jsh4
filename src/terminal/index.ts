@@ -28,7 +28,7 @@ interface NativeInputEngine {
     inputStart: (callbacks: {
         onRender: (state: InputState) => void;
         onLine: (line: string | null, errno?: number) => void;
-        onCompletion?: (input: string) => string[];
+        onCompletion?: (input: string) => string[] | Promise<string[]> | unknown;
     }) => void;
     inputStop: () => void;
     inputGetCols: () => number;
@@ -41,6 +41,7 @@ interface NativeInputEngine {
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
     inputInsertAtCursor: (text: string) => void;
+    inputSetCompletions: (entries: string[]) => void;
     inputEAGAIN: () => number;
 }
 
@@ -50,7 +51,7 @@ export class TerminalUI {
     private widgets: WidgetManager;
 
     private colorizeFn: ((input: string, context?: string) => string) | null = null;
-    private completionFn: ((input: string) => string[]) | null = null;
+    private completionFn: ((input: string) => string[] | Promise<string[]>) | null = null;
     private suggestionFn: ((input: string) => Promise<string | null>) | null = null;
     private lastState: InputState | null = null;
     private lineCallback: ((line: string | null, errno?: number) => void) | null = null;
@@ -102,7 +103,19 @@ export class TerminalUI {
             onRender: (state: InputState) => this.onRender(state),
             onLine: (line: string | null, errno?: number) => this.onLine(line, errno),
             onCompletion: this.completionFn
-                ? (input: string) => this.completionFn!(input)
+                ? (input: string) => {
+                    const result = this.completionFn!(input);
+                    if (result && typeof (result as Promise<string[]>).then === "function") {
+                        // Async: C++ will detect the promise and stop polling.
+                        // Chain .then to deliver results when ready.
+                        (result as Promise<string[]>).then(
+                            entries => this.native.inputSetCompletions(entries),
+                            () => this.native.inputSetCompletions([]),
+                        );
+                        return result; // Return the promise so C++ sees IsPromise()
+                    }
+                    return result; // Sync: return the array directly.
+                }
                 : undefined,
         });
     }
@@ -125,7 +138,7 @@ export class TerminalUI {
         this.colorizeFn = fn;
     }
 
-    setCompletion(fn: ((input: string) => string[]) | null): void {
+    setCompletion(fn: ((input: string) => string[] | Promise<string[]>) | null): void {
         this.completionFn = fn;
     }
 

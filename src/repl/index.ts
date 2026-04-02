@@ -25,7 +25,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputStart: (callbacks: {
         onRender: (state: { buf: string; pos: number; len: number; cols: number }) => void;
         onLine: (line: string | null, errno?: number) => void;
-        onCompletion?: (input: string) => string[];
+        onCompletion?: (input: string) => string[] | Promise<string[]> | unknown;
     }) => void;
     inputStop: () => void;
     inputGetCols: () => number;
@@ -38,6 +38,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
     inputInsertAtCursor: (text: string) => void;
+    inputSetCompletions: (entries: string[]) => void;
     inputEAGAIN: () => number;
 };
 

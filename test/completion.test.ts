@@ -89,4 +89,18 @@ describe("completion — user-defined handlers", () => {
         assert.ok(completions.includes("git pull"));
         assert.ok(!completions.includes("git add"));
     });
+
+    it("should support async handlers returning a promise", async () => {
+        registerCompletion("async-test", async (ctx) => {
+            // Simulate async work.
+            await new Promise(r => setTimeout(r, 10));
+            return ["one", "two", "three"].filter(s => s.startsWith(ctx.current));
+        });
+        const result = getCompletions("async-test t");
+        assert.ok(result instanceof Promise, "should return a Promise");
+        const completions = await result;
+        assert.ok(completions.includes("async-test two"));
+        assert.ok(completions.includes("async-test three"));
+        assert.ok(!completions.includes("async-test one"));
+    });
 });

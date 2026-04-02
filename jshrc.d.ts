@@ -349,12 +349,23 @@ declare const jsh: {
 
     /**
      * Register a tab completion handler for a command.
+     * Can return results synchronously or as a promise (async completions
+     * freeze the input briefly until results arrive).
+     *
      * @example
+     * // Sync completions
      * jsh.complete('git', (ctx) => {
      *     if (ctx.words.length === 2)
      *         return ['add','commit','push','pull','status'].filter(s => s.startsWith(ctx.current));
      *     return [];
      * });
+     *
+     * // Async completions (e.g., parsing --help output)
+     * jsh.complete('docker', async (ctx) => {
+     *     const { stdout } = await jsh.exec('docker --help 2>&1');
+     *     const cmds = stdout.match(/^\s+(\w+)/gm)?.map(s => s.trim()) ?? [];
+     *     return cmds.filter(c => c.startsWith(ctx.current));
+     * });
      */
-    complete(cmd: string, fn: (ctx: CompletionCtx) => string[]): void;
+    complete(cmd: string, fn: (ctx: CompletionCtx) => string[] | Promise<string[]>): void;
 };

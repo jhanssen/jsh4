@@ -272,6 +272,8 @@ struct InputState {
     bool active = false;
     int in_completion = 0;
     size_t completion_idx = 0;
+    bool waiting_for_completions = false; // true while async completions pending
+    std::vector<std::string> pending_completions; // set by inputSetCompletions
     // Reverse search (Ctrl-R)
     bool in_search = false;
     char search_query[256];
@@ -577,53 +579,68 @@ static void notifyRender() {
 
 // ---- Completion support ----------------------------------------------------
 
-struct Completions {
+static std::vector<std::string> extractCompletionArray(Napi::Array arr) {
     std::vector<std::string> entries;
-};
-
-static Completions doCompletion(InputState *s) {
-    Completions lc;
-    if (!g_ctx || g_ctx->onCompletion.IsEmpty()) return lc;
-    Napi::Env env = g_ctx->onCompletion.Env();
-    Napi::HandleScope scope(env);
-    Napi::Value result = g_ctx->onCompletion.Call({Napi::String::New(env, s->buf)});
-    if (result.IsArray()) {
-        Napi::Array arr = result.As<Napi::Array>();
-        for (uint32_t i = 0; i < arr.Length(); i++) {
-            Napi::Value item = arr.Get(i);
-            if (item.IsString()) lc.entries.push_back(item.As<Napi::String>().Utf8Value());
-        }
+    for (uint32_t i = 0; i < arr.Length(); i++) {
+        Napi::Value item = arr.Get(i);
+        if (item.IsString()) entries.push_back(item.As<Napi::String>().Utf8Value());
     }
-    return lc;
+    return entries;
 }
 
-static int completeLine(InputState *s, char c) {
-    Completions lc = doCompletion(s);
-    if (lc.entries.empty()) return c; // No completions, pass char through
+// Apply completions to the buffer (TAB cycling).
+static void applyCompletions(InputState *s, const std::vector<std::string> &entries) {
+    if (entries.empty()) return;
 
-    if (c == 9) { // TAB
-        if (!s->in_completion) {
-            s->in_completion = 1;
-            s->completion_idx = 0;
-        } else {
-            s->completion_idx = (s->completion_idx + 1) % (lc.entries.size() + 1);
-        }
-
-        if (s->completion_idx == lc.entries.size()) {
-            // Cycled back to original
-            // Leave buffer as-is
-        } else {
-            // Replace buffer with completion
-            const std::string &entry = lc.entries[s->completion_idx];
-            strncpy(s->buf, entry.c_str(), s->buflen);
-            s->buf[s->buflen] = '\0';
-            s->len = s->pos = strlen(s->buf);
-        }
-        notifyRender();
-        return 0; // Consumed
+    if (!s->in_completion) {
+        s->in_completion = 1;
+        s->completion_idx = 0;
+    } else {
+        s->completion_idx = (s->completion_idx + 1) % (entries.size() + 1);
     }
 
-    // Non-TAB while in completion: accept current completion and process char
+    if (s->completion_idx == entries.size()) {
+        // Cycled back to original — leave buffer as-is.
+    } else {
+        const std::string &entry = entries[s->completion_idx];
+        strncpy(s->buf, entry.c_str(), s->buflen);
+        s->buf[s->buflen] = '\0';
+        s->len = s->pos = strlen(s->buf);
+    }
+    notifyRender();
+}
+
+// Returns: 0 = consumed (sync completions applied or async started),
+//          c = pass through (no completions or non-TAB accepted).
+static int completeLine(InputState *s, char c) {
+    if (!g_ctx || g_ctx->onCompletion.IsEmpty()) return c;
+
+    if (c == 9) { // TAB
+        // Call the JS completion callback.
+        Napi::Env env = g_ctx->onCompletion.Env();
+        Napi::HandleScope scope(env);
+        Napi::Value result = g_ctx->onCompletion.Call({Napi::String::New(env, s->buf)});
+
+        if (result.IsArray()) {
+            // Sync: got results immediately.
+            auto entries = extractCompletionArray(result.As<Napi::Array>());
+            if (entries.empty()) return c;
+            applyCompletions(s, entries);
+            return 0;
+        }
+        if (result.IsPromise()) {
+            // Async: stop polling, wait for results.
+            s->waiting_for_completions = true;
+            if (g_ctx->poll) {
+                uv_poll_stop(g_ctx->poll);
+            }
+            // JS will call inputSetCompletions when the promise resolves.
+            return 0;
+        }
+        return c; // No results.
+    }
+
+    // Non-TAB while in completion: accept current completion and process char.
     s->in_completion = 0;
     return c;
 }
@@ -1211,6 +1228,30 @@ static Napi::Value SetInput(const Napi::CallbackInfo &info) {
     return env.Undefined();
 }
 
+static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (!g_state.waiting_for_completions) return env.Undefined();
+    g_state.waiting_for_completions = false;
+
+    // Extract completion entries.
+    std::vector<std::string> entries;
+    if (info.Length() > 0 && info[0].IsArray()) {
+        entries = extractCompletionArray(info[0].As<Napi::Array>());
+    }
+
+    // Apply completions.
+    if (!entries.empty()) {
+        applyCompletions(&g_state, entries);
+    }
+
+    // Resume stdin polling.
+    if (g_ctx && g_ctx->poll && g_state.active) {
+        uv_poll_start(g_ctx->poll, UV_READABLE, pollCallback);
+    }
+
+    return env.Undefined();
+}
+
 static Napi::Value InsertAtCursor(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsString()) return env.Undefined();
@@ -1301,8 +1342,9 @@ Napi::Object InitInputEngine(Napi::Env env, Napi::Object exports) {
     exports.Set("inputHistorySave",   Napi::Function::New(env, HistorySave));
     exports.Set("inputHistoryLoad",   Napi::Function::New(env, HistoryLoad));
     exports.Set("inputSetSuggestion", Napi::Function::New(env, SetSuggestion));
-    exports.Set("inputSetInput",     Napi::Function::New(env, SetInput));
+    exports.Set("inputSetInput",       Napi::Function::New(env, SetInput));
     exports.Set("inputInsertAtCursor", Napi::Function::New(env, InsertAtCursor));
+    exports.Set("inputSetCompletions", Napi::Function::New(env, SetCompletions));
     exports.Set("inputEAGAIN",        Napi::Function::New(env, GetEAGAIN));
     // Fd utilities (previously in linenoise.cc)
     exports.Set("closeFd",            Napi::Function::New(env, CloseFd));
