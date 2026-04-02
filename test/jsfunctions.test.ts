@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { parse } from "../src/parser/index.js";
 import type { JsFunction } from "../src/parser/index.js";
-import { registerJsFunction } from "../src/jsfunctions/index.js";
+import { registerJsFunction, lookupJsFunction } from "../src/jsfunctions/index.js";
 
 const require = createRequire(import.meta.url);
 
@@ -110,8 +110,9 @@ describe("@ syntax — inline execution", () => {
     });
 
     it("should handle console.log in @{ } without error", () => {
-        const { stderr } = runFull('@{ console.log("test") }');
-        assert.ok(!stderr.includes("not a function"));
+        const { stdout, stderr } = runFull('@{ console.log("test") }');
+        assert.strictEqual(stdout, "test");
+        assert.strictEqual(stderr, "");
     });
 
     it("should add newline to terminal output from function return", () => {
@@ -138,37 +139,31 @@ describe("@ syntax — inline execution", () => {
 });
 
 describe("@ syntax — named functions via .jshrc", () => {
-    it("should call a registered function", () => {
-        // Register in-process for the parser test; execution tests use subprocess
+    it("should register and lookup a function", () => {
         registerJsFunction("__test_upper", async function* (_args, stdin) {
-            if (!stdin) return;
             for await (const line of stdin as AsyncIterable<string>) {
                 yield line.trimEnd().toUpperCase() + "\n";
             }
         });
-        // Verify it's registered
-        const { lookupJsFunction } = require("../build/Release/jsh_native.node") as never;
-        void lookupJsFunction; // just verify registration works via direct test
-        assert.ok(true);
+        const fn = lookupJsFunction("__test_upper");
+        assert.ok(fn, "registered function should be retrievable");
+        assert.strictEqual(typeof fn, "function");
     });
 
     it("should work with named function via temp file", () => {
-        const rc = `/tmp/jsh_test_rc_${Date.now()}.js`;
+        const rc = `/tmp/jsh_test_rc_${Date.now()}.mjs`;
         require("fs").writeFileSync(rc, `
-registerJsFunction('upper2', async function*(args, stdin) {
+export async function* upper2(args, stdin) {
     for await (const l of stdin) yield l.trimEnd().toUpperCase() + '\\n';
-});
+}
 `);
         try {
-            const r = spawnSync("node", ["dist/index.js"], {
+            const r = spawnSync("node", ["dist/index.js", "--jshrc", rc], {
                 input: "echo hello | @upper2\nexit\n",
                 encoding: "utf8",
                 cwd: process.cwd(),
-                env: { ...process.env, HOME: require("path").dirname(rc), JSHRC: rc },
             });
-            // Can't easily override HOME for .jshrc path without more plumbing.
-            // Just verify the parser/executor path is correct by checking the subprocess ran.
-            assert.strictEqual(r.status, 0);
+            assert.strictEqual(r.stdout.trim(), "HELLO");
         } finally {
             try { require("fs").unlinkSync(rc); } catch {}
         }

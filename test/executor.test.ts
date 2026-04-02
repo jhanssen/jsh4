@@ -459,7 +459,8 @@ describe("executor — set builtin", () => {
         assert.ok(r.stderr.includes("unbound variable"), `expected error, got stderr: ${r.stderr}`);
     });
     it("should enable pipefail with set -o pipefail", () => {
-        assert.strictEqual(ec("set -o pipefail"), 0);
+        // Verify pipefail actually changes behavior — not just that set accepts the flag.
+        assert.strictEqual(ec("set -o pipefail; false | true"), 1);
     });
     it("should combine short flags", () => {
         assert.strictEqual(run("set -eu\nset +eu\necho ok"), "ok");
@@ -615,8 +616,13 @@ describe("executor — subshells", () => {
     });
 
     it("should isolate shell options", () => {
-        // set -x inside subshell should not persist outside
-        assert.strictEqual(run("(set -x; true); echo ok"), "ok");
+        // set -x inside subshell should not persist outside.
+        // Verify xtrace output (stderr) only appears for the subshell command, not the outer echo.
+        const { stdout, stderr } = runFull("(set -x; echo inner); echo outer");
+        assert.strictEqual(stdout, "inner\nouter");
+        // stderr should contain xtrace for "echo inner" but NOT for "echo outer"
+        assert.match(stderr, /\+ echo inner/);
+        assert.ok(!stderr.includes("+ echo outer"), "xtrace should not leak out of subshell");
     });
 
     it("should support pipelines in subshells", () => {
@@ -1078,7 +1084,7 @@ describe("executor — echo flags", () => {
         assert.strictEqual(run('echo -E "a\\tb"'), "a\\tb");
     });
 
-    it("should handle -- as end of flags", () => {
+    it("should suppress newline with -n and no argument", () => {
         assert.strictEqual(run("echo -n"), "");
     });
 
@@ -1511,6 +1517,95 @@ describe("executor — exec with redirections", () => {
         // but the file should have the content
         const content = run(`cat ${f}`);
         assert.strictEqual(content, "hello\nworld");
+    });
+});
+
+describe("executor — variable expansion colon distinction", () => {
+    it("${VAR:-default} should use default for empty", () => {
+        assert.strictEqual(run('X=""; echo ${X:-fallback}'), "fallback");
+    });
+
+    it("${VAR-default} should keep empty value", () => {
+        assert.strictEqual(run('X=""; echo ${X-fallback}'), "");
+    });
+
+    it("${VAR-default} should use default for unset", () => {
+        assert.strictEqual(run('unset X; echo ${X-fallback}'), "fallback");
+    });
+
+    it("${VAR:+alt} should return empty for empty value", () => {
+        assert.strictEqual(run('X=""; echo ${X:+alt}'), "");
+    });
+
+    it("${VAR+alt} should return alt for empty value", () => {
+        assert.strictEqual(run('X=""; echo ${X+alt}'), "alt");
+    });
+
+    it("${VAR:-$OTHER} should expand variable in operand", () => {
+        assert.strictEqual(run('OTHER=world; unset X; echo ${X:-$OTHER}'), "world");
+    });
+});
+
+describe("executor — arithmetic == vs =", () => {
+    it("$((x==5)) should compare, not assign", () => {
+        assert.strictEqual(run('x=5; echo $((x==5))'), "1");
+    });
+
+    it("$((x==3)) should return 0 for mismatch", () => {
+        assert.strictEqual(run('x=5; echo $((x==3))'), "0");
+    });
+
+    it("$((x!=5)) should return 0 for match", () => {
+        assert.strictEqual(run('x=5; echo $((x!=5))'), "0");
+    });
+
+    it("$((x=5)) should still assign", () => {
+        assert.strictEqual(run('x=0; echo $((x=5)); echo $x'), "5\n5");
+    });
+});
+
+describe("executor — exit uses $?", () => {
+    it("should exit with last command status", () => {
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: "false\nexit\n",
+            encoding: "utf8",
+        });
+        assert.strictEqual(r.status, 1);
+    });
+
+    it("should exit with explicit code", () => {
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: "exit 42\n",
+            encoding: "utf8",
+        });
+        assert.strictEqual(r.status, 42);
+    });
+});
+
+describe("executor — readonly sets exit code", () => {
+    it("should set $? to 1 on readonly violation", () => {
+        const { stdout, stderr } = runFull("readonly X=1; X=2; echo $?");
+        assert.match(stderr, /readonly/);
+        assert.strictEqual(stdout, "1");
+    });
+});
+
+describe("executor — unset -f", () => {
+    it("should remove a shell function", () => {
+        assert.strictEqual(run("myfn() { echo hello; }; myfn; unset -f myfn; myfn 2>/dev/null; echo $?"), "hello\n127");
+    });
+});
+
+describe("executor — $PPID readonly", () => {
+    it("should not allow assignment", () => {
+        const { stderr } = runFull("PPID=42");
+        assert.match(stderr, /readonly/);
+    });
+});
+
+describe("executor — for without in", () => {
+    it("should iterate positional params", () => {
+        assert.strictEqual(run('f() { for x; do echo $x; done; }; f a b c'), "a\nb\nc");
     });
 });
 

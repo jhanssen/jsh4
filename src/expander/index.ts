@@ -491,20 +491,37 @@ function expandVariable(seg: VariableExpansion): string {
     }
 
     switch (seg.operator) {
-        case ":-": case "-":
+        case ":-":
             return (val !== undefined && val !== "") ? val : expandOperand(seg);
-        case ":+": case "+":
+        case "-":
+            return val !== undefined ? val : expandOperand(seg);
+        case ":+":
             return (val !== undefined && val !== "") ? expandOperand(seg) : "";
-        case ":=": case "=":
+        case "+":
+            return val !== undefined ? expandOperand(seg) : "";
+        case ":=":
             if (val === undefined || val === "") {
                 const def = expandOperand(seg);
                 $[seg.name] = def;
                 return def;
             }
             return val;
-        case ":?": case "?": {
+        case "=":
+            if (val === undefined) {
+                const def = expandOperand(seg);
+                $[seg.name] = def;
+                return def;
+            }
+            return val;
+        case ":?": {
             if (val === undefined || val === "") {
                 throw new Error(expandOperand(seg) || `${seg.name}: parameter null or not set`);
+            }
+            return val;
+        }
+        case "?": {
+            if (val === undefined) {
+                throw new Error(expandOperand(seg) || `${seg.name}: parameter not set`);
             }
             return val;
         }
@@ -613,7 +630,8 @@ export function evalArithmetic(expr: string): string {
     let e = expr;
 
     // Handle assignment operators: VAR=expr, VAR+=expr, VAR-=expr, VAR*=expr, VAR/=expr, VAR%=expr
-    const assignMatch = e.match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([-+*/%]?)=\s*(.+)$/);
+    // Negative lookahead (?!=) prevents matching == as assignment.
+    const assignMatch = e.match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([-+*/%]?)=(?!=)\s*(.+)$/);
     if (assignMatch && assignMatch[2] !== "=") {
         const [, name, op, rhs] = assignMatch as [string, string, string, string];
         const rhsVal = Number(evalArithmetic(rhs));
@@ -700,8 +718,17 @@ function matchGlobSimple(str: string, pattern: string): boolean {
 function expandOperand(seg: VariableExpansion): string {
     if (!seg.operand) return "";
     return seg.operand.map(s => {
-        if (s.type === "Literal")      return (s as LiteralSegment).value;
-        if (s.type === "SingleQuoted") return (s as SingleQuotedSegment).value;
+        if (s.type === "Literal")           return (s as LiteralSegment).value;
+        if (s.type === "SingleQuoted")      return (s as SingleQuotedSegment).value;
+        if (s.type === "VariableExpansion")  return expandVariable(s as VariableExpansion);
+        if (s.type === "ArithmeticExpansion") return evalArithmetic((s as { expression: string }).expression);
+        if (s.type === "DoubleQuoted") {
+            return (s as DoubleQuotedSegment).segments.map(inner => {
+                if (inner.type === "Literal")           return (inner as LiteralSegment).value;
+                if (inner.type === "VariableExpansion")  return expandVariable(inner as VariableExpansion);
+                return "";
+            }).join("");
+        }
         return "";
     }).join("");
 }

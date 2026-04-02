@@ -32,12 +32,21 @@ static size_t utf8PrevCharLen(const char *buf, size_t pos) {
     return pos - i;
 }
 
-static uint32_t utf8DecodeChar(const char *s, size_t *clen) {
+static uint32_t utf8DecodeChar(const char *s, size_t *clen, size_t avail = 4) {
     unsigned char c = s[0];
     if (c < 0x80) { *clen = 1; return c; }
-    if (c < 0xE0) { *clen = 2; return ((c & 0x1F) << 6) | (s[1] & 0x3F); }
-    if (c < 0xF0) { *clen = 3; return ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); }
+    if (c < 0xE0) {
+        *clen = 2;
+        if (avail < 2) { *clen = 1; return 0xFFFD; }
+        return ((c & 0x1F) << 6) | (s[1] & 0x3F);
+    }
+    if (c < 0xF0) {
+        *clen = 3;
+        if (avail < 3) { *clen = 1; return 0xFFFD; }
+        return ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+    }
     *clen = 4;
+    if (avail < 4) { *clen = 1; return 0xFFFD; }
     return ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
 }
 
@@ -78,7 +87,7 @@ static size_t utf8StrWidth(const char *s, size_t len) {
     size_t width = 0, i = 0;
     while (i < len) {
         size_t clen;
-        uint32_t cp = utf8DecodeChar(s + i, &clen);
+        uint32_t cp = utf8DecodeChar(s + i, &clen, len - i);
         width += utf8CharWidth(cp);
         i += clen;
     }
@@ -105,7 +114,7 @@ static size_t utf8StrWidthAnsi(const char *s, size_t len) {
             continue;
         }
         size_t clen;
-        uint32_t cp = utf8DecodeChar(s + i, &clen);
+        uint32_t cp = utf8DecodeChar(s + i, &clen, len - i);
         width += utf8CharWidth(cp);
         i += clen;
     }
@@ -355,7 +364,8 @@ static bool editMoveUp(InputState *s) {
     size_t w = 0;
     while (i < prevLineEnd) {
         size_t clen = utf8NextCharLen(s->buf, i, prevLineEnd);
-        int cw = utf8CharWidth(utf8DecodeChar(s->buf + i, &clen));
+        size_t avail = prevLineEnd - i;
+        int cw = utf8CharWidth(utf8DecodeChar(s->buf + i, &clen, avail));
         if (w + cw > col) break;
         w += cw;
         i += clen;
@@ -379,7 +389,8 @@ static bool editMoveDown(InputState *s) {
     size_t w = 0;
     while (i < nextLineEnd) {
         size_t clen = utf8NextCharLen(s->buf, i, nextLineEnd);
-        int cw = utf8CharWidth(utf8DecodeChar(s->buf + i, &clen));
+        size_t avail = nextLineEnd - i;
+        int cw = utf8CharWidth(utf8DecodeChar(s->buf + i, &clen, avail));
         if (w + cw > col) break;
         w += cw;
         i += clen;
@@ -636,6 +647,11 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         return 1;
 
     case CTRL_C:
+        // Remove temp history entry (same as ENTER and Ctrl-D paths).
+        if (history_len > 0) {
+            history_len--;
+            free(history[history_len]);
+        }
         *out_errno = EAGAIN;
         return -1;
 
@@ -758,10 +774,15 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         char utf8[4];
         int utf8len = utf8ByteLen(static_cast<unsigned char>(c));
         utf8[0] = c;
+        int actual = 1;
         for (int i = 1; i < utf8len; i++) {
             if (read(s->ifd, utf8+i, 1) != 1) break;
+            actual++;
         }
-        editInsert(s, utf8, utf8len);
+        if (actual == utf8len) {
+            editInsert(s, utf8, utf8len);
+        }
+        // Drop incomplete sequences silently.
         notifyRender();
         break;
     }
@@ -942,7 +963,7 @@ static Napi::Value InputRenderLine(const Napi::CallbackInfo &info) {
     size_t skipWidth = 0;
     while (pwidth + poscol - skipWidth >= (size_t)cols) {
         size_t clen = utf8NextCharLen(rawBuf, skipBytes, rawLen);
-        int cwidth = utf8CharWidth(utf8DecodeChar(rawBuf + skipBytes, &clen));
+        int cwidth = utf8CharWidth(utf8DecodeChar(rawBuf + skipBytes, &clen, rawLen - skipBytes));
         skipBytes += clen;
         skipWidth += cwidth;
     }
@@ -954,7 +975,7 @@ static Napi::Value InputRenderLine(const Napi::CallbackInfo &info) {
     while (pwidth + lencol > (size_t)cols) {
         size_t clen = utf8PrevCharLen(rawBuf + skipBytes, displayLen);
         int cw;
-        { size_t cl; cw = utf8CharWidth(utf8DecodeChar(rawBuf + skipBytes + displayLen - clen, &cl)); }
+        { size_t cl; cw = utf8CharWidth(utf8DecodeChar(rawBuf + skipBytes + displayLen - clen, &cl, clen)); }
         displayLen -= clen;
         lencol -= cw;
     }

@@ -214,7 +214,15 @@ static void processWait(WaitRequest* req) {
     req->ctx->pgid = req->pgid;
     for (size_t i = 0; i < req->pids.size(); i++) {
         int status = 0;
-        waitpid(req->pids[i], &status, waitFlags);
+        pid_t w;
+        do {
+            w = waitpid(req->pids[i], &status, waitFlags);
+        } while (w == -1 && errno == EINTR);
+        if (w == -1) {
+            // Process already reaped or doesn't exist — skip.
+            req->ctx->pipeStatus[i] = 127;
+            continue;
+        }
         if (WIFSTOPPED(status)) {
             req->ctx->stopped = true;
             req->ctx->stoppedSignal = WSTOPSIG(status);
@@ -415,7 +423,8 @@ struct ExecutorState {
                 // wait for any we already forked.
                 for (pid_t p : pids) {
                     int st = 0;
-                    waitpid(p, &st, 0);
+                    pid_t w;
+                    do { w = waitpid(p, &st, 0); } while (w == -1 && errno == EINTR);
                 }
                 // close already-opened pipe fds
                 for (int j = 0; j < i && j < n - 1; j++) {
@@ -470,7 +479,9 @@ struct ExecutorState {
         req->ctx->pipeStatus.resize(pids.size(), 0);
         for (size_t i = 0; i < pids.size(); i++) {
             int status = 0;
-            waitpid(pids[i], &status, waitFlags);
+            pid_t w;
+            do { w = waitpid(pids[i], &status, waitFlags); } while (w == -1 && errno == EINTR);
+            if (w == -1) { req->ctx->pipeStatus[i] = 127; continue; }
             if (WIFSTOPPED(status)) {
                 // Job was stopped (Ctrl-Z). All processes in the group
                 // received SIGTSTP — break immediately.

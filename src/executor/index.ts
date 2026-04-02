@@ -13,7 +13,7 @@ import type {
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl, registerProcessSubstImpl, evalArithmetic } from "../expander/index.js";
-import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot, declareReadonly, getReadonlyVars } from "../variables/index.js";
+import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot, declareReadonly, isReadonly, getReadonlyVars } from "../variables/index.js";
 import { pushParams, popParams, shiftParams, setParams, snapshotParams, restoreParams, getAllParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { getAlias } from "../api/index.js";
@@ -431,6 +431,10 @@ async function captureAst(node: ASTNode): Promise<string> {
 
 async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     for (const a of cmd.assignments) {
+        if (isReadonly(a.name)) {
+            process.stderr.write(`jsh: ${a.name}: readonly variable\n`);
+            return { exitCode: 1 };
+        }
         if (a.array) {
             // Array assignment: name=(word1 word2 ...)
             const elements: string[] = [];
@@ -562,12 +566,9 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
                 process.stdout.write(name + "\n");
                 return { exitCode: 0 };
             }
-            // Check PATH — try to resolve via which
-            try {
-                const { execSync } = require("node:child_process") as typeof import("node:child_process");
-                const result = execSync(`which ${name} 2>/dev/null`, { encoding: "utf8" }).trim();
-                if (result) { process.stdout.write(result + "\n"); return { exitCode: 0 }; }
-            } catch {}
+            // Check PATH
+            const resolved = findInPath(name);
+            if (resolved) { process.stdout.write(resolved + "\n"); return { exitCode: 0 }; }
             return { exitCode: 1 };
         }
         // command NAME ARGS — run NAME bypassing functions and aliases
@@ -586,7 +587,7 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
 
     // exit — run EXIT trap before exiting
     if (command === "exit") {
-        const code = args[0] !== undefined ? parseInt(args[0], 10) : 0;
+        const code = args[0] !== undefined ? parseInt(args[0], 10) : Number($["?"] ?? 0);
         await runTrap("EXIT", executeString);
         process.exit(isNaN(code) ? 0 : code);
     }
@@ -640,6 +641,16 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
                 case "<&": {
                     const dstFd = parseInt(r.target, 10);
                     native.dup2Fd(dstFd, r.fd >= 0 ? r.fd : 0);
+                    break;
+                }
+                case "&>": case "&>>": {
+                    const flags = r.op === "&>"
+                        ? fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC
+                        : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
+                    const fileFd = openSync(r.target, flags, 0o666);
+                    native.dup2Fd(fileFd, 1);
+                    native.dup2Fd(fileFd, 2);
+                    native.closeFd(fileFd);
                     break;
                 }
             }
@@ -1449,7 +1460,8 @@ async function executeWhile(node: WhileClause): Promise<ExecResult> {
 }
 
 async function executeFor(node: ForClause): Promise<ExecResult> {
-    const itemArrays = node.items ? await Promise.all(node.items.map(expandWord)) : [];
+    // When no items specified (for VAR; do...done), iterate positional params.
+    const itemArrays = node.items ? await Promise.all(node.items.map(expandWord)) : [getAllParams()];
     const items = itemArrays.flat();
     let last: ExecResult = { exitCode: 0 };
     for (const item of items) {
@@ -1476,7 +1488,7 @@ async function executeArithmeticFor(node: ArithmeticFor): Promise<ExecResult> {
     const evalArith = (expr: string): number => {
         if (!expr.trim()) return 1; // Empty condition = true
         // Handle assignment operators: VAR=expr, VAR+=expr etc.
-        const assignMatch = expr.match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([-+*/%]?)=\s*(.+)$/);
+        const assignMatch = expr.match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([-+*/%]?)=(?!=)\s*(.+)$/);
         if (assignMatch && assignMatch[2] !== "=") {
             const [, name, op, rhs] = assignMatch as [string, string, string, string];
             const rhsVal = evalArith(rhs);
@@ -2468,7 +2480,17 @@ const builtins: Record<string, Builtin> = {
         }
         return { exitCode: 0 };
     }},
-    unset:    { external: false, run(args) { for (const a of args) delete $[a]; return { exitCode: 0 }; }},
+    unset:    { external: false, run(args) {
+        let mode: "v" | "f" = "v";
+        let startIdx = 0;
+        if (args[0] === "-f") { mode = "f"; startIdx = 1; }
+        else if (args[0] === "-v") { startIdx = 1; }
+        for (let i = startIdx; i < args.length; i++) {
+            if (mode === "f") { shellFunctions.delete(args[i]!); }
+            else { delete $[args[i]!]; }
+        }
+        return { exitCode: 0 };
+    }},
     true:     { external: true,  run() { return { exitCode: 0 }; }},
     false:    { external: true,  run() { return { exitCode: 1 }; }},
     echo: { external: true, run(args) {

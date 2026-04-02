@@ -7,7 +7,7 @@ for (const [key, value] of Object.entries(process.env)) {
     }
 }
 
-// Set PPID (parent PID) — readonly.
+// Set PPID (parent PID).
 store.set("PPID", String(process.ppid));
 
 // ---- local variable scoping -------------------------------------------------
@@ -67,7 +67,7 @@ export function declareLocal(name: string): void {
 }
 
 // ---- readonly variables -----------------------------------------------------
-const readonlySet = new Set<string>();
+const readonlySet = new Set<string>(["PPID"]);
 
 export function declareReadonly(name: string, value?: unknown): void {
     if (value !== undefined) store.set(name, value);
