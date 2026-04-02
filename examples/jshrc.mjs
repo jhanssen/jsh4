@@ -108,8 +108,8 @@ jsh.setSuggestion(async (input) => {
 
 // ---- Tab Completion --------------------------------------------------------
 
-import { gitCompletions } from 'jsh/completions/git';
-import { npmCompletions } from 'jsh/completions/npm';
+import { gitCompletions } from 'jsh/share/completions/git';
+import { npmCompletions } from 'jsh/share/completions/npm';
 gitCompletions(jsh);
 npmCompletions(jsh);
 

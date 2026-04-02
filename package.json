@@ -7,14 +7,14 @@
   "exports": {
     ".": "./dist/index.js",
     "./api": "./dist/api/index.js",
-    "./completions/git": "./dist/completions/git.js",
-    "./completions/npm": "./dist/completions/npm.js"
+    "./share/completions/git": "./dist/share/completions/git.js",
+    "./share/completions/npm": "./dist/share/completions/npm.js"
   },
   "engines": {
     "node": ">=22.17.0"
   },
   "scripts": {
-    "build:ts": "tsc",
+    "build:ts": "tsc && tsc -p share/tsconfig.json",
     "build:native": "cmake-js compile",
     "build": "npm run build:ts && npm run build:native",
     "test": "node --import tsx --test test/*.test.ts"
