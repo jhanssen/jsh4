@@ -246,7 +246,8 @@
 
 - [ ] **Keybind system** — C++ action table indexed by key enum, JS sets bindings via `jsh.bindKey("ctrl-a", "move-home")`. Custom JS callbacks for `"custom"` action. Default bindings built-in, user-overridable.
 - [ ] **Named internal widgets assignable to zones** — Allow JS to place built-in UI elements (e.g. search indicator, completion menu) into any zone via `jsh.addWidget("search-indicator", "footer")` with a name instead of a render function. The engine looks up "what zone is this element in?" and renders it there. This lets users control where Ctrl-R/Ctrl-S search text, completion candidates, etc. appear in the layout.
-- [ ] **OSC 133 marks with header widgets** — Currently iTerm2 shows the prompt chevron on both the header line and the input line when header widgets are present. The renderer redraws all rows on every frame update (including cursor-up movements through the header), which confuses iTerm2's row association for OSC 133 marks. Investigate iTerm2 source code (GitHub: gnachman/iTerm2, VT100 parser) to understand how it tracks mark positions during cursor movement.
+- [ ] **OSC 133 marks with header widgets** — Currently iTerm2 shows the prompt chevron on both the header line and the input line when header widgets are present. The renderer redraws all rows on every frame update (including cursor-up movements through the header), which confuses iTerm2's row association for OSC 133 marks. Investigate iTerm2 source code (GitHub: gnachman/iTerm2, VT100 parser) to understand how it tracks mark positions during cursor movement. Possible fix: lock widget line counts at session start so frame geometry is stable and the input line row is known.
+- [ ] **Dynamic overlay widgets** — Support popup menus (completion candidates, context menus) as overlays that don't affect the primary frame geometry. Needed if widget sizes are locked for OSC 133 compatibility.
 
 ### Testing
 
