@@ -600,6 +600,13 @@ export class Lexer {
                     operand = this.readBraceOperand();
                     return { type: "VariableExpansion", name, index, operator, operand };
                 }
+                // Substring: ${VAR:offset} or ${VAR:offset:length}
+                if (next === "}" || /[0-9 (+-]/.test(next)) {
+                    operator = ":";
+                    this.pos++; // skip :
+                    operand = this.readBraceOperand();
+                    return { type: "VariableExpansion", name, index, operator, operand };
+                }
             }
             if ((ch === "%" || ch === "#") && name.length > 0) {
                 if (this.pos + 1 < this.input.length && this.input[this.pos + 1] === ch) {

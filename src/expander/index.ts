@@ -433,6 +433,13 @@ function expandVariable(seg: VariableExpansion): string {
     if (seg.name === "#") return String(getParamCount());
     if (seg.name === "@" || seg.name === "*") return getAllParams().join(" ");
 
+    // ${#VAR} — length of variable value
+    if (seg.name.startsWith("#") && !seg.operator) {
+        const realName = seg.name.slice(1);
+        const v = $[realName];
+        return String(v !== undefined ? String(v).length : 0);
+    }
+
     const { val } = resolveVariable(seg);
     if (!seg.operator) {
         if (val === undefined && shellOpts.nounset) {
@@ -459,7 +466,103 @@ function expandVariable(seg: VariableExpansion): string {
             }
             return val;
         }
-        case "#": return String((val ?? "").length);
+        case "#": {
+            // Shortest prefix removal: ${VAR#pattern}
+            const pat = expandOperand(seg);
+            const str = val ?? "";
+            for (let i = 0; i <= str.length; i++) {
+                if (matchGlobSimple(str.slice(0, i), pat)) return str.slice(i);
+            }
+            return str;
+        }
+        // Pattern removal
+        case "##": {
+            const pat = expandOperand(seg);
+            const str = val ?? "";
+            // Greedy prefix removal
+            for (let i = str.length; i >= 0; i--) {
+                if (matchGlobSimple(str.slice(0, i), pat)) return str.slice(i);
+            }
+            return str;
+        }
+        case "%": {
+            const pat = expandOperand(seg);
+            const str = val ?? "";
+            // Shortest suffix removal
+            for (let i = str.length; i >= 0; i--) {
+                if (matchGlobSimple(str.slice(i), pat)) return str.slice(0, i);
+            }
+            return str;
+        }
+        case "%%": {
+            const pat = expandOperand(seg);
+            const str = val ?? "";
+            // Greedy suffix removal
+            for (let i = 0; i <= str.length; i++) {
+                if (matchGlobSimple(str.slice(i), pat)) return str.slice(0, i);
+            }
+            return str;
+        }
+        // Search/replace
+        case "/": {
+            const operandStr = expandOperand(seg);
+            const sepIdx = operandStr.indexOf("/");
+            const pat = sepIdx >= 0 ? operandStr.slice(0, sepIdx) : operandStr;
+            const rep = sepIdx >= 0 ? operandStr.slice(sepIdx + 1) : "";
+            const str = val ?? "";
+            // First match only
+            for (let i = 0; i < str.length; i++) {
+                for (let j = i + 1; j <= str.length; j++) {
+                    if (matchGlobSimple(str.slice(i, j), pat)) {
+                        return str.slice(0, i) + rep + str.slice(j);
+                    }
+                }
+            }
+            return str;
+        }
+        case "//": {
+            const operandStr = expandOperand(seg);
+            const sepIdx = operandStr.indexOf("/");
+            const pat = sepIdx >= 0 ? operandStr.slice(0, sepIdx) : operandStr;
+            const rep = sepIdx >= 0 ? operandStr.slice(sepIdx + 1) : "";
+            let str = val ?? "";
+            let result = "";
+            let i = 0;
+            while (i < str.length) {
+                let matched = false;
+                for (let j = i + 1; j <= str.length; j++) {
+                    if (matchGlobSimple(str.slice(i, j), pat)) {
+                        result += rep;
+                        i = j;
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) { result += str[i]; i++; }
+            }
+            return result;
+        }
+        // Case modification
+        case "^": return (val ?? "").length > 0 ? (val ?? "")[0]!.toUpperCase() + (val ?? "").slice(1) : "";
+        case "^^": return (val ?? "").toUpperCase();
+        case ",": return (val ?? "").length > 0 ? (val ?? "")[0]!.toLowerCase() + (val ?? "").slice(1) : "";
+        case ",,": return (val ?? "").toLowerCase();
+        // Substring: ${VAR:offset} or ${VAR:offset:length}
+        case ":": {
+            const operandStr = expandOperand(seg);
+            const parts = operandStr.split(":");
+            const str = val ?? "";
+            let offset = parseInt(parts[0] ?? "0", 10);
+            if (isNaN(offset)) offset = 0;
+            if (offset < 0) offset = Math.max(0, str.length + offset);
+            if (parts.length > 1) {
+                let length = parseInt(parts[1] ?? "0", 10);
+                if (isNaN(length)) length = 0;
+                if (length < 0) length = Math.max(0, str.length + length - offset);
+                return str.slice(offset, offset + length);
+            }
+            return str.slice(offset);
+        }
         default:  return val ?? "";
     }
 }
@@ -531,6 +634,25 @@ function evalArithmetic(expr: string): string {
         process.stderr.write(`jsh: arithmetic: ${expr}: syntax error\n`);
         return "0";
     }
+}
+
+function matchGlobSimple(str: string, pattern: string): boolean {
+    // Simple glob matching for ${VAR#pattern} etc. Supports * and ?
+    let si = 0, pi = 0;
+    let starSi = -1, starPi = -1;
+    while (si < str.length) {
+        if (pi < pattern.length && (pattern[pi] === "?" || pattern[pi] === str[si])) {
+            si++; pi++;
+        } else if (pi < pattern.length && pattern[pi] === "*") {
+            starPi = pi; starSi = si; pi++;
+        } else if (starPi >= 0) {
+            pi = starPi + 1; starSi++; si = starSi;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pattern.length && pattern[pi] === "*") pi++;
+    return pi === pattern.length;
 }
 
 function expandOperand(seg: VariableExpansion): string {

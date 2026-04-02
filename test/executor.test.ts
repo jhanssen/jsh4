@@ -1086,3 +1086,102 @@ describe("executor — echo flags", () => {
         assert.strictEqual(run("echo hello world"), "hello world");
     });
 });
+
+describe("executor — break/continue", () => {
+    it("should break out of for loop", () => {
+        assert.strictEqual(
+            run('for i in 1 2 3 4 5; do if [ "$i" = "3" ]; then break; fi; echo $i; done'),
+            "1\n2"
+        );
+    });
+
+    it("should continue in for loop", () => {
+        assert.strictEqual(
+            run('for i in 1 2 3 4 5; do if [ "$i" = "3" ]; then continue; fi; echo $i; done'),
+            "1\n2\n4\n5"
+        );
+    });
+
+    it("should break out of while loop", () => {
+        assert.strictEqual(
+            run("i=0; while true; do i=$((i+1)); if [ $i = 3 ]; then break; fi; echo $i; done"),
+            "1\n2"
+        );
+    });
+});
+
+describe("executor — string operations", () => {
+    it("should uppercase with ^^", () => {
+        assert.strictEqual(run('X=hello; echo ${X^^}'), "HELLO");
+    });
+
+    it("should lowercase with ,,", () => {
+        assert.strictEqual(run('X=HELLO; echo ${X,,}'), "hello");
+    });
+
+    it("should capitalize first with ^", () => {
+        assert.strictEqual(run('X=hello; echo ${X^}'), "Hello");
+    });
+
+    it("should substring with :offset", () => {
+        assert.strictEqual(run('X=hello_world; echo ${X:5}'), "_world");
+    });
+
+    it("should substring with :offset:length", () => {
+        assert.strictEqual(run('X=hello_world; echo ${X:0:5}'), "hello");
+    });
+
+    it("should get length with ${#VAR}", () => {
+        assert.strictEqual(run('X=hello; echo ${#X}'), "5");
+    });
+
+    it("should remove shortest prefix with #", () => {
+        assert.strictEqual(run('X="/usr/local/bin"; echo ${X#*/}'), "usr/local/bin");
+    });
+
+    it("should remove longest prefix with ##", () => {
+        assert.strictEqual(run('X="/usr/local/bin"; echo ${X##*/}'), "bin");
+    });
+
+    it("should remove shortest suffix with %", () => {
+        assert.strictEqual(run('X="foo.tar.gz"; echo ${X%.gz}'), "foo.tar");
+    });
+
+    it("should remove longest suffix with %%", () => {
+        assert.strictEqual(run('X="foo.tar.gz"; echo ${X%%.*}'), "foo");
+    });
+
+    it("should search/replace with /", () => {
+        assert.strictEqual(run('X="hello world"; echo ${X/world/earth}'), "hello earth");
+    });
+
+    it("should search/replace all with //", () => {
+        assert.strictEqual(run('X="aabaa"; echo ${X//a/x}'), "xxbxx");
+    });
+});
+
+describe("executor — pushd/popd/dirs", () => {
+    it("should push and pop directories", () => {
+        const out = run("pushd /tmp; pwd; popd; pwd");
+        assert.match(out, /tmp/);
+    });
+
+    it("should list directory stack with dirs", () => {
+        const out = run("pushd /tmp; dirs");
+        assert.ok(out.includes("tmp"));
+    });
+});
+
+describe("executor — basename/dirname builtins", () => {
+    it("should extract basename", () => {
+        assert.strictEqual(run("basename /usr/local/bin/node"), "node");
+    });
+
+    it("should extract dirname", () => {
+        assert.strictEqual(run("dirname /usr/local/bin/node"), "/usr/local/bin");
+    });
+
+    it("should strip suffix from basename", () => {
+        assert.strictEqual(run("basename /path/to/file.txt .txt"), "file");
+    });
+});

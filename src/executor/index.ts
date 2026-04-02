@@ -19,8 +19,10 @@ import { getAlias } from "../api/index.js";
 import { commandExists } from "../completion/index.js";
 import { shellOpts, saveShellOpts, restoreShellOpts } from "../shellopts/index.js";
 
-// Sentinel for `return N` in shell functions.
+// Sentinels for flow control in shell functions and loops.
 class ShellReturn { constructor(public exitCode: number) {} }
+class ShellBreak { constructor(public levels: number) {} }
+class ShellContinue { constructor(public levels: number) {} }
 import {
     addJob, removeJob, getJobBySpec, getCurrentJob, getAllJobs,
     markJobStopped, markJobRunning, reapFinishedJobs,
@@ -70,6 +72,13 @@ export interface ExecResult {
 
 // Shell function registry.
 const shellFunctions = new Map<string, ASTNode>();
+
+// Directory stack for pushd/popd.
+const dirStack: string[] = [];
+function printDirStack(): string {
+    const cwd = process.cwd().replace(String($["HOME"] ?? ""), "~");
+    return [cwd, ...dirStack.map(d => d.replace(String($["HOME"] ?? ""), "~")).reverse()].join(" ");
+}
 
 // Execute a string as shell commands (used by trap and eval).
 export async function executeString(code: string): Promise<void> {
@@ -453,6 +462,16 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         const r = await runSource(args[0]!, args.slice(1));
         $["PIPESTATUS"] = [r.exitCode];
         return r;
+    }
+
+    // break/continue — loop flow control
+    if (command === "break") {
+        const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
+        throw new ShellBreak(isNaN(n) || n < 1 ? 1 : n);
+    }
+    if (command === "continue") {
+        const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
+        throw new ShellContinue(isNaN(n) || n < 1 ? 1 : n);
     }
 
     // return — exit from shell function with code
@@ -944,7 +963,19 @@ async function executeWhile(node: WhileClause): Promise<ExecResult> {
         const cond = await executeNode(node.condition);
         const met = node.until ? cond.exitCode !== 0 : cond.exitCode === 0;
         if (!met) break;
-        last = await executeNode(node.body);
+        try {
+            last = await executeNode(node.body);
+        } catch (e) {
+            if (e instanceof ShellBreak) {
+                if (e.levels > 1) throw new ShellBreak(e.levels - 1);
+                break;
+            }
+            if (e instanceof ShellContinue) {
+                if (e.levels > 1) throw new ShellContinue(e.levels - 1);
+                continue;
+            }
+            throw e;
+        }
     }
     return last;
 }
@@ -955,7 +986,19 @@ async function executeFor(node: ForClause): Promise<ExecResult> {
     let last: ExecResult = { exitCode: 0 };
     for (const item of items) {
         $[node.name] = item;
-        last = await executeNode(node.body);
+        try {
+            last = await executeNode(node.body);
+        } catch (e) {
+            if (e instanceof ShellBreak) {
+                if (e.levels > 1) throw new ShellBreak(e.levels - 1);
+                break;
+            }
+            if (e instanceof ShellContinue) {
+                if (e.levels > 1) throw new ShellContinue(e.levels - 1);
+                continue;
+            }
+            throw e;
+        }
     }
     return last;
 }
@@ -985,7 +1028,19 @@ async function executeSelect(node: SelectClause): Promise<ExecResult> {
             $[node.name] = items[n - 1]!;
         }
         $["REPLY"] = trimmed;
-        last = await executeNode(node.body);
+        try {
+            last = await executeNode(node.body);
+        } catch (e) {
+            if (e instanceof ShellBreak) {
+                if (e.levels > 1) throw new ShellBreak(e.levels - 1);
+                break;
+            }
+            if (e instanceof ShellContinue) {
+                if (e.levels > 1) throw new ShellContinue(e.levels - 1);
+                continue;
+            }
+            throw e;
+        }
     }
     return last;
 }
@@ -1159,18 +1214,22 @@ function readLineFromFd(fd: number): string | null {
 function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
     // Parse options
     let raw = false;
+    let silent = false;
     let prompt = "";
+    let delimiter: string | null = null;
+    let nchars = -1;
+    let arrayName: string | null = null;
     const varNames: string[] = [];
     let i = 0;
     while (i < args.length) {
         const arg = args[i]!;
-        if (arg === "-r") {
-            raw = true;
-            i++;
-        } else if (arg === "-p" && i + 1 < args.length) {
-            prompt = args[i + 1]!;
-            i += 2;
-        } else if (arg.startsWith("-")) {
+        if (arg === "-r") { raw = true; i++; }
+        else if (arg === "-s") { silent = true; i++; }
+        else if (arg === "-p" && i + 1 < args.length) { prompt = args[i + 1]!; i += 2; }
+        else if (arg === "-d" && i + 1 < args.length) { delimiter = args[i + 1]!; i += 2; }
+        else if (arg === "-n" && i + 1 < args.length) { nchars = parseInt(args[i + 1]!, 10); i += 2; }
+        else if (arg === "-a" && i + 1 < args.length) { arrayName = args[i + 1]!; i += 2; }
+        else if (arg.startsWith("-") && arg.length > 1 && !/^[a-zA-Z_]/.test(arg[1]!)) {
             process.stderr.write(`read: ${arg}: unsupported option\n`);
             return { exitCode: 2 };
         } else {
@@ -1202,7 +1261,35 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
         try { line = readLineFromFd(fd); }
         finally { fs.closeSync(fd); }
     } else {
-        line = readLineFromFd(0);
+        if (nchars > 0) {
+            // Read exactly N characters.
+            const buf = Buffer.alloc(1);
+            let chars = "";
+            for (let c = 0; c < nchars; c++) {
+                try {
+                    const n = readSync(0, buf, 0, 1, null);
+                    if (n === 0) break;
+                    chars += buf.toString("utf8", 0, 1);
+                } catch { break; }
+            }
+            line = chars || null;
+        } else if (delimiter !== null) {
+            // Read until delimiter character.
+            const buf = Buffer.alloc(1);
+            let chars = "";
+            while (true) {
+                try {
+                    const n = readSync(0, buf, 0, 1, null);
+                    if (n === 0) break;
+                    const ch = buf.toString("utf8", 0, 1);
+                    if (ch === delimiter) break;
+                    chars += ch;
+                } catch { break; }
+            }
+            line = chars || null;
+        } else {
+            line = readLineFromFd(0);
+        }
     }
     if (line === null) return { exitCode: 1 };
 
@@ -1210,6 +1297,14 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
     let processed = line;
     if (!raw) {
         processed = processed.replace(/\\(.)/g, "$1");
+    }
+
+    // Array mode: split all words into array variable
+    if (arrayName) {
+        const ifs = String($["IFS"] ?? " \t\n");
+        const parts = splitOnIfs(processed, ifs, Infinity);
+        $[arrayName] = parts;
+        return { exitCode: 0 };
     }
 
     // If no variable names, use REPLY
@@ -1250,7 +1345,22 @@ function splitOnIfs(str: string, ifs: string, maxParts: number): string[] {
 // ---- source / . builtin -----------------------------------------------------
 
 async function runSource(file: string, extraArgs: string[]): Promise<ExecResult> {
-    const path = resolve(file);
+    // Search: try as-is, then search PATH if not absolute/relative.
+    let path = resolve(file);
+    try { accessSync(path, fsConstants.R_OK); } catch {
+        if (!file.startsWith("/") && !file.startsWith("./") && !file.startsWith("../")) {
+            const pathDirs = String($["PATH"] ?? "").split(":");
+            let found = false;
+            for (const dir of pathDirs) {
+                const candidate = resolve(dir, file);
+                try { accessSync(candidate, fsConstants.R_OK); path = candidate; found = true; break; } catch {}
+            }
+            if (!found) {
+                process.stderr.write(`source: ${file}: No such file or directory\n`);
+                return { exitCode: 1 };
+            }
+        }
+    }
     let content: string;
     try {
         content = readFileSync(path, "utf8");
@@ -1775,6 +1885,12 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             return { exitCode: 1 };
         }
         case "export": {
+            if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
+                for (const [key, val] of Object.entries(process.env)) {
+                    if (val !== undefined) process.stdout.write(`declare -x ${key}=${JSON.stringify(val)}\n`);
+                }
+                return { exitCode: 0 };
+            }
             for (const arg of args) {
                 const eq = arg.indexOf("=");
                 if (eq > 0) {
@@ -1853,6 +1969,61 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             return runType(args);
         case "which":
             return runWhich(args);
+        case "pushd": {
+            const target = args[0] ?? String($["HOME"] ?? "/");
+            const cwd = process.cwd();
+            try {
+                process.chdir(target);
+                dirStack.push(cwd);
+                $["PWD"] = process.cwd();
+                process.stdout.write(printDirStack() + "\n");
+            } catch (e: unknown) {
+                process.stderr.write(`pushd: ${e instanceof Error ? e.message : e}\n`);
+                return { exitCode: 1 };
+            }
+            return { exitCode: 0 };
+        }
+        case "popd": {
+            if (dirStack.length === 0) {
+                process.stderr.write("popd: directory stack empty\n");
+                return { exitCode: 1 };
+            }
+            const target = dirStack.pop()!;
+            try {
+                process.chdir(target);
+                $["PWD"] = process.cwd();
+                process.stdout.write(printDirStack() + "\n");
+            } catch (e: unknown) {
+                process.stderr.write(`popd: ${e instanceof Error ? e.message : e}\n`);
+                return { exitCode: 1 };
+            }
+            return { exitCode: 0 };
+        }
+        case "dirs":
+            process.stdout.write(printDirStack() + "\n");
+            return { exitCode: 0 };
+        case "basename": {
+            if (args.length === 0) { process.stderr.write("basename: missing operand\n"); return { exitCode: 1 }; }
+            let name = args[0]!;
+            // Remove trailing slashes.
+            while (name.length > 1 && name.endsWith("/")) name = name.slice(0, -1);
+            const lastSlash = name.lastIndexOf("/");
+            name = lastSlash >= 0 ? name.slice(lastSlash + 1) : name;
+            // Remove suffix if provided.
+            if (args[1] && name.endsWith(args[1]) && name !== args[1]) {
+                name = name.slice(0, -args[1].length);
+            }
+            process.stdout.write(name + "\n");
+            return { exitCode: 0 };
+        }
+        case "dirname": {
+            if (args.length === 0) { process.stderr.write("dirname: missing operand\n"); return { exitCode: 1 }; }
+            let name = args[0]!;
+            while (name.length > 1 && name.endsWith("/")) name = name.slice(0, -1);
+            const lastSlash = name.lastIndexOf("/");
+            process.stdout.write((lastSlash > 0 ? name.slice(0, lastSlash) : lastSlash === 0 ? "/" : ".") + "\n");
+            return { exitCode: 0 };
+        }
         case "readonly": {
             if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
                 for (const [name, val] of getReadonlyVars()) {
