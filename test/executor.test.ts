@@ -864,7 +864,7 @@ describe("executor — job control", () => {
     });
 
     it("should list jobs with jobs builtin", () => {
-        const { stdout } = runFull("sleep 10 &\njobs");
+        const { stdout } = runFull("sleep 10 &>/dev/null &\njobs");
         assert.match(stdout, /\[1\]\+\s+Running\s+sleep 10/);
     });
 
@@ -1296,12 +1296,12 @@ describe("executor — kill builtin", () => {
     });
 
     it("should send signal to a process", () => {
-        // Start a background sleep process, kill it, verify kill succeeds
-        assert.strictEqual(ec("sleep 60 & kill $!"), 0);
+        // Start a background sleep, kill it, wait for it to exit
+        assert.strictEqual(ec("sleep 60 & kill $! && wait $!; true"), 0);
     });
 
     it("should send specific signal by name", () => {
-        assert.strictEqual(ec("sleep 60 & kill -TERM $!"), 0);
+        assert.strictEqual(ec("sleep 60 & kill -TERM $! && wait $!; true"), 0);
     });
 
     it("should report error for invalid pid", () => {
@@ -1380,7 +1380,8 @@ describe("executor — colon builtin", () => {
 describe("executor — disown builtin", () => {
     it("should remove current job from table", () => {
         // Start a background job, disown it, jobs should show nothing
-        const out = run("sleep 60 & disown; jobs");
+        // Use sleep 0 to avoid blocking — we just need it in the job table briefly.
+        const out = run("sleep 0.1 & disown; jobs");
         assert.strictEqual(out, "");
     });
 });

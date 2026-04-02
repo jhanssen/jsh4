@@ -69,9 +69,19 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         ui!.historyLoad(historyFile);
 
         // Set up syntax highlighting.
+        // In continuation mode, prepend previous lines so the lexer sees the full
+        // context (e.g. an open string from a prior line).
         ui!.setColorize((input: string): string => {
             const userFn = getColorize();
             if (userFn) return userFn(input);
+            if (continuationBuffer) {
+                const full = continuationBuffer + "\n" + input;
+                const colorized = colorize(full, getCurrentTheme());
+                // Strip the prefix — the colorized version of previous lines + the \n.
+                // We colorize the full thing, then return only the suffix for the current line.
+                const prefixLen = continuationBuffer.length + 1; // +1 for \n
+                return stripColorizedPrefix(colorized, prefixLen);
+            }
             return colorize(input, getCurrentTheme());
         });
 
@@ -101,6 +111,7 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
 }
 
 let userSetPrompt = false;
+let continuationBuffer = ""; // accumulated buffer from previous lines for colorizer context
 
 async function loadRc(customPath?: string): Promise<void> {
     const rcPath = customPath
