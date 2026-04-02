@@ -321,17 +321,18 @@ export class TerminalUI {
             const { line, cursorCol: col } = this.native.inputRenderLine(
                 linePrompt, colorized, lineRprompt, state.cols, bufLine, linePos
             );
-            // Append ghost text to the last line if we have a suggestion and cursor is at end.
-            if (isLast && state.suggestion && state.pos === state.len) {
-                inputLines.push(line + this.suggestionColor + state.suggestion + "\x1b[0m");
-            } else {
-                inputLines.push(line);
-            }
+            inputLines.push(line);
             if (isCursorLine) cursorCol = col;
         }
 
-        // Cache for onLine reuse (avoids re-colorizing on Enter).
-        this.lastRenderedInputLines = inputLines;
+        // Cache clean lines (without ghost text) for onLine/clearFrame reuse.
+        this.lastRenderedInputLines = [...inputLines];
+
+        // Append ghost text to display (not cached — so it doesn't appear in frozen lines).
+        if (state.suggestion && state.pos === state.len && inputLines.length > 0) {
+            const lastIdx = inputLines.length - 1;
+            inputLines[lastIdx] = inputLines[lastIdx]! + this.suggestionColor + state.suggestion + "\x1b[0m";
+        }
 
         // Get header/footer from widgets.
         const headerLines = this.widgets.getZoneContent("header", state.cols);

@@ -760,6 +760,8 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
             history_len--;
             free(history[history_len]);
         }
+        // Clear suggestion so ghost text doesn't linger.
+        s->suggestion.clear();
         *out_errno = EAGAIN;
         return -1;
 
