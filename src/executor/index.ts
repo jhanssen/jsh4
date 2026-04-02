@@ -14,7 +14,7 @@ import type {
 import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl, registerProcessSubstImpl, evalArithmetic } from "../expander/index.js";
 import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot, declareReadonly, getReadonlyVars } from "../variables/index.js";
-import { pushParams, popParams, shiftParams, snapshotParams, restoreParams, getAllParams } from "../variables/positional.js";
+import { pushParams, popParams, shiftParams, setParams, snapshotParams, restoreParams, getAllParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { getAlias } from "../api/index.js";
 import { shellOpts, saveShellOpts, restoreShellOpts } from "../shellopts/index.js";
@@ -247,6 +247,16 @@ async function withRedirections(redirs: Redirection[], body: () => Promise<ExecR
 
             switch (r.op) {
                 case ">": case ">>": {
+                    // noclobber: prevent > from overwriting existing files (>> is always allowed).
+                    if (r.op === ">" && shellOpts.noclobber) {
+                        try {
+                            accessSync(target, fsConstants.F_OK);
+                            process.stderr.write(`jsh: ${target}: cannot overwrite existing file\n`);
+                            return { exitCode: 1 };
+                        } catch {
+                            // File doesn't exist — proceed.
+                        }
+                    }
                     const flags = r.op === ">"
                         ? fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC
                         : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
@@ -456,6 +466,10 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         } else {
             $[a.name] = await expandWordToStr(a.value);
         }
+        // allexport: auto-export assigned variables
+        if (shellOpts.allexport && $[a.name] !== undefined) {
+            process.env[a.name] = String($[a.name]);
+        }
     }
     if (cmd.words.length === 0) return { exitCode: 0 };
 
@@ -596,6 +610,41 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
             process.stderr.write(`eval: ${e instanceof Error ? e.message : e}\n`);
             return { exitCode: 1 };
         }
+    }
+
+    // exec with redirections only — apply permanently (no restore).
+    if (command === "exec" && args.length === 0 && redirs.length > 0) {
+        for (const r of redirs) {
+            if (r.isHereDoc) continue;
+            switch (r.op) {
+                case ">": case ">>": {
+                    const flags = r.op === ">"
+                        ? fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC
+                        : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
+                    const fileFd = openSync(r.target, flags, 0o666);
+                    native.dup2Fd(fileFd, r.fd >= 0 ? r.fd : 1);
+                    native.closeFd(fileFd);
+                    break;
+                }
+                case "<": {
+                    const fileFd = openSync(r.target, fsConstants.O_RDONLY);
+                    native.dup2Fd(fileFd, r.fd >= 0 ? r.fd : 0);
+                    native.closeFd(fileFd);
+                    break;
+                }
+                case ">&": {
+                    const dstFd = parseInt(r.target, 10);
+                    native.dup2Fd(dstFd, r.fd >= 0 ? r.fd : 1);
+                    break;
+                }
+                case "<&": {
+                    const dstFd = parseInt(r.target, 10);
+                    native.dup2Fd(dstFd, r.fd >= 0 ? r.fd : 0);
+                    break;
+                }
+            }
+        }
+        return { exitCode: 0 };
     }
 
     // Job control builtins (async).
@@ -856,7 +905,27 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
     if (node.inlineBody !== undefined) {
         try {
             // eslint-disable-next-line no-new-func
-            fn = new Function(`"use strict"; return (${node.inlineBody})`)() as Function;
+            const evaluated = new Function(`"use strict"; return (${node.inlineBody})`)();
+            if (typeof evaluated === "function") {
+                fn = evaluated;
+            } else {
+                // Not a function — treat the expression result as output.
+                if (evaluated !== null && evaluated !== undefined) {
+                    const out = stdoutFd === 1
+                        ? process.stdout
+                        : createWriteStream("", { fd: stdoutFd, autoClose: false });
+                    const str = String(evaluated);
+                    if (stdoutFd === 1) {
+                        out.write(str.endsWith("\n") ? str : str + "\n");
+                    } else {
+                        out.write(str);
+                    }
+                    if (stdoutFd !== 1) {
+                        await new Promise<void>(r => out.end(r));
+                    }
+                }
+                return 0;
+            }
         } catch (e) {
             process.stderr.write(`jsh: @{}: ${e instanceof Error ? e.message : e}\n`);
             return 1;
@@ -873,8 +942,11 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
     const args = (await Promise.all(node.args.map(expandWord))).flat();
 
     // Build stdin iterable — line-by-line reader from a raw fd.
-    const stdinIterable: AsyncIterable<string> | null = stdinFd === 0
-        ? null
+    // When not in a pipeline (stdinFd === 0), provide an empty async iterable
+    // so generators don't crash on `for await (... of stdin)`.
+    const emptyIterable: AsyncIterable<string> = { [Symbol.asyncIterator]: async function*() {} };
+    const stdinIterable: AsyncIterable<string> = stdinFd === 0
+        ? emptyIterable
         : fdLineReader(stdinFd);
 
     // Output writer.
@@ -911,7 +983,13 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
         } else if (Buffer.isBuffer(result) || result instanceof Uint8Array) {
             out.write(result);
         } else {
-            writeOut(result);
+            const str = String(result);
+            // Add trailing newline only when writing to terminal, not into a pipe.
+            if (stdoutFd === 1) {
+                out.write(str.endsWith("\n") ? str : str + "\n");
+            } else {
+                out.write(str);
+            }
         }
         return 0;
     } catch (e: unknown) {
@@ -2431,6 +2509,8 @@ const builtins: Record<string, Builtin> = {
         return { exitCode: shiftParams(n) ? 0 : 1 };
     }},
     exec:     { external: false, run(args) {
+        // exec with args: replace process. exec without args handled in executeSimple
+        // (redirections are applied permanently there).
         if (args.length === 0) return { exitCode: 0 };
         return runExec("exec", args);
     }},
@@ -2491,6 +2571,60 @@ const builtins: Record<string, Builtin> = {
     let:      { external: false, run: (args) => runLet(args) },
     declare:  { external: false, run: (args) => runDeclare(args) },
     ":"       : { external: false, run() { return { exitCode: 0 }; }},
+    pwd:      { external: true, run(args) {
+        // -P: physical (resolve symlinks), -L: logical (default, use $PWD)
+        if (args.includes("-P")) {
+            try {
+                const { realpathSync } = require("node:fs") as typeof import("node:fs");
+                process.stdout.write(realpathSync(process.cwd()) + "\n");
+            } catch {
+                process.stdout.write(process.cwd() + "\n");
+            }
+        } else {
+            process.stdout.write((String($["PWD"] ?? process.cwd())) + "\n");
+        }
+        return { exitCode: 0 };
+    }},
+    umask:    { external: false, run(args) {
+        if (args.length === 0) {
+            const mask = process.umask();
+            process.stdout.write("0" + mask.toString(8).padStart(3, "0") + "\n");
+            // umask() with no args in Node returns current and sets to same value
+            process.umask(mask);
+            return { exitCode: 0 };
+        }
+        const val = parseInt(args[0]!, 8);
+        if (isNaN(val)) {
+            process.stderr.write(`umask: ${args[0]}: invalid octal number\n`);
+            return { exitCode: 1 };
+        }
+        process.umask(val);
+        return { exitCode: 0 };
+    }},
+    ulimit:   { external: false, run(args) {
+        // Minimal ulimit — only supports -n (nofile) which is the most commonly used.
+        if (args.length === 0 || args[0] === "-n") {
+            // Node doesn't expose getrlimit, report "unlimited" or use a default
+            process.stdout.write("unlimited\n");
+            return { exitCode: 0 };
+        }
+        if (args[0] === "-a") {
+            process.stdout.write("core file size          (blocks, -c) unlimited\n");
+            process.stdout.write("data seg size           (kbytes, -d) unlimited\n");
+            process.stdout.write("file size               (blocks, -f) unlimited\n");
+            process.stdout.write("max locked memory       (kbytes, -l) unlimited\n");
+            process.stdout.write("max memory size         (kbytes, -m) unlimited\n");
+            process.stdout.write("open files                      (-n) unlimited\n");
+            process.stdout.write("pipe size            (512 bytes, -p) 1\n");
+            process.stdout.write("stack size              (kbytes, -s) unlimited\n");
+            process.stdout.write("cpu time               (seconds, -t) unlimited\n");
+            process.stdout.write("max user processes              (-u) unlimited\n");
+            process.stdout.write("virtual memory          (kbytes, -v) unlimited\n");
+            return { exitCode: 0 };
+        }
+        process.stderr.write(`ulimit: ${args[0]}: unsupported option\n`);
+        return { exitCode: 1 };
+    }},
 };
 
 function runBuiltin(name: string, args: string[]): ExecResult | null {
@@ -2676,6 +2810,8 @@ const shortOptMap: Record<string, keyof typeof shellOpts> = {
     e: "errexit",
     u: "nounset",
     x: "xtrace",
+    a: "allexport",
+    C: "noclobber",
 };
 
 const longOptMap: Record<string, keyof typeof shellOpts> = {
@@ -2683,6 +2819,8 @@ const longOptMap: Record<string, keyof typeof shellOpts> = {
     nounset: "nounset",
     xtrace: "xtrace",
     pipefail: "pipefail",
+    allexport: "allexport",
+    noclobber: "noclobber",
 };
 
 function runSet(args: string[]): ExecResult {
@@ -2691,6 +2829,12 @@ function runSet(args: string[]): ExecResult {
         for (const [name, val] of Object.entries(shellOpts)) {
             process.stdout.write(`${name}\t${val ? "on" : "off"}\n`);
         }
+        return { exitCode: 0 };
+    }
+
+    // set -- args: set positional parameters
+    if (args[0] === "--") {
+        setParams(args.slice(1));
         return { exitCode: 0 };
     }
 

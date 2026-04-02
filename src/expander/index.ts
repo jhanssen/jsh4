@@ -446,6 +446,16 @@ function resolveVariable(seg: VariableExpansion): { raw: unknown; val: string | 
     return { raw, val };
 }
 
+function getShellOptFlags(): string {
+    let flags = "";
+    if (shellOpts.allexport) flags += "a";
+    if (shellOpts.noclobber) flags += "C";
+    if (shellOpts.errexit) flags += "e";
+    if (shellOpts.nounset) flags += "u";
+    if (shellOpts.xtrace) flags += "x";
+    return flags;
+}
+
 function expandVariable(seg: VariableExpansion): string {
     if (/^\d+$/.test(seg.name)) {
         const n = parseInt(seg.name, 10);
@@ -455,6 +465,7 @@ function expandVariable(seg: VariableExpansion): string {
     if (seg.name === "?") return String($["?"] ?? 0);
     if (seg.name === "#") return String(getParamCount());
     if (seg.name === "@" || seg.name === "*") return getAllParams().join(" ");
+    if (seg.name === "-") return getShellOptFlags();
 
     // ${#VAR} — length of variable value or array
     if (seg.name.startsWith("#") && !seg.operator) {

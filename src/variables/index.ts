@@ -7,6 +7,9 @@ for (const [key, value] of Object.entries(process.env)) {
     }
 }
 
+// Set PPID (parent PID) — readonly.
+store.set("PPID", String(process.ppid));
+
 // ---- local variable scoping -------------------------------------------------
 // Each frame records the original values of variables declared `local`.
 // On scope exit, these are restored (or deleted if they didn't exist).

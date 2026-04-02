@@ -1385,3 +1385,143 @@ describe("executor — disown builtin", () => {
         assert.strictEqual(out, "");
     });
 });
+
+describe("executor — $PPID", () => {
+    it("should be set to parent PID", () => {
+        const out = run("echo $PPID");
+        const ppid = parseInt(out, 10);
+        assert.ok(!isNaN(ppid) && ppid > 0);
+    });
+});
+
+describe("executor — pwd builtin", () => {
+    it("should print working directory", () => {
+        const out = run("pwd");
+        assert.ok(out.startsWith("/"));
+    });
+
+    it("should match $PWD", () => {
+        assert.strictEqual(run("pwd"), run("echo $PWD"));
+    });
+
+    it("should support -P flag", () => {
+        const out = run("pwd -P");
+        assert.ok(out.startsWith("/"));
+    });
+});
+
+describe("executor — umask builtin", () => {
+    it("should print current mask", () => {
+        const out = run("umask");
+        assert.match(out, /^0[0-7]{3}$/);
+    });
+
+    it("should set and report new mask", () => {
+        // Set to 0077, check, restore to 0022
+        const out = run("umask 0077; umask; umask 0022");
+        assert.strictEqual(out, "0077");
+    });
+
+    it("should reject invalid input", () => {
+        assert.strictEqual(ec("umask xyz"), 1);
+    });
+});
+
+describe("executor — set -a (allexport)", () => {
+    it("should auto-export assigned variables", () => {
+        const out = run("set -a; MYVAR=hello; env | grep MYVAR");
+        assert.strictEqual(out, "MYVAR=hello");
+    });
+
+    it("should stop after set +a", () => {
+        const out = run("set -a; A=1; set +a; B=2; env | grep -c '^B='");
+        assert.strictEqual(out, "0");
+    });
+});
+
+describe("executor — set -C (noclobber)", () => {
+    let tmp: string;
+    before(() => { tmp = mkdtempSync(join(tmpdir(), "jsh-noclobber-")); });
+    after(() => { rmSync(tmp, { recursive: true }); });
+
+    it("should prevent > from overwriting existing file", () => {
+        const f = join(tmp, "existing");
+        const { stderr } = runFull(`echo first > ${f}; set -C; echo second > ${f}`);
+        assert.match(stderr, /cannot overwrite/);
+    });
+
+    it("should allow >> even with noclobber", () => {
+        const f = join(tmp, "appendable");
+        const out = run(`echo first > ${f}; set -C; echo second >> ${f}; cat ${f}`);
+        assert.strictEqual(out, "first\nsecond");
+    });
+
+    it("should allow > to new file with noclobber", () => {
+        const f = join(tmp, "newfile");
+        const out = run(`set -C; echo hello > ${f}; cat ${f}`);
+        assert.strictEqual(out, "hello");
+    });
+});
+
+describe("executor — $- shell option flags", () => {
+    it("should be empty by default", () => {
+        assert.strictEqual(run("echo $-"), "");
+    });
+
+    it("should reflect set -e", () => {
+        assert.strictEqual(run("set -e; echo $-"), "e");
+    });
+
+    it("should reflect multiple flags", () => {
+        const out = run("set -eu; echo $-");
+        assert.ok(out.includes("e"));
+        assert.ok(out.includes("u"));
+    });
+
+    it("should reflect set -a", () => {
+        const out = run("set -a; echo $-");
+        assert.ok(out.includes("a"));
+    });
+});
+
+describe("executor — set -- positional params", () => {
+    it("should set positional parameters", () => {
+        assert.strictEqual(run("set -- a b c; echo $1 $2 $3"), "a b c");
+    });
+
+    it("should update $#", () => {
+        assert.strictEqual(run("set -- x y; echo $#"), "2");
+    });
+
+    it("should clear params with empty set --", () => {
+        assert.strictEqual(run("set -- a b; set --; echo $#"), "0");
+    });
+});
+
+describe("executor — exec with redirections", () => {
+    let tmp: string;
+    before(() => { tmp = mkdtempSync(join(tmpdir(), "jsh-exec-redir-")); });
+    after(() => { rmSync(tmp, { recursive: true }); });
+
+    it("should permanently redirect stdout", () => {
+        const f = join(tmp, "out");
+        // exec > file redirects all subsequent stdout to file
+        const out = run(`exec > ${f}; echo hello; echo world`);
+        // stdout is redirected to file, so run() captures nothing from stdout
+        // but the file should have the content
+        const content = run(`cat ${f}`);
+        assert.strictEqual(content, "hello\nworld");
+    });
+});
+
+describe("executor — ulimit builtin", () => {
+    it("should print a value", () => {
+        const out = run("ulimit");
+        assert.ok(out.length > 0);
+    });
+
+    it("should support -a flag", () => {
+        const out = run("ulimit -a");
+        assert.match(out, /open files/);
+    });
+});

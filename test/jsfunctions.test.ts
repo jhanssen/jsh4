@@ -20,6 +20,15 @@ function run(cmd: string): string {
     return r.stdout.trim();
 }
 
+function runFull(cmd: string): { stdout: string; stderr: string } {
+    const r = spawnSync("node", ["dist/index.js"], {
+        input: cmd + "\nexit\n",
+        encoding: "utf8",
+        cwd: process.cwd(),
+    });
+    return { stdout: r.stdout.trim(), stderr: r.stderr.trim() };
+}
+
 describe("@ syntax — parser", () => {
     it("should parse @name as JsFunction node", () => {
         const ast = parse("@upper") as JsFunction;
@@ -84,6 +93,47 @@ describe("@ syntax — inline execution", () => {
     it("should handle @{ } in three-stage pipeline", () => {
         const out = run("seq 5 | @{ async function*(a, s) { for await (const l of s) yield l; } } | head -3");
         assert.deepStrictEqual(out.split("\n"), ["1", "2", "3"]);
+    });
+
+    it("should output non-function expression result", () => {
+        assert.strictEqual(run('@{ 2 + 2 }'), "4");
+    });
+
+    it("should handle standalone generator with no stdin", () => {
+        // Generator that only reads stdin — should produce no output, no error
+        assert.strictEqual(run('@{ async function*(a, s) { for await (const l of s) yield l; } }'), "");
+    });
+
+    it("should not add extra newline when piped", () => {
+        // Function return piped to wc -l — should be 0 lines (no trailing newline in pipe)
+        assert.strictEqual(run('@{ () => "hello" } | wc -l').trim(), "0");
+    });
+
+    it("should handle console.log in @{ } without error", () => {
+        const { stderr } = runFull('@{ console.log("test") }');
+        assert.ok(!stderr.includes("not a function"));
+    });
+
+    it("should add newline to terminal output from function return", () => {
+        // Use raw stdout (no trim) to verify trailing newline is present.
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: '@{ () => "hello" }\nexit\n',
+            encoding: "utf8",
+        });
+        assert.strictEqual(r.stdout, "hello\n");
+    });
+
+    it("should add newline to terminal output from expression", () => {
+        const r = spawnSync("node", ["dist/index.js"], {
+            input: '@{ "world" }\nexit\n',
+            encoding: "utf8",
+        });
+        assert.strictEqual(r.stdout, "world\n");
+    });
+
+    it("should pipe function return without extra newline", () => {
+        // "hello" without newline → wc -c should be 5
+        assert.strictEqual(run('@{ () => "hello" } | wc -c').trim(), "5");
     });
 });
 

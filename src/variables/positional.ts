@@ -34,6 +34,10 @@ export function restoreParams(saved: string[][]): void {
     for (const frame of saved) stack.push(frame);
 }
 
+export function setParams(args: string[]): void {
+    stack[stack.length - 1] = args;
+}
+
 export function shiftParams(n: number): boolean {
     const frame = stack[stack.length - 1]!;
     if (n > frame.length) return false;

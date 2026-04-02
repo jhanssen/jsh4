@@ -91,6 +91,15 @@
 - [x] `declare` — variable declarations (`-a` array, `-x` export, `-r` readonly, `-p` print)
 - [x] `time` — measure command execution time
 - [x] `:` — no-op builtin (POSIX colon command)
+- [x] `pwd` — print working directory (`-P` physical, `-L` logical)
+- [x] `umask` — get/set file creation mask
+- [x] `ulimit` — resource limits (minimal: `-a`, `-n`)
+- [x] `set -a` (allexport) — auto-export assigned variables
+- [x] `set -C` (noclobber) — prevent `>` from overwriting existing files
+- [x] `set --` — set positional parameters directly
+- [x] `exec` with redirections only — `exec 3>file` applies permanent fd redirections
+- [x] `$PPID` — parent process ID
+- [x] `$-` — current shell option flags
 
 ### Expansion
 - [x] Variable expansion with all operators (`:-`, `:+`, `:=`, `:?`, `#`, `##`, `%`, `%%`, `/`, `//`)
@@ -193,6 +202,7 @@
 - [x] Here-doc `$()` and `$(())` expansion tests
 - [x] Array tests (assign, append, index, `[@]`/`[*]`, `${#arr[@]}`, quoted expansion)
 - [x] kill, disown, hash, let, declare, time, colon tests
+- [x] $PPID, pwd, umask, set -a, set -C, $-, set --, exec redirections, ulimit tests
 
 ---
 
@@ -200,9 +210,22 @@
 
 ### Shell features
 
+- [ ] **`$RANDOM`** — random number variable (0–32767)
+- [ ] **`$LINENO`** — current line number in script/function
+- [ ] **`$FUNCNAME`** — name of current function
+- [ ] **`(( ))` as a command** — arithmetic evaluation returning exit code (0 if non-zero, 1 if zero)
+- [ ] **`mapfile` / `readarray`** — read lines from stdin into an array
+- [ ] **`export -n`** — un-export a variable (remove from environment, keep in shell)
+- [ ] **`unset -f`** — remove shell functions
+- [ ] **`shopt` / shell options** — `nullglob`, `dotglob`, `nocaseglob`, `extglob`
+- [ ] **`${!prefix*}` / `${!name}`** — variable name expansion, indirect expansion
+- [ ] **`builtin` keyword** — force builtin execution over function
+- [ ] **`command -p`** — use default PATH
+- [ ] **Signal forwarding** — forward SIGINT/SIGTERM to foreground process group on shell exit
 - [ ] **Recursive glob `**` in brace expansion** — e.g. `{src,test}/**/*.ts`
 - [ ] **Named pipes / coprocesses**
 - [ ] **`read -t`** — timeout flag (requires async I/O changes)
+- [ ] **`TMOUT`** — auto-logout after idle timeout
 
 ### Terminal / UI
 
