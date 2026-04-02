@@ -129,9 +129,9 @@
 - [x] Ctrl-D exits
 - [x] Ctrl-R reverse history search
 - [x] Syntax highlighting (lexer-based, true color RGB, command-exists green/red)
-- [x] Right-aligned prompt
-- [x] Async prompt support (`jsh.setPrompt(async fn)`)
-- [x] Header/footer widget regions with live timer updates
+- [x] Multi-line syntax highlighting — continuation lines colorized with context from previous lines
+- [x] Unified widget system — prompt, rprompt, PS2, header, footer are all widgets in zones
+- [x] Widget handles with `update()` / `remove()` — intervals are userland, not baked in
 - [x] OSC 133 shell integration marks
 - [x] OSC 7 cwd reporting
 - [x] Synchronized rendering (CSI 2026)
@@ -143,12 +143,10 @@
 - [x] `jsh` global object with full API
 - [x] `jsh.$` — variable store proxy
 - [x] `jsh.alias(name, expansion)` / `jsh.unalias(name)`
-- [x] `jsh.setPrompt(fn)` — sync or async prompt function
-- [x] `jsh.setRightPrompt(fn)` — right-aligned prompt
+- [x] `jsh.addWidget(id, zone, render, order)` — unified widget system for all zones (prompt, rprompt, ps2, header, footer)
+- [x] Widget handles: `update()` re-evaluates render, `remove()` unregisters
 - [x] `jsh.setColorize(fn)` — custom syntax highlighting override
 - [x] `jsh.setTheme(theme)` — syntax highlighting theme with RGB/hex/named colors
-- [x] `jsh.setHeader(fn)` / `jsh.setFooter(fn)` — header/footer region content
-- [x] `jsh.addWidget(id, zone, render, order, interval)` — live-updating widgets
 - [x] `jsh.colors` — ANSI color constants
 - [x] `jsh.makeFgColor()` / `jsh.makeBgColor()` / `jsh.makeUlColor()` — RGB color builders
 - [x] `jsh.style` — tagged template for styled strings with auto-reset
@@ -199,7 +197,6 @@
 
 ### Shell features
 
-- [ ] **`PS2` customization** — continuation prompt hardcoded as `"> "`
 - [ ] **Recursive glob `**` in brace expansion** — e.g. `{src,test}/**/*.ts`
 - [ ] **Named pipes / coprocesses**
 - [ ] **`read -t`** — timeout flag (requires async I/O changes)

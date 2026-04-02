@@ -69,20 +69,12 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         ui!.historyLoad(historyFile);
 
         // Set up syntax highlighting.
-        // In continuation mode, prepend previous lines so the lexer sees the full
-        // context (e.g. an open string from a prior line).
+        // In continuation mode, pass previous lines as context so the lexer sees
+        // the full input (e.g. an open string from a prior line).
         ui!.setColorize((input: string): string => {
             const userFn = getColorize();
             if (userFn) return userFn(input);
-            if (continuationBuffer) {
-                const full = continuationBuffer + "\n" + input;
-                const colorized = colorize(full, getCurrentTheme());
-                // Strip the prefix — the colorized version of previous lines + the \n.
-                // We colorize the full thing, then return only the suffix for the current line.
-                const prefixLen = continuationBuffer.length + 1; // +1 for \n
-                return stripColorizedPrefix(colorized, prefixLen);
-            }
-            return colorize(input, getCurrentTheme());
+            return colorize(input, getCurrentTheme(), continuationBuffer || undefined);
         });
 
         // Set up tab completion.
@@ -179,6 +171,7 @@ function emitOsc7(): void {
 
 async function promptLoop(buffer: string): Promise<void> {
     if (!ui) return;
+    continuationBuffer = buffer;
 
     // Reap finished background jobs and print notifications.
     if (!buffer) {

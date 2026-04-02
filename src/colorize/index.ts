@@ -109,51 +109,49 @@ const COMMAND_SEPARATORS = new Set<string>([
 
 const RESET = "\x1b[0m";
 
-export function colorize(input: string, theme?: Theme): string {
+export function colorize(input: string, theme?: Theme, context?: string): string {
     const t = theme ?? currentTheme;
     if (input.length === 0) return "";
 
+    // If context is provided (continuation lines), lex the full input so the
+    // lexer sees the complete state (e.g. an open string from a prior line).
+    // We only emit colorized output for the portion after the context.
+    const full = context !== undefined ? context + "\n" + input : input;
+    const outputStart = context !== undefined ? context.length + 1 : 0;
+
     let tokens;
     try {
-        const lexer = new Lexer(input, { partial: true });
+        const lexer = new Lexer(full, { partial: true });
         tokens = lexer.getTokens();
     } catch {
         return input;
     }
 
     let result = "";
-    let pos = 0;
-    let commandPosition = true; // first token is in command position
+    let pos = outputStart; // start emitting from the current line
+    let commandPosition = true;
+    let activeColor: string | null = null; // track color state from context
 
     for (const tok of tokens) {
         if (tok.type === TokenType.EOF) break;
 
-        // Copy any gap (whitespace) between last position and this token
-        if (tok.start > pos) {
-            result += input.slice(pos, tok.start);
-        }
-
-        const raw = input.slice(tok.start, tok.end);
         let color: string | null = null;
 
         switch (tok.type) {
             case TokenType.Word: {
                 if (KEYWORDS.has(tok.value)) {
                     color = resolveColor(t.keyword);
-                    commandPosition = true; // next word after keyword is command position (e.g., after "then")
+                    commandPosition = true;
                 } else if (commandPosition) {
-                    // Check if command exists
                     const name = tok.value;
                     if (isValidCommand(name)) {
                         color = resolveColor(t.command);
                     } else {
-                        // Invalid command: red with curly underline
                         const fg = resolveColor(t.commandNotFound);
-                        color = fg ? fg + "\x1b[4:3m" : "\x1b[4:3m"; // curly underline
+                        color = fg ? fg + "\x1b[4:3m" : "\x1b[4:3m";
                     }
                     commandPosition = false;
                 } else {
-                    // Check if word contains variable/substitution segments
                     const hasVar = tok.word?.segments.some(s =>
                         s.type === "VariableExpansion" || s.type === "CommandSubstitution"
                     );
@@ -202,17 +200,45 @@ export function colorize(input: string, theme?: Theme): string {
                 break;
         }
 
+        // Track active color for context-aware prefix handling
+        if (color) activeColor = color;
+        else if (tok.type !== TokenType.Newline) activeColor = null;
+
+        // Only emit output for tokens that overlap with the current line
+        if (tok.end <= outputStart) continue;
+
+        const emitStart = Math.max(tok.start, outputStart);
+        const emitEnd = tok.end;
+
+        // Copy any gap (whitespace) between last position and this token
+        if (emitStart > pos) {
+            result += full.slice(pos, emitStart);
+        }
+
+        const raw = full.slice(emitStart, emitEnd);
+
         if (color) {
             result += color + raw + RESET;
         } else {
             result += raw;
         }
-        pos = tok.end;
+        pos = emitEnd;
     }
 
-    // Copy any trailing content
-    if (pos < input.length) {
-        result += input.slice(pos);
+    // Copy any trailing content. If we're in continuation mode and there's
+    // unprocessed text (e.g. inside an unterminated string), color it as string.
+    if (pos < full.length) {
+        const trailing = full.slice(pos);
+        if (context !== undefined) {
+            const strColor = resolveColor(t.string);
+            if (strColor) {
+                result += strColor + trailing + RESET;
+            } else {
+                result += trailing;
+            }
+        } else {
+            result += trailing;
+        }
     }
 
     return result;
