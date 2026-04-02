@@ -39,6 +39,8 @@ interface NativeInputEngine {
     inputHistorySave: (path: string) => number;
     inputHistoryLoad: (path: string) => number;
     inputSetSuggestion: (id: number, text: string) => void;
+    inputSetInput: (text: string) => void;
+    inputInsertAtCursor: (text: string) => void;
     inputEAGAIN: () => number;
 }
 
@@ -133,6 +135,16 @@ export class TerminalUI {
 
     setSuggestionColor(color: string): void {
         this.suggestionColor = color;
+    }
+
+    /** Replace the entire input buffer and move cursor to end. */
+    setInput(text: string): void {
+        this.native.inputSetInput(text);
+    }
+
+    /** Insert text at the current cursor position. */
+    insertAtCursor(text: string): void {
+        this.native.inputInsertAtCursor(text);
     }
 
     // ---- Widgets ----

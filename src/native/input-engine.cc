@@ -1197,6 +1197,41 @@ static Napi::Value SetSuggestion(const Napi::CallbackInfo &info) {
     return env.Undefined();
 }
 
+static Napi::Value SetInput(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString()) return env.Undefined();
+    std::string text = info[0].As<Napi::String>().Utf8Value();
+    size_t len = text.size();
+    if (len > g_state.buflen) len = g_state.buflen;
+    memcpy(g_state.buf, text.c_str(), len);
+    g_state.buf[len] = '\0';
+    g_state.pos = g_state.len = len;
+    bufferChanged();
+    if (g_state.active) notifyRender();
+    return env.Undefined();
+}
+
+static Napi::Value InsertAtCursor(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString()) return env.Undefined();
+    std::string text = info[0].As<Napi::String>().Utf8Value();
+    size_t tlen = text.size();
+    if (g_state.len + tlen > g_state.buflen) return env.Undefined(); // won't fit
+    // Make room at cursor position.
+    if (g_state.pos < g_state.len) {
+        memmove(g_state.buf + g_state.pos + tlen,
+                g_state.buf + g_state.pos,
+                g_state.len - g_state.pos);
+    }
+    memcpy(g_state.buf + g_state.pos, text.c_str(), tlen);
+    g_state.pos += tlen;
+    g_state.len += tlen;
+    g_state.buf[g_state.len] = '\0';
+    bufferChanged();
+    if (g_state.active) notifyRender();
+    return env.Undefined();
+}
+
 static Napi::Value GetEAGAIN(const Napi::CallbackInfo &info) {
     return Napi::Number::New(info.Env(), EAGAIN);
 }
@@ -1266,6 +1301,8 @@ Napi::Object InitInputEngine(Napi::Env env, Napi::Object exports) {
     exports.Set("inputHistorySave",   Napi::Function::New(env, HistorySave));
     exports.Set("inputHistoryLoad",   Napi::Function::New(env, HistoryLoad));
     exports.Set("inputSetSuggestion", Napi::Function::New(env, SetSuggestion));
+    exports.Set("inputSetInput",     Napi::Function::New(env, SetInput));
+    exports.Set("inputInsertAtCursor", Napi::Function::New(env, InsertAtCursor));
     exports.Set("inputEAGAIN",        Napi::Function::New(env, GetEAGAIN));
     // Fd utilities (previously in linenoise.cc)
     exports.Set("closeFd",            Napi::Function::New(env, CloseFd));

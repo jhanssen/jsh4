@@ -307,6 +307,24 @@ declare const jsh: {
     /** Current terminal width in columns. */
     readonly columns: number;
 
+    // ---- Input buffer ----
+
+    /**
+     * Replace the entire input buffer and move cursor to end.
+     * Only works during an active editing session.
+     * @example
+     * jsh.setInput("git commit -m 'fix bug'");
+     */
+    setInput(text: string): void;
+
+    /**
+     * Insert text at the current cursor position.
+     * Only works during an active editing session.
+     * @example
+     * jsh.insertAtCursor(" --force");
+     */
+    insertAtCursor(text: string): void;
+
     // ---- Aliases ----
 
     alias(name: string, expansion: string): void;

@@ -36,6 +36,8 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputHistorySave: (path: string) => number;
     inputHistoryLoad: (path: string) => number;
     inputSetSuggestion: (id: number, text: string) => void;
+    inputSetInput: (text: string) => void;
+    inputInsertAtCursor: (text: string) => void;
     inputEAGAIN: () => number;
 };
 
@@ -140,6 +142,9 @@ async function loadRc(customPath?: string): Promise<void> {
         removeWidget: (id: string) => ui?.removeWidget(id),
         // Terminal info
         get columns() { return native.inputGetCols(); },
+        // Input buffer manipulation
+        setInput: (text: string) => ui?.setInput(text),
+        insertAtCursor: (text: string) => ui?.insertAtCursor(text),
         // Colors
         colors,
         makeFgColor,
