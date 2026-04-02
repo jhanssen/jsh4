@@ -276,6 +276,7 @@ struct InputState {
     // Cached completion state: original buffer + candidates from first Tab.
     std::string completion_original; // buffer before first completion applied
     std::vector<std::string> completion_entries; // cached candidates
+    std::vector<std::string> completion_descriptions; // parallel to completion_entries
     // Reverse search (Ctrl-R)
     bool in_search = false;
     char search_query[256];
@@ -576,6 +577,12 @@ static void notifyRender() {
     if (g_state.in_line_search) {
         state.Set("lineSearchQuery", Napi::String::New(env, g_state.line_search_query, g_state.line_search_query_len));
     }
+    if (g_state.in_completion && g_state.completion_idx < g_state.completion_descriptions.size()) {
+        auto& desc = g_state.completion_descriptions[g_state.completion_idx];
+        if (!desc.empty()) {
+            state.Set("completionDesc", Napi::String::New(env, desc));
+        }
+    }
     g_ctx->onRender.Call({state});
 }
 
@@ -608,11 +615,12 @@ static void applyCurrentCompletion(InputState *s) {
     notifyRender();
 }
 
-// Start completion with a set of entries.
-static void startCompletion(InputState *s, std::vector<std::string> entries) {
+// Start completion with a set of entries and optional descriptions.
+static void startCompletion(InputState *s, std::vector<std::string> entries, std::vector<std::string> descs = {}) {
     if (entries.empty()) return;
     s->completion_original = std::string(s->buf, s->len);
     s->completion_entries = std::move(entries);
+    s->completion_descriptions = std::move(descs);
     s->completion_idx = 0;
     s->in_completion = 1;
     applyCurrentCompletion(s);
@@ -660,6 +668,7 @@ static int completeLine(InputState *s, char c) {
     if (c == '/' && s->len > 0 && s->buf[s->len - 1] == '/') {
         s->in_completion = 0;
         s->completion_entries.clear();
+        s->completion_descriptions.clear();
         s->completion_original.clear();
         bufferChanged();
         notifyRender();
@@ -667,6 +676,7 @@ static int completeLine(InputState *s, char c) {
     }
     s->in_completion = 0;
     s->completion_entries.clear();
+    s->completion_descriptions.clear();
     s->completion_original.clear();
     return c;
 }
@@ -1260,15 +1270,19 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
     if (!g_state.waiting_for_completions) return env.Undefined();
     g_state.waiting_for_completions = false;
 
-    // Extract completion entries.
+    // Extract completion entries and optional descriptions.
     std::vector<std::string> entries;
+    std::vector<std::string> descs;
     if (info.Length() > 0 && info[0].IsArray()) {
         entries = extractCompletionArray(info[0].As<Napi::Array>());
+    }
+    if (info.Length() > 1 && info[1].IsArray()) {
+        descs = extractCompletionArray(info[1].As<Napi::Array>());
     }
 
     // Apply completions.
     if (!entries.empty()) {
-        startCompletion(&g_state, std::move(entries));
+        startCompletion(&g_state, std::move(entries), std::move(descs));
     }
 
     // Resume stdin polling.

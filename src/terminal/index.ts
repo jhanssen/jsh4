@@ -4,6 +4,8 @@ import { Renderer } from "./renderer.js";
 import { WidgetManager } from "./widgets.js";
 import type { WidgetDef, WidgetHandle, WidgetZone, WidgetOptions } from "./widgets.js";
 import type { Frame } from "./renderer.js";
+import type { CompletionEntry } from "../completion/index.js";
+import { normalizeEntries } from "../completion/index.js";
 
 export type { WidgetDef, WidgetHandle, WidgetZone, WidgetOptions } from "./widgets.js";
 
@@ -17,6 +19,7 @@ interface InputState {
     searchQuery?: string;     // Ctrl-R reverse history search
     searchMatch?: boolean;
     lineSearchQuery?: string; // Ctrl-S inline forward search
+    completionDesc?: string;  // description of current completion entry
 }
 
 interface RenderLineResult {
@@ -41,7 +44,7 @@ interface NativeInputEngine {
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
     inputInsertAtCursor: (text: string) => void;
-    inputSetCompletions: (entries: string[]) => void;
+    inputSetCompletions: (entries: string[], descs: string[]) => void;
     inputEAGAIN: () => number;
 }
 
@@ -51,7 +54,7 @@ export class TerminalUI {
     private widgets: WidgetManager;
 
     private colorizeFn: ((input: string, context?: string) => string) | null = null;
-    private completionFn: ((input: string) => string[] | Promise<string[]>) | null = null;
+    private completionFn: ((input: string) => CompletionEntry[] | Promise<CompletionEntry[]>) | null = null;
     private suggestionFn: ((input: string) => Promise<string | null>) | null = null;
     private lastState: InputState | null = null;
     private lineCallback: ((line: string | null, errno?: number) => void) | null = null;
@@ -105,16 +108,22 @@ export class TerminalUI {
             onCompletion: this.completionFn
                 ? (input: string) => {
                     const result = this.completionFn!(input);
-                    if (result && typeof (result as Promise<string[]>).then === "function") {
+                    if (result && typeof (result as Promise<CompletionEntry[]>).then === "function") {
                         // Async: C++ will detect the promise and stop polling.
                         // Chain .then to deliver results when ready.
-                        (result as Promise<string[]>).then(
-                            entries => this.native.inputSetCompletions(entries),
-                            () => this.native.inputSetCompletions([]),
+                        (result as Promise<CompletionEntry[]>).then(
+                            entries => {
+                                const { texts, descs } = normalizeEntries(entries);
+                                this.native.inputSetCompletions(texts, descs);
+                            },
+                            () => this.native.inputSetCompletions([], []),
                         );
                         return result; // Return the promise so C++ sees IsPromise()
                     }
-                    return result; // Sync: return the array directly.
+                    // Sync: normalize and return texts only (C++ reads directly).
+                    // Sync completions (file/command) are plain strings without descriptions.
+                    const { texts } = normalizeEntries(result as CompletionEntry[]);
+                    return texts;
                 }
                 : undefined,
         });
@@ -138,7 +147,7 @@ export class TerminalUI {
         this.colorizeFn = fn;
     }
 
-    setCompletion(fn: ((input: string) => string[] | Promise<string[]>) | null): void {
+    setCompletion(fn: ((input: string) => CompletionEntry[] | Promise<CompletionEntry[]>) | null): void {
         this.completionFn = fn;
     }
 
@@ -357,6 +366,12 @@ export class TerminalUI {
         if (state.suggestion && state.pos === state.len && inputLines.length > 0) {
             const lastIdx = inputLines.length - 1;
             inputLines[lastIdx] = inputLines[lastIdx]! + this.suggestionColor + state.suggestion + "\x1b[0m";
+        }
+
+        // Append completion description (dimmed, after cursor on the input line).
+        if (state.completionDesc && inputLines.length > 0) {
+            const lastIdx = inputLines.length - 1;
+            inputLines[lastIdx] += "\x1b[2m " + state.completionDesc + "\x1b[0m";
         }
 
         // Get header/footer from widgets.

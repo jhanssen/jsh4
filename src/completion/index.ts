@@ -5,10 +5,35 @@ import { $ } from "../variables/index.js";
 import { getAlias } from "../api/index.js";
 import { listJsFunctions } from "../jsfunctions/index.js";
 
+// ---- Completion entry type --------------------------------------------------
+
+export type CompletionEntry = string | { text: string; desc?: string };
+
+/** Split CompletionEntry[] into parallel texts[] and descs[] arrays for C++. */
+export function normalizeEntries(entries: CompletionEntry[]): { texts: string[]; descs: string[] } {
+    const texts: string[] = [];
+    const descs: string[] = [];
+    for (const e of entries) {
+        if (typeof e === "string") {
+            texts.push(e);
+            descs.push("");
+        } else {
+            texts.push(e.text);
+            descs.push(e.desc ?? "");
+        }
+    }
+    return { texts, descs };
+}
+
+/** Extract the text value from a CompletionEntry. */
+export function entryText(e: CompletionEntry): string {
+    return typeof e === "string" ? e : e.text;
+}
+
 // ---- User-defined completion handlers ---------------------------------------
 
 type CompletionCtx = { words: string[]; current: string };
-type CompletionFn = (ctx: CompletionCtx) => string[] | Promise<string[]>;
+type CompletionFn = (ctx: CompletionCtx) => CompletionEntry[] | Promise<CompletionEntry[]>;
 
 const handlers = new Map<string, CompletionFn>();
 
@@ -139,7 +164,16 @@ function splitWords(input: string): string[] {
     return words;
 }
 
-export function getCompletions(input: string): string[] | Promise<string[]> {
+/** Prepend inputPrefix to each entry's text, preserving description. */
+function prefixEntries(entries: CompletionEntry[], inputPrefix: string): CompletionEntry[] {
+    if (!inputPrefix) return entries;
+    return entries.map(e => {
+        if (typeof e === "string") return inputPrefix + e;
+        return { text: inputPrefix + e.text, desc: e.desc };
+    });
+}
+
+export function getCompletions(input: string): CompletionEntry[] | Promise<CompletionEntry[]> {
     const words = splitWords(input);
     const isFirstWord = words.length === 0 || (words.length === 1 && !input.endsWith(" ") && !input.endsWith("\t"));
     const current = isFirstWord ? (words[0] ?? "") : (input.endsWith(" ") || input.endsWith("\t") ? "" : (words[words.length - 1] ?? ""));
@@ -165,13 +199,13 @@ export function getCompletions(input: string): string[] | Promise<string[]> {
     const handler = handlers.get(cmd);
     if (handler) {
         const result = handler({ words, current });
-        if (result && typeof (result as Promise<string[]>).then === "function") {
+        if (result && typeof (result as Promise<CompletionEntry[]>).then === "function") {
             // Async handler — propagate the promise.
-            return (result as Promise<string[]>).then(
-                candidates => candidates.map(c => inputPrefix + c)
+            return (result as Promise<CompletionEntry[]>).then(
+                candidates => prefixEntries(candidates, inputPrefix)
             );
         }
-        return (result as string[]).map(c => inputPrefix + c);
+        return prefixEntries(result as CompletionEntry[], inputPrefix);
     }
 
     // Default: file completion (sync).
