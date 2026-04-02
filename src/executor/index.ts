@@ -7,16 +7,20 @@ import { promisify } from "node:util";
 const fsReadAsync = promisify(fsRead);
 import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup, Subshell, Redirection,
-    IfClause, WhileClause, ForClause, FunctionDef, JsFunction, CaseClause,
+    IfClause, WhileClause, ForClause, SelectClause, FunctionDef, JsFunction, CaseClause,
     ConditionalExpr,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl, registerProcessSubstImpl } from "../expander/index.js";
-import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot } from "../variables/index.js";
-import { pushParams, popParams, shiftParams, snapshotParams, restoreParams } from "../variables/positional.js";
+import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot, declareReadonly, getReadonlyVars } from "../variables/index.js";
+import { pushParams, popParams, shiftParams, snapshotParams, restoreParams, getAllParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { getAlias } from "../api/index.js";
+import { commandExists } from "../completion/index.js";
 import { shellOpts, saveShellOpts, restoreShellOpts } from "../shellopts/index.js";
+
+// Sentinel for `return N` in shell functions.
+class ShellReturn { constructor(public exitCode: number) {} }
 import {
     addJob, removeJob, getJobBySpec, getCurrentJob, getAllJobs,
     markJobStopped, markJobRunning, reapFinishedJobs,
@@ -176,6 +180,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         case "IfClause":       return executeIf(node as IfClause);
         case "WhileClause":    return executeWhile(node as WhileClause);
         case "ForClause":      return executeFor(node as ForClause);
+        case "SelectClause":   return executeSelect(node as SelectClause);
         case "FunctionDef":    return executeFunctionDef(node as FunctionDef);
         case "CaseClause":     return executeCase(node as CaseClause);
         case "ConditionalExpr": return executeConditionalExpr(node as ConditionalExpr);
@@ -421,6 +426,12 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
             const r = await executeNode(func);
             $["PIPESTATUS"] = [r.exitCode];
             return r;
+        } catch (e) {
+            if (e instanceof ShellReturn) {
+                $["PIPESTATUS"] = [e.exitCode];
+                return { exitCode: e.exitCode };
+            }
+            throw e;
         }
         finally { popScope(); popParams(); }
     }
@@ -442,6 +453,43 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         const r = await runSource(args[0]!, args.slice(1));
         $["PIPESTATUS"] = [r.exitCode];
         return r;
+    }
+
+    // return — exit from shell function with code
+    if (command === "return") {
+        const code = args[0] !== undefined ? parseInt(args[0], 10) : Number($["?"] ?? 0);
+        throw new ShellReturn(isNaN(code) ? 0 : code);
+    }
+
+    // command — bypass functions/aliases, or check existence with -v
+    if (command === "command") {
+        if (args[0] === "-v" || args[0] === "-V") {
+            if (args.length < 2) return { exitCode: 1 };
+            const name = args[1]!;
+            // Check builtins, PATH, aliases, functions
+            if (commandExists(name)) {
+                process.stdout.write(name + "\n");
+                return { exitCode: 0 };
+            }
+            // Check shell functions
+            if (shellFunctions.has(name)) {
+                process.stdout.write(name + "\n");
+                return { exitCode: 0 };
+            }
+            return { exitCode: 1 };
+        }
+        // command NAME ARGS — run NAME bypassing functions and aliases
+        if (args.length > 0) {
+            const subCmd = args[0]!;
+            const subArgs = args.slice(1);
+            // Try builtins first
+            const builtin = runBuiltin(subCmd, subArgs);
+            if (builtin !== null) return builtin;
+            // External command
+            const result = await native.spawnPipeline([{ cmd: subCmd, args: subArgs, redirs }], []);
+            return { exitCode: result.exitCode };
+        }
+        return { exitCode: 0 };
     }
 
     // exit — run EXIT trap before exiting
@@ -912,6 +960,36 @@ async function executeFor(node: ForClause): Promise<ExecResult> {
     return last;
 }
 
+async function executeSelect(node: SelectClause): Promise<ExecResult> {
+    const itemArrays = await Promise.all(node.items.map(expandWord));
+    const items = itemArrays.flat();
+    if (items.length === 0) return { exitCode: 0 };
+
+    // Display menu.
+    for (let i = 0; i < items.length; i++) {
+        process.stderr.write(`${i + 1}) ${items[i]}\n`);
+    }
+
+    let last: ExecResult = { exitCode: 0 };
+    // Loop: read choice from stdin.
+    while (true) {
+        process.stderr.write("#? ");
+        const line = readLineFromFd(0);
+        if (line === null) break; // EOF
+        const trimmed = line.trim();
+        if (trimmed === "") continue; // Empty: redisplay menu
+        const n = parseInt(trimmed, 10);
+        if (isNaN(n) || n < 1 || n > items.length) {
+            $[node.name] = "";
+        } else {
+            $[node.name] = items[n - 1]!;
+        }
+        $["REPLY"] = trimmed;
+        last = await executeNode(node.body);
+    }
+    return last;
+}
+
 async function executeCase(node: CaseClause): Promise<ExecResult> {
     const word = await expandWordToStr(node.word);
     for (const item of node.items) {
@@ -1340,6 +1418,97 @@ function toInt(s: string): number {
     return n;
 }
 
+// ---- getopts builtin --------------------------------------------------------
+
+function runGetopts(args: string[]): ExecResult {
+    if (args.length < 2) {
+        process.stderr.write("getopts: usage: getopts optstring name [args]\n");
+        return { exitCode: 2 };
+    }
+    const optstring = args[0]!;
+    const name = args[1]!;
+    // Use positional params if no extra args
+    const optArgs = args.length > 2 ? args.slice(2) : getAllParams();
+
+    // OPTIND is 1-based
+    let optind = parseInt(String($["OPTIND"] ?? "1"), 10);
+    if (isNaN(optind) || optind < 1) optind = 1;
+
+    const idx = optind - 1;
+    if (idx >= optArgs.length) {
+        $[name] = "?";
+        return { exitCode: 1 };
+    }
+
+    const arg = optArgs[idx]!;
+    if (!arg.startsWith("-") || arg === "-" || arg === "--") {
+        $[name] = "?";
+        if (arg === "--") $["OPTIND"] = String(optind + 1);
+        return { exitCode: 1 };
+    }
+
+    // Get current position within the arg (for bundled options like -abc)
+    let optpos = parseInt(String($["_OPTPOS"] ?? "1"), 10);
+    if (isNaN(optpos) || optpos < 1) optpos = 1;
+
+    const ch = arg[optpos];
+    if (!ch) {
+        $["OPTIND"] = String(optind + 1);
+        $["_OPTPOS"] = "1";
+        $[name] = "?";
+        return { exitCode: 1 };
+    }
+
+    const colonIdx = optstring.indexOf(ch);
+    if (colonIdx === -1) {
+        // Unknown option
+        $[name] = "?";
+        $["OPTARG"] = ch;
+        if (optpos + 1 < arg.length) {
+            $["_OPTPOS"] = String(optpos + 1);
+        } else {
+            $["OPTIND"] = String(optind + 1);
+            $["_OPTPOS"] = "1";
+        }
+        if (optstring[0] !== ":") process.stderr.write(`jsh: getopts: illegal option -- ${ch}\n`);
+        return { exitCode: 0 };
+    }
+
+    $[name] = ch;
+
+    // Check if option takes an argument
+    if (optstring[colonIdx + 1] === ":") {
+        // Needs argument
+        if (optpos + 1 < arg.length) {
+            // Rest of current arg is the optarg
+            $["OPTARG"] = arg.slice(optpos + 1);
+            $["OPTIND"] = String(optind + 1);
+            $["_OPTPOS"] = "1";
+        } else if (idx + 1 < optArgs.length) {
+            // Next arg is the optarg
+            $["OPTARG"] = optArgs[idx + 1]!;
+            $["OPTIND"] = String(optind + 2);
+            $["_OPTPOS"] = "1";
+        } else {
+            // Missing argument
+            $[name] = optstring[0] === ":" ? ":" : "?";
+            $["OPTARG"] = ch;
+            $["OPTIND"] = String(optind + 1);
+            $["_OPTPOS"] = "1";
+            if (optstring[0] !== ":") process.stderr.write(`jsh: getopts: option requires an argument -- ${ch}\n`);
+        }
+    } else {
+        // No argument needed
+        if (optpos + 1 < arg.length) {
+            $["_OPTPOS"] = String(optpos + 1);
+        } else {
+            $["OPTIND"] = String(optind + 1);
+            $["_OPTPOS"] = "1";
+        }
+    }
+    return { exitCode: 0 };
+}
+
 // ---- echo escape processing -------------------------------------------------
 
 function echoEscape(s: string): string {
@@ -1572,15 +1741,38 @@ function consumeEscape(s: string, i: number): { char: string; next: number } {
 function runBuiltin(name: string, args: string[]): ExecResult | null {
     switch (name) {
         case "cd": {
-            const target = args[0] ?? String($["HOME"] ?? process.env["HOME"] ?? "/");
-            try {
-                process.chdir(target);
-                $["PWD"] = process.cwd();
-            } catch (e: unknown) {
-                process.stderr.write(`cd: ${e instanceof Error ? e.message : e}\n`);
-                return { exitCode: 1 };
+            let target = args[0] ?? String($["HOME"] ?? process.env["HOME"] ?? "/");
+            if (target === "-") {
+                const oldPwd = String($["OLDPWD"] ?? "");
+                if (!oldPwd) { process.stderr.write("cd: OLDPWD not set\n"); return { exitCode: 1 }; }
+                target = oldPwd;
+                process.stdout.write(target + "\n");
             }
-            return { exitCode: 0 };
+            const oldCwd = process.cwd();
+            // Try target directly first, then search CDPATH for non-absolute/non-relative paths.
+            let resolved = false;
+            if (!target.startsWith("/") && !target.startsWith("./") && !target.startsWith("../")) {
+                try { process.chdir(target); resolved = true; } catch {}
+                if (!resolved) {
+                    const cdpath = String($["CDPATH"] ?? "");
+                    if (cdpath) {
+                        for (const dir of cdpath.split(":")) {
+                            const candidate = dir ? `${dir}/${target}` : target;
+                            try { process.chdir(candidate); resolved = true; break; } catch {}
+                        }
+                    }
+                }
+            }
+            if (!resolved) {
+                try { process.chdir(target); resolved = true; } catch {}
+            }
+            if (resolved) {
+                $["OLDPWD"] = oldCwd;
+                $["PWD"] = process.cwd();
+                return { exitCode: 0 };
+            }
+            process.stderr.write(`cd: no such file or directory: ${target}\n`);
+            return { exitCode: 1 };
         }
         case "export": {
             for (const arg of args) {
@@ -1661,6 +1853,27 @@ function runBuiltin(name: string, args: string[]): ExecResult | null {
             return runType(args);
         case "which":
             return runWhich(args);
+        case "readonly": {
+            if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
+                for (const [name, val] of getReadonlyVars()) {
+                    process.stdout.write(`declare -r ${name}=${JSON.stringify(String(val ?? ""))}\n`);
+                }
+                return { exitCode: 0 };
+            }
+            for (const arg of args) {
+                const eq = arg.indexOf("=");
+                if (eq > 0) {
+                    const key = arg.slice(0, eq);
+                    const val = arg.slice(eq + 1);
+                    declareReadonly(key, val);
+                } else if (arg) {
+                    declareReadonly(arg);
+                }
+            }
+            return { exitCode: 0 };
+        }
+        case "getopts":
+            return runGetopts(args);
         case "printf":
             return runPrintf(args);
         default:

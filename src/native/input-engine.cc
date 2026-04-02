@@ -308,14 +308,20 @@ static void editHistoryNav(InputState *s, int dir) {
 
 // ---- Reverse history search ------------------------------------------------
 
-static void searchHistoryReverse(InputState *s) {
+static void searchHistoryReverse(InputState *s, bool nextMatch = false) {
     // Search backward from current match position (or end of history).
-    int start = s->search_match_index >= 0 ? s->search_match_index - 1 : history_len - 2;
+    // If nextMatch is false, try the current position first (query may have changed).
+    // If nextMatch is true (Ctrl-R pressed again), skip to the next older match.
+    int start;
+    if (s->search_match_index >= 0) {
+        start = nextMatch ? s->search_match_index - 1 : s->search_match_index;
+    } else {
+        start = history_len - 2; // -2 because last entry is the temp editing entry
+    }
     if (s->search_query_len == 0) { s->search_match_index = -1; return; }
     for (int i = start; i >= 0; i--) {
         if (strstr(history[i], s->search_query) != nullptr) {
             s->search_match_index = i;
-            // Copy match to edit buffer.
             strncpy(s->buf, history[i], s->buflen);
             s->buf[s->buflen] = '\0';
             s->len = s->pos = strlen(s->buf);
@@ -459,7 +465,7 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
     if (s->in_search) {
         if (c == CTRL_R) {
             // Search for next older match.
-            searchHistoryReverse(s);
+            searchHistoryReverse(s, true);
             notifyRender();
             return 0;
         }
@@ -479,12 +485,12 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
             return 0;
         }
         if (c == BACKSPACE || c == CTRL_H) {
-            // Delete last char from search query.
+            // Delete last char from search query, re-search from end.
             if (s->search_query_len > 0) {
                 s->search_query_len--;
                 s->search_query[s->search_query_len] = '\0';
-                s->search_match_index = -1; // Reset search position.
-                searchHistoryReverse(s);
+                s->search_match_index = -1;
+                searchHistoryReverse(s, false);
             }
             notifyRender();
             return 0;

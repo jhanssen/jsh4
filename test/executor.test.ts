@@ -1000,6 +1000,67 @@ describe("executor — process substitution", () => {
     });
 });
 
+describe("executor — return builtin", () => {
+    it("should return from function with exit code", () => {
+        assert.strictEqual(run("f() { return 42; }; f; echo $?"), "42");
+    });
+
+    it("should stop execution at return", () => {
+        assert.strictEqual(run("f() { echo before; return 0; echo after; }; f"), "before");
+    });
+
+    it("should default to last exit code", () => {
+        assert.strictEqual(run("f() { false; return; }; f; echo $?"), "1");
+    });
+});
+
+describe("executor — command builtin", () => {
+    it("should find existing command with -v", () => {
+        assert.strictEqual(run("command -v echo"), "echo");
+    });
+
+    it("should return 1 for nonexistent command with -v", () => {
+        assert.strictEqual(ec("command -v __no_such_cmd__"), 1);
+    });
+
+    it("should bypass functions", () => {
+        assert.strictEqual(run("echo() { true; }; command echo hello"), "hello");
+    });
+});
+
+describe("executor — readonly builtin", () => {
+    it("should set and protect a variable", () => {
+        const { stdout, stderr } = runFull("readonly X=hello; X=world; echo $X");
+        assert.strictEqual(stdout, "hello");
+        assert.match(stderr, /readonly/);
+    });
+
+    it("should list readonly vars with -p", () => {
+        const out = run("readonly A=1; readonly -p");
+        assert.match(out, /declare -r A=/);
+    });
+});
+
+describe("executor — cd enhancements", () => {
+    it("should support cd -", () => {
+        const out = run("cd /tmp; cd /; cd -; pwd");
+        assert.match(out, /tmp/);
+    });
+
+    it("should support CDPATH", () => {
+        assert.strictEqual(run("export CDPATH=/usr; cd bin; pwd"), "/usr/bin");
+    });
+});
+
+describe("executor — getopts builtin", () => {
+    it("should parse simple flags", () => {
+        assert.strictEqual(
+            run('f() { while getopts "ab:" opt; do echo "$opt"; done; }; f -a -b val'),
+            "a\nb"
+        );
+    });
+});
+
 describe("executor — echo flags", () => {
     it("should suppress newline with -n", () => {
         assert.strictEqual(run("echo -n hello; echo world"), "helloworld");

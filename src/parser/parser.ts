@@ -1,7 +1,7 @@
 import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List,
     Subshell, BraceGroup, Redirection, Word, WordSegment,
-    IfClause, WhileClause, ForClause, FunctionDef, CaseClause, CaseItem,
+    IfClause, WhileClause, ForClause, SelectClause, FunctionDef, CaseClause, CaseItem,
     ConditionalExpr,
 } from "./ast.js";
 import { Lexer, TokenType } from "./lexer.js";
@@ -196,6 +196,7 @@ export class Parser {
             if (kw === "while") return this.parseWhile(false);
             if (kw === "until") return this.parseWhile(true);
             if (kw === "for")   return this.parseFor();
+            if (kw === "select") return this.parseSelect();
             if (kw === "case")  return this.parseCase();
 
             // [[ conditional expression
@@ -371,6 +372,42 @@ export class Parser {
         this.expectKeyword("done");
 
         return { type: "ForClause", name, items, body };
+    }
+
+    // select name in word*; do list done
+    private parseSelect(): SelectClause {
+        this.lexer.next(); // consume 'select'
+        this.skipNewlines();
+
+        const nameTok = this.lexer.peek();
+        const name = this.literalValue(nameTok);
+        if (!name) throw new ParseError("Expected variable name after 'select'");
+        this.lexer.next();
+
+        this.skipNewlines();
+
+        const items: Word[] = [];
+        if (this.literalValue(this.lexer.peek()) === "in") {
+            this.lexer.next(); // consume 'in'
+            while (
+                this.lexer.peek().type === TokenType.Word &&
+                !this.isCompoundTerminator()
+            ) {
+                items.push(this.lexer.peek().word!);
+                this.lexer.next();
+            }
+        }
+
+        if (this.lexer.peek().type === TokenType.Semi) this.lexer.next();
+        this.skipNewlines();
+
+        this.expectKeyword("do");
+        this.skipNewlines();
+        const body = this.parseList();
+        this.skipNewlines();
+        this.expectKeyword("done");
+
+        return { type: "SelectClause", name, items, body };
     }
 
     // case word in [pattern) list ;;]* esac

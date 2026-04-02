@@ -138,6 +138,13 @@ export interface ForClause extends ASTNode {
     body: ASTNode;
 }
 
+export interface SelectClause extends ASTNode {
+    type: "SelectClause";
+    name: string;
+    items: Word[];
+    body: ASTNode;
+}
+
 export interface FunctionDef extends ASTNode {
     type: "FunctionDef";
     name: string;

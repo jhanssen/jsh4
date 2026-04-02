@@ -63,6 +63,26 @@ export function declareLocal(name: string): void {
     }
 }
 
+// ---- readonly variables -----------------------------------------------------
+const readonlySet = new Set<string>();
+
+export function declareReadonly(name: string, value?: unknown): void {
+    if (value !== undefined) store.set(name, value);
+    readonlySet.add(name);
+}
+
+export function isReadonly(name: string): boolean {
+    return readonlySet.has(name);
+}
+
+export function getReadonlyVars(): Map<string, unknown> {
+    const result = new Map<string, unknown>();
+    for (const name of readonlySet) {
+        result.set(name, store.get(name));
+    }
+    return result;
+}
+
 export const $: Record<string, unknown> = new Proxy(
     {} as Record<string, unknown>,
     {
@@ -70,10 +90,18 @@ export const $: Record<string, unknown> = new Proxy(
             return store.get(prop);
         },
         set(_target, prop: string, value: unknown): boolean {
+            if (readonlySet.has(prop)) {
+                process.stderr.write(`jsh: ${prop}: readonly variable\n`);
+                return true;
+            }
             store.set(prop, value);
             return true;
         },
         deleteProperty(_target, prop: string): boolean {
+            if (readonlySet.has(prop)) {
+                process.stderr.write(`jsh: ${prop}: readonly variable\n`);
+                return true;
+            }
             store.delete(prop);
             delete process.env[prop];
             return true;
