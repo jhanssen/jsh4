@@ -1240,3 +1240,147 @@ describe("executor — builtins in pipelines", () => {
         assert.strictEqual(run("echo hello | cat"), "hello");
     });
 });
+
+describe("executor — arrays", () => {
+    it("should assign and expand array elements", () => {
+        assert.strictEqual(run("arr=(a b c); echo ${arr[0]} ${arr[1]} ${arr[2]}"), "a b c");
+    });
+
+    it("should expand all elements with [@]", () => {
+        assert.strictEqual(run("arr=(hello world); echo ${arr[@]}"), "hello world");
+    });
+
+    it("should expand all elements with [*]", () => {
+        assert.strictEqual(run("arr=(hello world); echo ${arr[*]}"), "hello world");
+    });
+
+    it("should get array length with #", () => {
+        assert.strictEqual(run('arr=(a b c d); echo ${#arr[@]}'), "4");
+    });
+
+    it("should append with +=", () => {
+        assert.strictEqual(run("arr=(a b); arr+=(c d); echo ${arr[@]}"), "a b c d");
+    });
+
+    it("should assign by index", () => {
+        assert.strictEqual(run("arr=(a b c); arr[1]=X; echo ${arr[@]}"), "a X c");
+    });
+
+    it("should treat unindexed array as first element", () => {
+        assert.strictEqual(run("arr=(first second); echo $arr"), "first");
+    });
+
+    it("should preserve words in quoted array expansion", () => {
+        const out = run('arr=("hello world" "foo bar"); for x in "${arr[@]}"; do echo "[$x]"; done');
+        assert.strictEqual(out, "[hello world]\n[foo bar]");
+    });
+
+    it("should string-append with +=", () => {
+        assert.strictEqual(run("x=hello; x+=world; echo $x"), "helloworld");
+    });
+
+    it("should handle empty array", () => {
+        assert.strictEqual(run("arr=(); echo ${#arr[@]}"), "0");
+    });
+
+    it("should expand array in for loop", () => {
+        assert.strictEqual(run("arr=(1 2 3); for i in ${arr[@]}; do echo $i; done"), "1\n2\n3");
+    });
+});
+
+describe("executor — kill builtin", () => {
+    it("should list signals with -l", () => {
+        const out = run("kill -l");
+        assert.match(out, /SIGTERM/);
+        assert.match(out, /SIGKILL/);
+    });
+
+    it("should send signal to a process", () => {
+        // Start a background sleep process, kill it, verify kill succeeds
+        assert.strictEqual(ec("sleep 60 & kill $!"), 0);
+    });
+
+    it("should send specific signal by name", () => {
+        assert.strictEqual(ec("sleep 60 & kill -TERM $!"), 0);
+    });
+
+    it("should report error for invalid pid", () => {
+        assert.strictEqual(ec("kill 999999999"), 1);
+    });
+});
+
+describe("executor — hash builtin", () => {
+    it("should hash a command", () => {
+        const out = run("hash ls; hash");
+        assert.match(out, /ls=/);
+    });
+
+    it("should clear hash table with -r", () => {
+        const { stderr } = runFull("hash ls; hash -r; hash");
+        assert.match(stderr, /hash table empty/);
+    });
+
+    it("should report error for unknown command", () => {
+        assert.strictEqual(ec("hash __no_such_cmd__"), 1);
+    });
+});
+
+describe("executor — let builtin", () => {
+    it("should evaluate arithmetic expression", () => {
+        assert.strictEqual(run("let x=5+3; echo $x"), "8");
+    });
+
+    it("should support multiple expressions", () => {
+        assert.strictEqual(run("let a=2 b=3 c=a+b; echo $c"), "5");
+    });
+
+    it("should return 0 for non-zero result", () => {
+        assert.strictEqual(ec("let x=1"), 0);
+    });
+
+    it("should return 1 for zero result", () => {
+        assert.strictEqual(ec("let x=0"), 1);
+    });
+
+    it("should support increment/decrement", () => {
+        assert.strictEqual(run("x=5; let x++; echo $x"), "6");
+    });
+});
+
+describe("executor — time keyword", () => {
+    it("should time a command and output timing to stderr", () => {
+        const { stdout, stderr } = runFull("time echo hello");
+        assert.strictEqual(stdout, "hello");
+        assert.match(stderr, /real\t/);
+    });
+});
+
+describe("executor — declare builtin", () => {
+    it("should declare an array", () => {
+        const out = run("declare -a myarr; myarr=(x y z); echo ${myarr[@]}");
+        assert.strictEqual(out, "x y z");
+    });
+
+    it("should print array declarations with -a", () => {
+        const out = run("arr=(a b); declare -a");
+        assert.match(out, /declare -a arr=/);
+    });
+});
+
+describe("executor — colon builtin", () => {
+    it("should be a no-op returning 0", () => {
+        assert.strictEqual(ec(":"), 0);
+    });
+
+    it("should work in while loop", () => {
+        assert.strictEqual(run("x=0; while :; do x=$((x+1)); if [ $x = 3 ]; then break; fi; done; echo $x"), "3");
+    });
+});
+
+describe("executor — disown builtin", () => {
+    it("should remove current job from table", () => {
+        // Start a background job, disown it, jobs should show nothing
+        const out = run("sleep 60 & disown; jobs");
+        assert.strictEqual(out, "");
+    });
+});

@@ -155,6 +155,29 @@ async function expandSegmentToFragments(seg: WordSegment, quoted: boolean): Prom
                 const sep = ifs.length > 0 ? ifs[0]! : "";
                 return [{ type: "literal", text: getAllParams().join(sep) }];
             }
+            // "${arr[@]}" in double-quoted context → separate words per element
+            if (vexp.index === "@" && quoted && !vexp.operator) {
+                const raw = $[vexp.name];
+                if (Array.isArray(raw)) {
+                    const arr = raw as unknown[];
+                    if (arr.length === 0) return [];
+                    const frags: Fragment[] = [{ type: "literal", text: String(arr[0]) }];
+                    for (let i = 1; i < arr.length; i++) {
+                        frags.push({ type: "break" });
+                        frags.push({ type: "literal", text: String(arr[i]) });
+                    }
+                    return frags;
+                }
+            }
+            // "${arr[*]}" in double-quoted context → join with IFS
+            if (vexp.index === "*" && quoted && !vexp.operator) {
+                const raw = $[vexp.name];
+                if (Array.isArray(raw)) {
+                    const ifs = getIFS();
+                    const sep = ifs.length > 0 ? ifs[0]! : "";
+                    return [{ type: "literal", text: (raw as unknown[]).map(String).join(sep) }];
+                }
+            }
             const text = expandVariable(vexp);
             return [quoted ? { type: "literal", text } : { type: "splittable", text }];
         }
@@ -433,10 +456,18 @@ function expandVariable(seg: VariableExpansion): string {
     if (seg.name === "#") return String(getParamCount());
     if (seg.name === "@" || seg.name === "*") return getAllParams().join(" ");
 
-    // ${#VAR} — length of variable value
+    // ${#VAR} — length of variable value or array
     if (seg.name.startsWith("#") && !seg.operator) {
         const realName = seg.name.slice(1);
         const v = $[realName];
+        // ${#arr[@]} or ${#arr[*]} — array element count
+        if (seg.index === "@" || seg.index === "*") {
+            return String(Array.isArray(v) ? v.length : (v !== undefined ? 1 : 0));
+        }
+        // ${#arr} where arr is an array — length of first element (bash compat)
+        if (Array.isArray(v)) {
+            return String(v.length > 0 ? String(v[0]).length : 0);
+        }
         return String(v !== undefined ? String(v).length : 0);
     }
 
@@ -567,7 +598,7 @@ function expandVariable(seg: VariableExpansion): string {
     }
 }
 
-function evalArithmetic(expr: string): string {
+export function evalArithmetic(expr: string): string {
     let e = expr;
 
     // Handle assignment operators: VAR=expr, VAR+=expr, VAR-=expr, VAR*=expr, VAR/=expr, VAR%=expr

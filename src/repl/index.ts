@@ -6,7 +6,6 @@ import { parse, IncompleteInputError } from "../parser/index.js";
 import { execute, executeString, setCommandText, reapJobs, hasShellFunction } from "../executor/index.js";
 import { $ } from "../variables/index.js";
 import {
-    getPromptAsync, setPrompt, setRightPrompt, getRightPromptAsync,
     setColorize, getColorize, setTheme, getAlias,
     alias, unalias, registerJsFunction, exec, registerCompletion,
 } from "../api/index.js";
@@ -16,6 +15,7 @@ import { commandExists } from "../completion/index.js";
 import { runTrap } from "../trap/index.js";
 import { addHistoryEntry, expandHistory } from "../history/index.js";
 import { TerminalUI } from "../terminal/index.js";
+import type { WidgetHandle, WidgetZone } from "../terminal/index.js";
 import { colors, makeFgColor, makeBgColor, makeUlColor, style } from "../terminal/colors.js";
 import type { JsPipelineFunction } from "../jsfunctions/index.js";
 
@@ -78,6 +78,11 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         // Set up tab completion.
         ui!.setCompletion((input: string) => getCompletions(input));
 
+        // Register default prompt if user didn't set one.
+        if (!userSetPrompt) {
+            ui!.addWidget("__default_prompt", "prompt", () => "$ ");
+        }
+
         process.on("beforeExit", async () => {
             await runTrap("EXIT", executeString);
         });
@@ -95,20 +100,27 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
     }
 }
 
+let userSetPrompt = false;
+
 async function loadRc(customPath?: string): Promise<void> {
     const rcPath = customPath
         ? resolve(customPath)
         : join(String($["HOME"] ?? homedir()), ".jshrc");
 
     const jshApi = {
-        $, setPrompt, setRightPrompt, setColorize, setTheme,
+        $, setColorize, setTheme,
         alias, unalias, registerJsFunction, exec,
         complete: registerCompletion,
-        // Terminal UI
-        setHeader: (fn: (() => string[] | Promise<string[]>) | null) => ui?.setHeader(fn),
-        setFooter: (fn: (() => string[] | Promise<string[]>) | null) => ui?.setFooter(fn),
-        addWidget: (id: string, zone: "header" | "footer", render: () => string | string[] | Promise<string | string[]>, order?: number, interval?: number) =>
-            ui?.addWidget(id, zone, render, order, interval),
+        // Widgets — unified API for all rendered regions
+        addWidget: (
+            id: string,
+            zone: WidgetZone,
+            render: () => string | string[] | Promise<string | string[]>,
+            order?: number,
+        ): WidgetHandle | undefined => {
+            if (zone === "prompt") userSetPrompt = true;
+            return ui?.addWidget(id, zone, render, order);
+        },
         removeWidget: (id: string) => ui?.removeWidget(id),
         // Colors
         colors,
@@ -165,12 +177,9 @@ async function promptLoop(buffer: string): Promise<void> {
         }
     }
 
-    const prompt = buffer ? "> " : await getPromptAsync();
-    const rprompt = buffer ? "" : await getRightPromptAsync();
+    const continuation = buffer.length > 0;
 
-    const markedPrompt = `\x1b]133;A\x07${prompt}\x1b]133;B\x07`;
-
-    ui.start(markedPrompt, rprompt, async (line, errno) => {
+    await ui.start(continuation, async (line, errno) => {
         if (line === null) {
             if (errno === ui!.eagain) {
                 // Ctrl-C — C++ already wrote \r\n

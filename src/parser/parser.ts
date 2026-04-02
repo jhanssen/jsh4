@@ -1,5 +1,5 @@
 import type {
-    ASTNode, SimpleCommand, Pipeline, AndOr, List,
+    ASTNode, SimpleCommand, Pipeline, AndOr, List, Assignment,
     Subshell, BraceGroup, Redirection, Word, WordSegment,
     IfClause, WhileClause, ForClause, ArithmeticFor, SelectClause, FunctionDef, CaseClause, CaseItem,
     ConditionalExpr,
@@ -203,8 +203,10 @@ export class Parser {
             if (tok.value === "[[") return this.parseConditionalExpr();
 
             // Function definition: NAME ( )
-            if (kw !== null && this.lexer.peekAt(1).type === TokenType.LParen &&
-                               this.lexer.peekAt(2).type === TokenType.RParen) {
+            // Exclude assignments (contain '=' or '+=') from being parsed as functions.
+            if (kw !== null && !kw.includes("=") &&
+                this.lexer.peekAt(1).type === TokenType.LParen &&
+                this.lexer.peekAt(2).type === TokenType.RParen) {
                 return this.parseFunctionDef(kw);
             }
 
@@ -661,7 +663,6 @@ export class Parser {
             if (tok.type !== TokenType.Word) break;
             if (!seenCommandWord && this.isAssignment(tok)) {
                 assignments.push(this.parseAssignment(tok));
-                this.lexer.next();
                 continue;
             }
             seenCommandWord = true;
@@ -719,23 +720,86 @@ export class Parser {
         if (!tok.word || tok.word.segments.length === 0) return false;
         const first = tok.word.segments[0]!;
         if (first.type !== "Literal") return false;
-        const eqIdx = (first as { type: "Literal"; value: string }).value.indexOf("=");
-        if (eqIdx <= 0) return false;
-        return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(
-            (first as { type: "Literal"; value: string }).value.slice(0, eqIdx)
-        );
+        const lit = (first as { type: "Literal"; value: string }).value;
+        // Match: name=, name+=, name[idx]= (where [idx] is a Glob segment followed by =)
+        const eqIdx = lit.indexOf("=");
+        if (eqIdx <= 0) {
+            // Could be name followed by Glob [idx] followed by Literal =val
+            // e.g. segments: [Literal "arr", Glob "[0]", Literal "=hello"]
+            if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(lit) && tok.word.segments.length >= 3) {
+                const second = tok.word.segments[1]!;
+                const third = tok.word.segments[2]!;
+                if (second.type === "Glob" && third.type === "Literal") {
+                    const tv = (third as { type: "Literal"; value: string }).value;
+                    if (tv.startsWith("=")) return true;
+                }
+            }
+            return false;
+        }
+        const before = lit.slice(0, eqIdx);
+        // name+= (append)
+        if (before.endsWith("+")) {
+            return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(before.slice(0, -1));
+        }
+        return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(before);
     }
 
-    private parseAssignment(tok: Token): { name: string; value: Word } {
+    private parseAssignment(tok: Token): Assignment {
         const first = tok.word!.segments[0]! as { type: "Literal"; value: string };
         const eqIdx = first.value.indexOf("=");
-        const name = first.value.slice(0, eqIdx);
+
+        // Handle name[idx]=val (Glob-based index)
+        if (eqIdx < 0) {
+            const name = first.value;
+            const globSeg = tok.word!.segments[1]! as { type: "Glob"; pattern: string };
+            const idx = globSeg.pattern.slice(1, -1); // strip [ ]
+            const third = tok.word!.segments[2]! as { type: "Literal"; value: string };
+            const rest = third.value.slice(1); // strip =
+            const valueSegments: WordSegment[] = [];
+            if (rest) valueSegments.push({ type: "Literal", value: rest });
+            for (let i = 3; i < tok.word!.segments.length; i++) {
+                valueSegments.push(tok.word!.segments[i]!);
+            }
+            this.lexer.next(); // consume token
+            return { name, index: idx, value: { segments: valueSegments } };
+        }
+
+        let before = first.value.slice(0, eqIdx);
+        const append = before.endsWith("+");
+        if (append) before = before.slice(0, -1);
+        const name = before;
         const rest = first.value.slice(eqIdx + 1);
+
+        // Check for array: name=( ... ) or name+=( ... )
+        if (rest === "" && this.lexer.peekAt(1).type === TokenType.LParen) {
+            this.lexer.next(); // consume assignment token
+            this.lexer.next(); // consume (
+            const elements: Word[] = [];
+            while (this.lexer.peek().type !== TokenType.RParen) {
+                if (this.lexer.peek().type === TokenType.EOF) {
+                    throw new IncompleteInputError();
+                }
+                // Skip newlines inside array
+                if (this.lexer.peek().type === TokenType.Newline) {
+                    this.lexer.next();
+                    continue;
+                }
+                if (this.lexer.peek().type !== TokenType.Word) {
+                    throw new ParseError(`Unexpected token in array: ${this.lexer.peek().value}`);
+                }
+                elements.push(this.lexer.peek().word!);
+                this.lexer.next();
+            }
+            this.lexer.next(); // consume )
+            return { name, append, array: elements, value: { segments: [] } };
+        }
+
+        this.lexer.next(); // consume assignment token
         const valueSegments: WordSegment[] = [];
         if (rest) valueSegments.push({ type: "Literal", value: rest });
         for (let i = 1; i < tok.word!.segments.length; i++) {
             valueSegments.push(tok.word!.segments[i]!);
         }
-        return { name, value: { segments: valueSegments } };
+        return { name, append, value: { segments: valueSegments } };
     }
 }

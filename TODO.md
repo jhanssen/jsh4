@@ -84,13 +84,24 @@
 - [x] `echo -n` / `-e` / `-E` — suppress newline, enable/disable escapes
 - [x] `read -s` / `-d` / `-n` / `-a` — silent, delimiter, nchars, array
 - [x] Builtins in pipelines — builtin-only commands run in-process with pipe fd redirection
+- [x] `kill` — send signals to processes/jobs (`kill [-signal] pid/jobspec`)
+- [x] `disown` — remove jobs from table (`-a` all, `-r` running)
+- [x] `hash` — command hash table for PATH lookup caching (`-r` to clear)
+- [x] `let` — arithmetic evaluation (`let x=5+3`, `let x++`)
+- [x] `declare` — variable declarations (`-a` array, `-x` export, `-r` readonly, `-p` print)
+- [x] `time` — measure command execution time
+- [x] `:` — no-op builtin (POSIX colon command)
 
 ### Expansion
 - [x] Variable expansion with all operators (`:-`, `:+`, `:=`, `:?`, `#`, `##`, `%`, `%%`, `/`, `//`)
 - [x] Case modification `${VAR^^}`, `${VAR,,}`, `${VAR^}`, `${VAR,}`
 - [x] Substring extraction `${VAR:offset}`, `${VAR:offset:length}`
 - [x] Length `${#VAR}`
+- [x] Array literals `name=(word ...)`, append `name+=(word ...)`, index `name[i]=val`
 - [x] Array subscript syntax `${VAR[n]}`, `${VAR[@]}`, `${VAR[*]}`
+- [x] `"${arr[@]}"` produces separate words; `"${arr[*]}"` joins with IFS
+- [x] `${#arr[@]}` — array element count
+- [x] String append `name+=value`
 - [x] Tilde expansion (`~`, `~/path`)
 - [x] Command substitution `$()` (fork + pipe capture, supports arbitrary ASTs including control flow)
 - [x] Arithmetic expansion `$((...))` via JS `Function()`, with `++`/`--`, `+=`/`-=`/`*=`/`/=`/`%=`, `=`
@@ -179,6 +190,8 @@
 - [x] Arithmetic for loop tests
 - [x] Builtins in pipelines tests
 - [x] Here-doc `$()` and `$(())` expansion tests
+- [x] Array tests (assign, append, index, `[@]`/`[*]`, `${#arr[@]}`, quoted expansion)
+- [x] kill, disown, hash, let, declare, time, colon tests
 
 ---
 
@@ -188,7 +201,6 @@
 
 - [ ] **`PS2` customization** — continuation prompt hardcoded as `"> "`
 - [ ] **Recursive glob `**` in brace expansion** — e.g. `{src,test}/**/*.ts`
-- [ ] **`hash` builtin** — command hash table for PATH lookup caching
 - [ ] **Named pipes / coprocesses**
 - [ ] **`read -t`** — timeout flag (requires async I/O changes)
 

@@ -9,15 +9,18 @@
  * jsh.$.EDITOR = 'nvim';
  * jsh.alias('ll', 'ls -la');
  *
- * jsh.setPrompt(async () => {
+ * // Prompt is a widget — re-evaluated on each new line or on handle.update().
+ * const prompt = jsh.addWidget("ps1", "prompt", async () => {
  *     const branch = await jsh.exec('git branch --show-current');
  *     const cwd = String(jsh.$.PWD ?? '~').replace(String(jsh.$.HOME ?? ''), '~');
  *     return jsh.style`${green}${bold}${cwd} ${cyan}${branch.ok ? branch.stdout : ''}${reset}$ `;
  * });
  *
- * jsh.addWidget("clock", "footer", () => {
+ * // Footer with a clock — interval is userland.
+ * const clock = jsh.addWidget("clock", "footer", () => {
  *     return jsh.style`${orange}${new Date().toLocaleTimeString()}`;
- * }, 0, 1000);
+ * });
+ * setInterval(() => clock.update(), 1000);
  *
  * // Exported functions are auto-registered as @name pipeline functions.
  * export async function* upper(args: string[], stdin: AsyncIterable<string>) {
@@ -71,6 +74,32 @@ interface Theme {
     argument?: Color;
     paren?: Color;
     jsInline?: Color;
+}
+
+// ---- Widgets ----------------------------------------------------------------
+
+/**
+ * Widget zones control where content renders in the terminal layout:
+ *
+ * - `"header"` — lines above the input line (multi-line, multiple widgets stack)
+ * - `"prompt"` — left side of input line (single-line, multiple widgets concatenate)
+ * - `"rprompt"` — right side of input line (single-line, multiple widgets concatenate)
+ * - `"ps2"` — left side of continuation lines (single-line)
+ * - `"footer"` — lines below the input line (multi-line, multiple widgets stack)
+ */
+type WidgetZone = "header" | "footer" | "prompt" | "rprompt" | "ps2";
+
+/**
+ * Handle returned by addWidget. Use update() to re-evaluate the render function
+ * and repaint the screen, or remove() to unregister the widget.
+ */
+interface WidgetHandle {
+    /** Re-evaluate the render function and repaint if content changed. */
+    update(): void;
+    /** Remove the widget from the layout. */
+    remove(): void;
+    /** The widget's unique id. */
+    readonly id: string;
 }
 
 // ---- Color constants --------------------------------------------------------
@@ -136,26 +165,61 @@ declare const jsh: {
     /** Shell variable store. */
     $: Record<string, unknown>;
 
-    // ---- Prompt ----
+    // ---- Widgets ----
 
     /**
-     * Set the interactive prompt. Supports async (e.g., for git branch).
+     * Register a widget that renders content in a layout zone.
+     * Returns a handle for updating or removing the widget.
+     *
+     * The render function is called:
+     * - Once on registration
+     * - On each new editing session (prompt/ps2 zones)
+     * - When handle.update() is called
+     *
+     * For prompt/rprompt/ps2 zones, the render function should return a string.
+     * For header/footer zones, it can return a string or string[].
+     *
+     * Multiple widgets in the same zone are ordered by the `order` parameter.
+     * Header/footer widgets stack (each adds lines). Prompt/rprompt/ps2 widgets
+     * concatenate their strings.
+     *
+     * @param id      Unique identifier
+     * @param zone    Where to render: "header", "footer", "prompt", "rprompt", "ps2"
+     * @param render  Function returning content (may be async)
+     * @param order   Sort order within the zone (default 0)
+     *
      * @example
-     * jsh.setPrompt(() => `$ `);
-     * jsh.setPrompt(async () => {
-     *     const b = await jsh.exec('git branch --show-current');
-     *     return `${b.ok ? b.stdout + ' ' : ''}$ `;
+     * // Prompt — re-evaluated on each new line
+     * const ps1 = jsh.addWidget("ps1", "prompt", async () => {
+     *     const b = await jsh.exec("git branch --show-current");
+     *     return `${b.ok ? b.stdout + " " : ""}$ `;
      * });
+     *
+     * // Right prompt
+     * jsh.addWidget("time", "rprompt", () => new Date().toLocaleTimeString());
+     *
+     * // Continuation prompt
+     * jsh.addWidget("ps2", "ps2", () => "> ");
+     *
+     * // Footer with live clock — interval is userland
+     * const clock = jsh.addWidget("clock", "footer", () => {
+     *     return jsh.style`${jsh.colors.dim}${new Date().toLocaleTimeString()}`;
+     * });
+     * setInterval(() => clock.update(), 1000);
+     *
+     * // Header updated from event
+     * const status = jsh.addWidget("net", "header", () => networkStatus);
+     * someEmitter.on("change", () => status.update());
      */
-    setPrompt(fn: () => string | Promise<string>): void;
+    addWidget(
+        id: string,
+        zone: WidgetZone,
+        render: () => string | string[] | Promise<string | string[]>,
+        order?: number,
+    ): WidgetHandle;
 
-    /**
-     * Set a right-aligned prompt. Supports async.
-     * Disappears if the input line would overlap it.
-     * @example
-     * jsh.setRightPrompt(() => new Date().toLocaleTimeString());
-     */
-    setRightPrompt(fn: (() => string | Promise<string>) | null): void;
+    /** Remove a previously registered widget by id. */
+    removeWidget(id: string): void;
 
     // ---- Syntax highlighting ----
 
@@ -164,55 +228,6 @@ declare const jsh: {
 
     /** Override syntax highlighting entirely. Null restores the default. */
     setColorize(fn: ((input: string) => string) | null): void;
-
-    // ---- Layout regions ----
-
-    /**
-     * Set header content (lines rendered above the input line).
-     * @example
-     * jsh.setHeader(() => ["  git: main ●3 ↑1"]);
-     */
-    setHeader(fn: (() => string[] | Promise<string[]>) | null): void;
-
-    /**
-     * Set footer content (lines rendered below the input line).
-     * @example
-     * jsh.setFooter(() => ["  12:34 PM"]);
-     */
-    setFooter(fn: (() => string[] | Promise<string[]>) | null): void;
-
-    // ---- Widgets ----
-
-    /**
-     * Register a widget that renders content in a header or footer zone.
-     * Widgets with an interval auto-refresh while the user is typing.
-     *
-     * @param id      Unique identifier (used for removeWidget)
-     * @param zone    "header" or "footer"
-     * @param render  Function returning a line or lines (may be async)
-     * @param order   Sort order within the zone (default 0)
-     * @param interval Auto-refresh interval in ms (omit for static)
-     *
-     * @example
-     * jsh.addWidget("clock", "footer", () => {
-     *     return jsh.style`${jsh.colors.dim}${new Date().toLocaleTimeString()}`;
-     * }, 0, 1000);
-     *
-     * jsh.addWidget("git", "header", async () => {
-     *     const b = await jsh.exec("git branch --show-current");
-     *     return b.ok ? jsh.style`${jsh.colors.cyan}${b.stdout}` : "";
-     * });
-     */
-    addWidget(
-        id: string,
-        zone: "header" | "footer",
-        render: () => string | string[] | Promise<string | string[]>,
-        order?: number,
-        interval?: number,
-    ): void;
-
-    /** Remove a previously registered widget. */
-    removeWidget(id: string): void;
 
     // ---- Colors ----
 

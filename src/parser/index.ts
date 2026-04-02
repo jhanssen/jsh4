@@ -1,5 +1,5 @@
 export type {
-    ASTNode, SimpleCommand, Pipeline, AndOr, List,
+    ASTNode, SimpleCommand, Pipeline, AndOr, List, Assignment,
     Subshell, BraceGroup, Redirection, Word, WordSegment,
     LiteralSegment, SingleQuotedSegment, DoubleQuotedSegment,
     VariableExpansion, CommandSubstitution, ArithmeticExpansion, GlobSegment, ProcessSubstitution,

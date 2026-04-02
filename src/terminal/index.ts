@@ -2,10 +2,10 @@
 
 import { Renderer } from "./renderer.js";
 import { WidgetManager } from "./widgets.js";
-import type { WidgetDef } from "./widgets.js";
+import type { WidgetDef, WidgetHandle, WidgetZone } from "./widgets.js";
 import type { Frame } from "./renderer.js";
 
-export type { WidgetDef } from "./widgets.js";
+export type { WidgetDef, WidgetHandle, WidgetZone } from "./widgets.js";
 
 interface InputState {
     buf: string;
@@ -43,15 +43,12 @@ export class TerminalUI {
     private renderer: Renderer;
     private widgets: WidgetManager;
 
-    private prompt = "$ ";
-    private rightPrompt = "";
     private colorizeFn: ((input: string) => string) | null = null;
     private completionFn: ((input: string) => string[]) | null = null;
-    private headerFn: (() => string[] | Promise<string[]>) | null = null;
-    private footerFn: (() => string[] | Promise<string[]>) | null = null;
     private lastState: InputState | null = null;
     private lineCallback: ((line: string | null, errno?: number) => void) | null = null;
     private EAGAIN: number;
+    private isContinuation = false;
 
     constructor(native: NativeInputEngine) {
         this.native = native;
@@ -63,12 +60,21 @@ export class TerminalUI {
 
     // ---- Core ----
 
-    start(prompt: string, rprompt: string, callback: (line: string | null, errno?: number) => void): void {
-        this.prompt = prompt;
-        this.rightPrompt = rprompt;
+    async start(continuation: boolean, callback: (line: string | null, errno?: number) => void): Promise<void> {
+        this.isContinuation = continuation;
         this.lineCallback = callback;
         this.renderer.reset();
-        this.widgets.startTimers();
+
+        // Re-evaluate prompt/rprompt/ps2 for this editing session.
+        if (continuation) {
+            await this.widgets.refreshZone("ps2");
+        } else {
+            await this.widgets.refreshZone("prompt");
+            await this.widgets.refreshZone("rprompt");
+        }
+        // Refresh header/footer too.
+        await this.widgets.refreshZone("header");
+        await this.widgets.refreshZone("footer");
 
         this.native.inputStart({
             onRender: (state: InputState) => this.onRender(state),
@@ -80,7 +86,6 @@ export class TerminalUI {
     }
 
     stop(): void {
-        this.widgets.stopTimers();
         this.native.inputStop();
     }
 
@@ -102,18 +107,10 @@ export class TerminalUI {
         this.completionFn = fn;
     }
 
-    setHeader(fn: (() => string[] | Promise<string[]>) | null): void {
-        this.headerFn = fn;
-    }
-
-    setFooter(fn: (() => string[] | Promise<string[]>) | null): void {
-        this.footerFn = fn;
-    }
-
     // ---- Widgets ----
 
-    addWidget(id: string, zone: "header" | "footer", render: WidgetDef["render"], order = 0, interval?: number): void {
-        this.widgets.add({ id, zone, order, render, interval });
+    addWidget(id: string, zone: WidgetZone, render: WidgetDef["render"], order = 0): WidgetHandle {
+        return this.widgets.add({ id, zone, order, render });
     }
 
     removeWidget(id: string): void {
@@ -137,15 +134,37 @@ export class TerminalUI {
 
     // ---- Internal ----
 
+    private oscMarks = true;
+
+    setOscMarks(enabled: boolean): void {
+        this.oscMarks = enabled;
+    }
+
+    private getPrompt(): string {
+        if (this.isContinuation) {
+            return this.widgets.hasZone("ps2") ? this.widgets.getZoneString("ps2") : "> ";
+        }
+        const raw = this.widgets.getZoneString("prompt") || "$ ";
+        if (this.oscMarks) {
+            return `\x1b]133;A\x07${raw}\x1b]133;B\x07`;
+        }
+        return raw;
+    }
+
+    private getRightPrompt(): string {
+        if (this.isContinuation) return "";
+        return this.widgets.getZoneString("rprompt");
+    }
+
     private onRender(state: InputState): void {
         this.lastState = state;
         this.renderFrame(state);
     }
 
     private onLine(line: string | null, errno?: number): void {
-        this.widgets.stopTimers();
         const headerRows = this.renderer.getLastHeaderRows();
         const footerRows = this.renderer.getLastFooterRows();
+        const prompt = this.getPrompt();
 
         if (headerRows > 0 || footerRows > 0) {
             let buf = "";
@@ -159,7 +178,7 @@ export class TerminalUI {
             if (this.lastState) {
                 const colorized = this.colorizeFn ? this.colorizeFn(this.lastState.buf) : this.lastState.buf;
                 const { line: inputLine } = this.native.inputRenderLine(
-                    this.prompt, colorized, "", this.lastState.cols
+                    prompt, colorized, "", this.lastState.cols
                 );
                 buf += inputLine;
             }
@@ -178,9 +197,12 @@ export class TerminalUI {
     }
 
     private renderFrame(state: InputState): void {
+        const prompt = this.getPrompt();
+        const rprompt = this.getRightPrompt();
+
         // In search mode, show the search prompt instead of the normal prompt.
-        let displayPrompt = this.prompt;
-        let displayRightPrompt = this.rightPrompt;
+        let displayPrompt = prompt;
+        let displayRightPrompt = rprompt;
         if (state.searchQuery !== undefined) {
             const failMark = state.searchMatch === false && state.searchQuery.length > 0 ? "failing " : "";
             displayPrompt = `(${failMark}reverse-i-search)\`${state.searchQuery}': `;
@@ -195,23 +217,11 @@ export class TerminalUI {
             displayPrompt, colorized, displayRightPrompt, state.cols
         );
 
-        // Get header/footer from widgets and/or direct functions.
-        const headerLines = this.getHeaderLines();
-        const footerLines = this.getFooterLines();
+        // Get header/footer from widgets.
+        const headerLines = this.widgets.getZoneLines("header");
+        const footerLines = this.widgets.getZoneLines("footer");
 
         const frame: Frame = { headerLines, inputLine: line, cursorCol, footerLines };
         this.renderer.render(frame);
-    }
-
-    private getHeaderLines(): string[] {
-        // Combine widget header lines with direct header function.
-        const widgetLines = this.widgets.getZoneLines("header");
-        // headerFn is async-capable but during render we use cached/sync result.
-        // If headerFn is set, it should be called async before start() and cached.
-        return widgetLines;
-    }
-
-    private getFooterLines(): string[] {
-        return this.widgets.getZoneLines("footer");
     }
 }

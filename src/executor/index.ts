@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
 import { createReadStream, createWriteStream, read as fsRead, readFileSync, readSync, accessSync, openSync, closeSync, constants as fsConstants } from "node:fs";
 import { resolve } from "node:path";
+import { constants as osConstants } from "node:os";
 import { promisify } from "node:util";
 
 const fsReadAsync = promisify(fsRead);
@@ -11,7 +12,7 @@ import type {
     ConditionalExpr,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
-import { expandWord, expandWordToStr, registerCaptureImpl, registerProcessSubstImpl } from "../expander/index.js";
+import { expandWord, expandWordToStr, registerCaptureImpl, registerProcessSubstImpl, evalArithmetic } from "../expander/index.js";
 import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot, declareReadonly, getReadonlyVars } from "../variables/index.js";
 import { pushParams, popParams, shiftParams, snapshotParams, restoreParams, getAllParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
@@ -420,7 +421,41 @@ async function captureAst(node: ASTNode): Promise<string> {
 
 async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     for (const a of cmd.assignments) {
-        $[a.name] = await expandWordToStr(a.value);
+        if (a.array) {
+            // Array assignment: name=(word1 word2 ...)
+            const elements: string[] = [];
+            for (const w of a.array) {
+                elements.push(...await expandWord(w));
+            }
+            if (a.append) {
+                const existing = $[a.name];
+                const cur = Array.isArray(existing) ? existing as string[] : (existing !== undefined ? [String(existing)] : []);
+                $[a.name] = [...cur, ...elements];
+            } else {
+                $[a.name] = elements;
+            }
+        } else if (a.index !== undefined) {
+            // Array element assignment: name[idx]=val
+            const val = await expandWordToStr(a.value);
+            const existing = $[a.name];
+            const arr = Array.isArray(existing) ? existing as string[] : [];
+            const idx = parseInt(a.index, 10);
+            // Extend array if needed
+            while (arr.length <= idx) arr.push("");
+            arr[idx] = val;
+            $[a.name] = arr;
+        } else if (a.append) {
+            // String append: name+=val
+            const val = await expandWordToStr(a.value);
+            const existing = $[a.name];
+            if (Array.isArray(existing)) {
+                $[a.name] = [...existing, val];
+            } else {
+                $[a.name] = (existing !== undefined ? String(existing) : "") + val;
+            }
+        } else {
+            $[a.name] = await expandWordToStr(a.value);
+        }
     }
     if (cmd.words.length === 0) return { exitCode: 0 };
 
@@ -432,6 +467,22 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     if (shellOpts.xtrace) {
         const trace = [command, ...args].join(" ");
         process.stderr.write(`+ ${trace}\n`);
+    }
+
+    // time keyword: measure execution time
+    if (command === "time") {
+        const remaining = args.join(" ");
+        if (!remaining.trim()) return { exitCode: 0 };
+        const startTime = process.hrtime.bigint();
+        const ast = parse(remaining);
+        const result = ast ? await executeNode(ast) : { exitCode: 0 };
+        const elapsed = Number(process.hrtime.bigint() - startTime) / 1e9;
+        const mins = Math.floor(elapsed / 60);
+        const secs = elapsed - mins * 60;
+        process.stderr.write(`\nreal\t${mins}m${secs.toFixed(3)}s\n`);
+        process.stderr.write(`user\t0m0.000s\n`);
+        process.stderr.write(`sys\t0m0.000s\n`);
+        return result;
     }
 
     // Shell functions take priority.
@@ -1029,6 +1080,264 @@ async function runWait(args: string[]): Promise<ExecResult> {
         }
     }
     return { exitCode: lastExit };
+}
+
+function evalArithmeticToNumber(expr: string): number {
+    return parseInt(evalArithmetic(expr), 10) || 0;
+}
+
+// ---- kill builtin -----------------------------------------------------------
+
+const SIGNAL_MAP: Record<string, number> = {};
+{
+    const sigs = osConstants.signals as Record<string, number>;
+    for (const [name, num] of Object.entries(sigs)) {
+        SIGNAL_MAP[name] = num;
+        SIGNAL_MAP[name.replace("SIG", "")] = num;
+    }
+}
+
+function runKill(args: string[]): ExecResult {
+    if (args.length === 0) {
+        process.stderr.write("kill: usage: kill [-signal] pid ...\n");
+        return { exitCode: 1 };
+    }
+    // -l: list signals
+    if (args[0] === "-l" || args[0] === "-L") {
+        const sigs = osConstants.signals as Record<string, number>;
+        const entries = Object.entries(sigs).filter(([n]) => n.startsWith("SIG")).sort((a, b) => a[1] - b[1]);
+        for (const [name, num] of entries) {
+            process.stdout.write(`${num}) ${name}\n`);
+        }
+        return { exitCode: 0 };
+    }
+
+    let signal = 15; // SIGTERM default
+    let startIdx = 0;
+
+    if (args[0]!.startsWith("-")) {
+        const sigSpec = args[0]!.slice(1).toUpperCase();
+        const num = parseInt(sigSpec, 10);
+        if (!isNaN(num)) {
+            signal = num;
+        } else {
+            const resolved = SIGNAL_MAP[sigSpec] ?? SIGNAL_MAP["SIG" + sigSpec];
+            if (resolved === undefined) {
+                process.stderr.write(`kill: ${args[0]}: invalid signal specification\n`);
+                return { exitCode: 1 };
+            }
+            signal = resolved;
+        }
+        startIdx = 1;
+    }
+
+    if (startIdx >= args.length) {
+        process.stderr.write("kill: usage: kill [-signal] pid ...\n");
+        return { exitCode: 1 };
+    }
+
+    let exitCode = 0;
+    for (let i = startIdx; i < args.length; i++) {
+        const arg = args[i]!;
+        let pid: number;
+        if (arg.startsWith("%")) {
+            const job = getJobBySpec(arg);
+            if (!job) {
+                process.stderr.write(`kill: ${arg}: no such job\n`);
+                exitCode = 1;
+                continue;
+            }
+            pid = -job.pgid; // negative = process group
+        } else {
+            pid = parseInt(arg, 10);
+            if (isNaN(pid)) {
+                process.stderr.write(`kill: ${arg}: invalid pid\n`);
+                exitCode = 1;
+                continue;
+            }
+        }
+        const r = native.sendSignal(pid, signal);
+        if (r !== 0) {
+            process.stderr.write(`kill: (${pid}) - No such process\n`);
+            exitCode = 1;
+        }
+    }
+    return { exitCode };
+}
+
+// ---- disown builtin ---------------------------------------------------------
+
+function runDisown(args: string[]): ExecResult {
+    if (args.length === 0) {
+        // Disown current job
+        const job = getCurrentJob();
+        if (!job) {
+            process.stderr.write("jsh: disown: no current job\n");
+            return { exitCode: 1 };
+        }
+        removeJob(job.id);
+        return { exitCode: 0 };
+    }
+    let exitCode = 0;
+    for (const arg of args) {
+        if (arg === "-a") {
+            // Disown all jobs
+            for (const job of getAllJobs()) removeJob(job.id);
+            return { exitCode: 0 };
+        }
+        if (arg === "-r") {
+            // Disown all running jobs
+            for (const job of getAllJobs()) {
+                if (job.status === "running") removeJob(job.id);
+            }
+            return { exitCode: 0 };
+        }
+        const job = getJobBySpec(arg);
+        if (!job) {
+            process.stderr.write(`jsh: disown: ${arg}: no such job\n`);
+            exitCode = 1;
+            continue;
+        }
+        removeJob(job.id);
+    }
+    return { exitCode };
+}
+
+// ---- hash builtin -----------------------------------------------------------
+
+const hashTable = new Map<string, string>();
+
+function runHash(args: string[]): ExecResult {
+    if (args.length === 0) {
+        if (hashTable.size === 0) {
+            process.stderr.write("hash: hash table empty\n");
+            return { exitCode: 0 };
+        }
+        for (const [name, path] of hashTable) {
+            process.stdout.write(`${name}=${path}\n`);
+        }
+        return { exitCode: 0 };
+    }
+    if (args[0] === "-r") {
+        hashTable.clear();
+        return { exitCode: 0 };
+    }
+    // hash name — add to hash table by looking up PATH
+    let exitCode = 0;
+    for (const name of args) {
+        const path = findInPath(name);
+        if (path) {
+            hashTable.set(name, path);
+        } else {
+            process.stderr.write(`hash: ${name}: not found\n`);
+            exitCode = 1;
+        }
+    }
+    return { exitCode };
+}
+
+// Lookup in hash table, used by findInPath integration.
+export function hashLookup(name: string): string | undefined {
+    return hashTable.get(name);
+}
+
+// ---- let builtin ------------------------------------------------------------
+
+function runLet(args: string[]): ExecResult {
+    if (args.length === 0) {
+        process.stderr.write("let: usage: let expression ...\n");
+        return { exitCode: 1 };
+    }
+    let lastResult = 0;
+    for (const expr of args) {
+        lastResult = evalArithmeticToNumber(expr);
+    }
+    // let returns 1 if last expression is 0, 0 otherwise (like bash)
+    return { exitCode: lastResult === 0 ? 1 : 0 };
+}
+
+// ---- declare builtin --------------------------------------------------------
+
+function runDeclare(args: string[]): ExecResult {
+    if (args.length === 0) {
+        // Print all variables
+        for (const key of Object.keys($)) {
+            const val = $[key];
+            if (Array.isArray(val)) {
+                const elements = (val as unknown[]).map((v, i) => `[${i}]="${v}"`).join(" ");
+                process.stdout.write(`declare -a ${key}=(${elements})\n`);
+            } else {
+                process.stdout.write(`declare -- ${key}="${val}"\n`);
+            }
+        }
+        return { exitCode: 0 };
+    }
+
+    let isArray = false;
+    let isExport = false;
+    let isReadonly = false;
+    let isPrint = false;
+    let startIdx = 0;
+
+    // Parse flags
+    for (let i = 0; i < args.length; i++) {
+        const a = args[i]!;
+        if (!a.startsWith("-") && !a.startsWith("+")) break;
+        startIdx = i + 1;
+        const flags = a.slice(1);
+        for (const f of flags) {
+            switch (f) {
+                case "a": isArray = true; break;
+                case "x": isExport = true; break;
+                case "r": isReadonly = true; break;
+                case "p": isPrint = true; break;
+                default:
+                    process.stderr.write(`declare: -${f}: invalid option\n`);
+                    return { exitCode: 1 };
+            }
+        }
+    }
+
+    if (isPrint || startIdx >= args.length) {
+        // Print matching variables
+        for (const key of Object.keys($)) {
+            const val = $[key];
+            if (isArray && !Array.isArray(val)) continue;
+            if (Array.isArray(val)) {
+                const elements = (val as unknown[]).map((v, i) => `[${i}]="${v}"`).join(" ");
+                process.stdout.write(`declare -a ${key}=(${elements})\n`);
+            } else {
+                process.stdout.write(`declare -- ${key}="${val}"\n`);
+            }
+        }
+        return { exitCode: 0 };
+    }
+
+    for (let i = startIdx; i < args.length; i++) {
+        const arg = args[i]!;
+        const eq = arg.indexOf("=");
+        const name = eq > 0 ? arg.slice(0, eq) : arg;
+        const value = eq > 0 ? arg.slice(eq + 1) : undefined;
+
+        if (isArray) {
+            if (value === undefined) {
+                if (!Array.isArray($[name])) $[name] = [];
+            } else {
+                // declare -a arr=value is not standard; treat as single element
+                $[name] = [value];
+            }
+        } else if (value !== undefined) {
+            $[name] = value;
+        }
+
+        if (isExport && $[name] !== undefined) {
+            process.env[name] = String($[name]);
+        }
+        if (isReadonly) {
+            declareReadonly(name, $[name] ?? "");
+        }
+    }
+    return { exitCode: 0 };
 }
 
 async function executeIf(node: IfClause): Promise<ExecResult> {
@@ -2176,6 +2485,12 @@ const builtins: Record<string, Builtin> = {
     }},
     getopts:  { external: false, run: (args) => runGetopts(args) },
     printf:   { external: true,  run: (args) => runPrintf(args) },
+    kill:     { external: true,  run: (args) => runKill(args) },
+    disown:   { external: false, run: (args) => runDisown(args) },
+    hash:     { external: false, run: (args) => runHash(args) },
+    let:      { external: false, run: (args) => runLet(args) },
+    declare:  { external: false, run: (args) => runDeclare(args) },
+    ":"       : { external: false, run() { return { exitCode: 0 }; }},
 };
 
 function runBuiltin(name: string, args: string[]): ExecResult | null {
@@ -2273,14 +2588,23 @@ function evalCondPrimary(args: string[], pos: number, end: number): CondResult {
 // ---- type / which builtins --------------------------------------------------
 
 const BUILTIN_NAMES = new Set([
-    "cd", "exit", "export", "unset", "echo", "true", "false",
-    "test", "[", "set", "local", "shift", "exec", "read",
-    "source", ".", "alias", "unalias", "type", "which",
+    ...Object.keys(builtins),
+    "read", "source", ".", "alias", "unalias",
+    "eval", "trap", "return", "command", "break", "continue",
+    "fg", "bg", "jobs", "wait", "select", "time",
 ]);
 
 function findInPath(cmd: string): string | null {
     if (cmd.includes("/")) {
         try { accessSync(cmd, fsConstants.X_OK); return cmd; } catch { return null; }
+    }
+    // Check hash table first
+    const hashed = hashTable.get(cmd);
+    if (hashed) {
+        try { accessSync(hashed, fsConstants.X_OK); return hashed; } catch {
+            // Stale entry — remove it
+            hashTable.delete(cmd);
+        }
     }
     const path = String($["PATH"] ?? process.env["PATH"] ?? "");
     for (const dir of path.split(":")) {

@@ -79,9 +79,17 @@ export interface ASTNode {
     type: string;
 }
 
+export interface Assignment {
+    name: string;
+    index?: string;           // array subscript: arr[0]=val
+    value: Word;
+    append?: boolean;         // +=
+    array?: Word[];           // arr=(word1 word2 ...)
+}
+
 export interface SimpleCommand extends ASTNode {
     type: "SimpleCommand";
-    assignments: { name: string; value: Word }[];
+    assignments: Assignment[];
     words: Word[];
     redirections: Redirection[];
 }

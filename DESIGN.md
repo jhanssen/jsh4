@@ -303,7 +303,13 @@ Builtins execute in-process (no fork):
 | `pushd` / `popd` / `dirs` | ✅ | Directory stack |
 | `basename` / `dirname` | ✅ | Path manipulation |
 | `select` | ✅ | Interactive menu loop |
-| `hash` | ❌ | Command hash table |
+| `kill` | ✅ | Send signals to processes/jobs (`-l` to list, `-SIGNAL`, `%jobspec`) |
+| `disown` | ✅ | Remove jobs from table (`-a` all, `-r` running) |
+| `hash` | ✅ | Command hash table for PATH caching (`-r` to clear) |
+| `let` | ✅ | Arithmetic evaluation (`let x=5+3`, `let x++`) |
+| `declare` | ✅ | Variable declarations (`-a` array, `-x` export, `-r` readonly) |
+| `time` | ✅ | Measure command execution time |
+| `:` | ✅ | No-op command (POSIX colon) |
 
 ---
 
@@ -369,6 +375,26 @@ jsh.$.items = ['a', 'b', 'c'];   // JS can store any type
 ```
 
 `export VAR` syncs to `process.env` so child processes inherit it.
+
+### Arrays
+
+Arrays are stored as JS arrays in the variable store. Assignment syntax:
+
+```sh
+arr=(a b c)          # create array
+arr+=(d e)           # append elements
+arr[1]=X             # assign by index
+declare -a myarr     # declare empty array
+```
+
+Expansion:
+- `${arr[0]}` — single element
+- `${arr[@]}` — all elements (separate words when quoted)
+- `${arr[*]}` — all elements (joined with IFS when quoted)
+- `${#arr[@]}` — element count
+- `$arr` — first element (bash compat)
+
+String append: `x+=val` concatenates to existing value. If the variable is an array, `+=` appends elements.
 
 ### Subshells
 

@@ -20,9 +20,12 @@ jsh.alias('gl', 'git log --oneline -20');
 jsh.alias('..', 'cd ..');
 jsh.alias('...', 'cd ../..');
 
-// ---- Prompt ----------------------------------------------------------------
+// ---- Prompt (widget) -------------------------------------------------------
 
-jsh.setPrompt(async () => {
+// The prompt is a widget in the "prompt" zone. Multiple widgets concatenate.
+// Call handle.update() to refresh, or the engine re-evaluates on each new line.
+
+const promptWidget = jsh.addWidget("prompt", "prompt", async () => {
     const cwd = String(jsh.$.PWD ?? '~').replace(String(jsh.$.HOME ?? ''), '~');
     const branch = await jsh.exec('git branch --show-current 2>/dev/null');
     const dirty = await jsh.exec('git status --porcelain 2>/dev/null');
@@ -39,6 +42,10 @@ jsh.setPrompt(async () => {
     return `${bold}${yellow}${cwd}${reset}${gitInfo} ${symbol}${reset} `;
 });
 
+// ---- PS2 (continuation prompt) ---------------------------------------------
+
+jsh.addWidget("ps2", "ps2", () => `${softGray}> ${reset}`);
+
 // ---- Header Widget ---------------------------------------------------------
 
 jsh.addWidget("gitinfo", "header", async () => {
@@ -50,13 +57,16 @@ jsh.addWidget("gitinfo", "header", async () => {
     return `  ${cyan}${branch.stdout}${reset} ${dirty}${count ? ` ${yellow}${count} changed${reset}` : ''}`;
 });
 
-// ---- Footer Widget ---------------------------------------------------------
+// ---- Footer Widget (clock with interval) -----------------------------------
 
-jsh.addWidget("clock", "footer", () => {
+const clock = jsh.addWidget("clock", "footer", () => {
     const now = new Date();
     const time = now.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     return `  ${softGray}${time}${reset}`;
-}, 0, 1000);
+});
+
+// Update the clock every second — intervals are userland, not baked into widgets.
+setInterval(() => clock.update(), 1000);
 
 // ---- Theme -----------------------------------------------------------------
 

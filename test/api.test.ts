@@ -1,6 +1,6 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
-import { alias, unalias, getAlias, setPrompt, getPrompt } from "../src/api/index.js";
+import { alias, unalias, getAlias } from "../src/api/index.js";
 import { registerJsFunction, lookupJsFunction, listJsFunctions } from "../src/jsfunctions/index.js";
 import type { JsPipelineFunction } from "../src/jsfunctions/index.js";
 
@@ -40,44 +40,6 @@ describe("alias", () => {
         assert.strictEqual(getAlias("__test_ll"), "ls -la");
         assert.strictEqual(getAlias("__test_gs"), "git status");
         unalias("__test_gs");
-    });
-});
-
-// ---- setPrompt / getPrompt --------------------------------------------------
-
-describe("setPrompt / getPrompt", () => {
-    let savedPrompt: (() => string) | null = null;
-
-    before(() => {
-        // Save current prompt state by capturing what getPrompt returns.
-        const current = getPrompt();
-        savedPrompt = () => current;
-    });
-
-    after(() => {
-        if (savedPrompt) setPrompt(savedPrompt);
-    });
-
-    it("should return '$ ' by default", () => {
-        setPrompt(() => "$ "); // ensure default
-        assert.strictEqual(getPrompt(), "$ ");
-    });
-
-    it("should change the prompt string", () => {
-        setPrompt(() => "test> ");
-        assert.strictEqual(getPrompt(), "test> ");
-    });
-
-    it("should support dynamic prompt content", () => {
-        let n = 0;
-        setPrompt(() => `${++n}> `);
-        assert.strictEqual(getPrompt(), "1> ");
-        assert.strictEqual(getPrompt(), "2> ");
-    });
-
-    it("should return '$ ' when prompt function throws", () => {
-        setPrompt(() => { throw new Error("oops"); });
-        assert.strictEqual(getPrompt(), "$ ");
     });
 });
 
