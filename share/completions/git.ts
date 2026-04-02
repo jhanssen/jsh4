@@ -116,37 +116,58 @@ type FileCategory =
     | 'modified' | 'modified-staged' | 'deleted' | 'deleted-staged'
     | 'untracked' | 'added' | 'renamed' | 'copied' | 'unmerged';
 
-/** Parse `git status --porcelain` into categorized file lists. */
+/** Parse `git status --porcelain` into categorized file lists.
+ *  Untracked files are fetched separately via `ls-files` to avoid
+ *  forcing `-u` (which can be slow in large repos when the user
+ *  has disabled `status.showUntrackedFiles`). */
 async function statusFiles(jsh: JshApi, prefix: string, ...categories: FileCategory[]): Promise<string[]> {
-    const r = await jsh.exec('git status --porcelain');
-    if (!r.ok) return [];
-
     const catSet = new Set(categories);
-    const files: string[] = [];
+    const wantUntracked = catSet.has('untracked');
+    catSet.delete('untracked');
 
-    for (const line of r.stdout.split('\n')) {
-        if (!line || line.length < 4) continue;
-        const x = line[0]!;  // index status
-        const y = line[1]!;  // worktree status
-        const path = line.slice(3);
+    const promises: Promise<string[]>[] = [];
 
-        // Renamed/copied: "R  old -> new" or "C  old -> new"
-        const actualPath = (x === 'R' || x === 'C') ? (path.split(' -> ')[1] ?? path) : path;
+    // Tracked file status from porcelain (without untracked — fast).
+    if (catSet.size > 0) {
+        promises.push((async () => {
+            const r = await jsh.exec('git status --porcelain -uno');
+            if (!r.ok) return [];
 
-        if (catSet.has('untracked') && x === '?' && y === '?') files.push(actualPath);
-        if (catSet.has('modified') && y === 'M') files.push(actualPath);
-        if (catSet.has('modified-staged') && x === 'M') files.push(actualPath);
-        if (catSet.has('deleted') && y === 'D') files.push(actualPath);
-        if (catSet.has('deleted-staged') && x === 'D') files.push(actualPath);
-        if (catSet.has('added') && x === 'A') files.push(actualPath);
-        if (catSet.has('renamed') && x === 'R') files.push(actualPath);
-        if (catSet.has('copied') && x === 'C') files.push(actualPath);
-        if (catSet.has('unmerged') && (x === 'U' || y === 'U' || (x === 'A' && y === 'A') || (x === 'D' && y === 'D'))) {
-            files.push(actualPath);
-        }
+            const files: string[] = [];
+            for (const line of r.stdout.split('\n')) {
+                if (!line || line.length < 4) continue;
+                const x = line[0]!;
+                const y = line[1]!;
+                const path = line.slice(3);
+                const actualPath = (x === 'R' || x === 'C') ? (path.split(' -> ')[1] ?? path) : path;
+
+                if (catSet.has('modified') && y === 'M') files.push(actualPath);
+                if (catSet.has('modified-staged') && x === 'M') files.push(actualPath);
+                if (catSet.has('deleted') && y === 'D') files.push(actualPath);
+                if (catSet.has('deleted-staged') && x === 'D') files.push(actualPath);
+                if (catSet.has('added') && x === 'A') files.push(actualPath);
+                if (catSet.has('renamed') && x === 'R') files.push(actualPath);
+                if (catSet.has('copied') && x === 'C') files.push(actualPath);
+                if (catSet.has('unmerged') && (x === 'U' || y === 'U' || (x === 'A' && y === 'A') || (x === 'D' && y === 'D'))) {
+                    files.push(actualPath);
+                }
+            }
+            return files;
+        })());
     }
 
-    return [...new Set(files)].filter(f => f.startsWith(prefix));
+    // Untracked files via ls-files (separate, respects config).
+    if (wantUntracked) {
+        promises.push((async () => {
+            const r = await jsh.exec('git ls-files -o --exclude-standard');
+            if (!r.ok) return [];
+            return r.stdout.split('\n').filter(f => f.length > 0);
+        })());
+    }
+
+    const results = await Promise.all(promises);
+    const all = results.flat();
+    return [...new Set(all)].filter(f => f.startsWith(prefix));
 }
 
 // ---- Flag maps --------------------------------------------------------------
