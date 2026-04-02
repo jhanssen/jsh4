@@ -1,4 +1,4 @@
-import { createRequire } from "node:module";
+import { createRequire, register } from "node:module";
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { readFileSync } from "node:fs";
@@ -63,6 +63,9 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         // Create TerminalUI before loading rc so jshrc can register widgets.
         ui = new TerminalUI(native);
     }
+
+    // Register ESM loader hook so jshrc files can `import ... from 'jsh/...'`.
+    register('../loader-hooks.js', import.meta.url);
 
     await loadRc(opts?.jshrc);
 
@@ -164,7 +167,15 @@ async function loadRc(customPath?: string): Promise<void> {
             }
         }
     } catch (e: unknown) {
-        if ((e as NodeJS.ErrnoException)?.code !== "ERR_MODULE_NOT_FOUND") {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        // Only silence ERR_MODULE_NOT_FOUND when it's the jshrc file itself that's missing,
+        // not when a module imported *by* the jshrc can't be found.
+        if (code === "ERR_MODULE_NOT_FOUND") {
+            const msg = (e as Error).message ?? "";
+            if (!msg.includes(rcPath)) {
+                process.stderr.write(`jsh: .jshrc: ${msg}\n`);
+            }
+        } else {
             process.stderr.write(`jsh: .jshrc: ${e instanceof Error ? e.message : e}\n`);
         }
     }

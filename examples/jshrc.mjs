@@ -108,29 +108,10 @@ jsh.setSuggestion(async (input) => {
 
 // ---- Tab Completion --------------------------------------------------------
 
-jsh.complete('git', (ctx) => {
-    const subcmds = [
-        'add', 'bisect', 'branch', 'checkout', 'cherry-pick', 'clone',
-        'commit', 'diff', 'fetch', 'grep', 'init', 'log', 'merge',
-        'mv', 'pull', 'push', 'rebase', 'remote', 'reset', 'restore',
-        'rm', 'show', 'stash', 'status', 'switch', 'tag',
-    ];
-    if (ctx.words.length === 2) {
-        return subcmds.filter(s => s.startsWith(ctx.current));
-    }
-    return [];
-});
-
-jsh.complete('npm', (ctx) => {
-    const subcmds = [
-        'install', 'run', 'test', 'start', 'build', 'publish',
-        'init', 'exec', 'ls', 'outdated', 'update', 'audit',
-    ];
-    if (ctx.words.length === 2) {
-        return subcmds.filter(s => s.startsWith(ctx.current));
-    }
-    return [];
-});
+import { gitCompletions } from 'jsh/completions/git';
+import { npmCompletions } from 'jsh/completions/npm';
+gitCompletions(jsh);
+npmCompletions(jsh);
 
 // ---- Pipeline Functions (@name) --------------------------------------------
 
