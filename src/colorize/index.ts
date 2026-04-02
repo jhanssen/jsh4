@@ -41,12 +41,19 @@ const DEFAULT_THEME: Theme = {
 
 let currentTheme: Theme = { ...DEFAULT_THEME };
 
-export function setTheme(theme: Partial<Theme>): void {
-    currentTheme = { ...DEFAULT_THEME, ...theme };
-}
-
-export function getCurrentTheme(): Theme {
-    return currentTheme;
+// Pre-resolved ANSI strings for the current theme — rebuilt on setTheme().
+interface ResolvedTheme {
+    command: string | null;
+    commandNotFound: string | null;
+    keyword: string | null;
+    operator: string | null;
+    redirect: string | null;
+    string: string | null;
+    variable: string | null;
+    comment: string | null;
+    argument: string | null;
+    paren: string | null;
+    jsInline: string | null;
 }
 
 const NAMED_COLORS: Record<string, number> = {
@@ -77,6 +84,33 @@ function resolveColor(c: Color | undefined): string | null {
         return seq || null;
     }
     return null;
+}
+
+function buildResolved(t: Theme): ResolvedTheme {
+    return {
+        command: resolveColor(t.command),
+        commandNotFound: resolveColor(t.commandNotFound),
+        keyword: resolveColor(t.keyword),
+        operator: resolveColor(t.operator),
+        redirect: resolveColor(t.redirect),
+        string: resolveColor(t.string),
+        variable: resolveColor(t.variable),
+        comment: resolveColor(t.comment),
+        argument: resolveColor(t.argument),
+        paren: resolveColor(t.paren),
+        jsInline: resolveColor(t.jsInline),
+    };
+}
+
+let resolved: ResolvedTheme = buildResolved(currentTheme);
+
+export function setTheme(theme: Partial<Theme>): void {
+    currentTheme = { ...DEFAULT_THEME, ...theme };
+    resolved = buildResolved(currentTheme);
+}
+
+export function getCurrentTheme(): Theme {
+    return currentTheme;
 }
 
 // ---- Keyword detection ------------------------------------------------------
@@ -110,7 +144,7 @@ const COMMAND_SEPARATORS = new Set<string>([
 const RESET = "\x1b[0m";
 
 export function colorize(input: string, theme?: Theme, context?: string): string {
-    const t = theme ?? currentTheme;
+    const t = theme ? (theme === currentTheme ? resolved : buildResolved(theme)) : resolved;
     if (input.length === 0) return "";
 
     // If context is provided (continuation lines), lex the full input so the
@@ -128,9 +162,8 @@ export function colorize(input: string, theme?: Theme, context?: string): string
     }
 
     let result = "";
-    let pos = outputStart; // start emitting from the current line
+    let pos = outputStart;
     let commandPosition = true;
-    let activeColor: string | null = null; // track color state from context
 
     for (const tok of tokens) {
         if (tok.type === TokenType.EOF) break;
@@ -140,14 +173,14 @@ export function colorize(input: string, theme?: Theme, context?: string): string
         switch (tok.type) {
             case TokenType.Word: {
                 if (KEYWORDS.has(tok.value)) {
-                    color = resolveColor(t.keyword);
+                    color = t.keyword;
                     commandPosition = true;
                 } else if (commandPosition) {
                     const name = tok.value;
                     if (isValidCommand(name)) {
-                        color = resolveColor(t.command);
+                        color = t.command;
                     } else {
-                        const fg = resolveColor(t.commandNotFound);
+                        const fg = t.commandNotFound;
                         color = fg ? fg + "\x1b[4:3m" : "\x1b[4:3m";
                     }
                     commandPosition = false;
@@ -159,11 +192,11 @@ export function colorize(input: string, theme?: Theme, context?: string): string
                         s.type === "SingleQuoted" || s.type === "DoubleQuoted"
                     );
                     if (hasVar) {
-                        color = resolveColor(t.variable);
+                        color = t.variable;
                     } else if (hasQuote) {
-                        color = resolveColor(t.string);
+                        color = t.string;
                     } else {
-                        color = resolveColor(t.argument);
+                        color = t.argument;
                     }
                 }
                 break;
@@ -176,33 +209,29 @@ export function colorize(input: string, theme?: Theme, context?: string): string
             case TokenType.Amp:
             case TokenType.Bang:
             case TokenType.CaseSemi:
-                color = resolveColor(t.operator);
+                color = t.operator;
                 commandPosition = true;
                 break;
             case TokenType.Redirect:
-                color = resolveColor(t.redirect);
+                color = t.redirect;
                 break;
             case TokenType.LParen:
             case TokenType.RParen:
             case TokenType.LBrace:
             case TokenType.RBrace:
-                color = resolveColor(t.paren);
+                color = t.paren;
                 if (tok.type === TokenType.LParen || tok.type === TokenType.LBrace) {
                     commandPosition = true;
                 }
                 break;
             case TokenType.JsInline:
-                color = resolveColor(t.jsInline);
+                color = t.jsInline;
                 commandPosition = false;
                 break;
             case TokenType.Newline:
                 commandPosition = true;
                 break;
         }
-
-        // Track active color for context-aware prefix handling
-        if (color) activeColor = color;
-        else if (tok.type !== TokenType.Newline) activeColor = null;
 
         // Only emit output for tokens that overlap with the current line
         if (tok.end <= outputStart) continue;
@@ -230,9 +259,8 @@ export function colorize(input: string, theme?: Theme, context?: string): string
     if (pos < full.length) {
         const trailing = full.slice(pos);
         if (context !== undefined) {
-            const strColor = resolveColor(t.string);
-            if (strColor) {
-                result += strColor + trailing + RESET;
+            if (t.string) {
+                result += t.string + trailing + RESET;
             } else {
                 result += trailing;
             }

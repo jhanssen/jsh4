@@ -51,6 +51,7 @@ export class TerminalUI {
     private isContinuation = false;
     private frozenLines: string[] = [];
     private pendingFreeze: string[] = []; // rendered lines from last session, frozen on continuation
+    private lastRenderedInputLines: string[] = []; // cached from last renderFrame for onLine reuse
     private editing = false; // true while an editing session is active
 
     constructor(native: NativeInputEngine) {
@@ -176,24 +177,8 @@ export class TerminalUI {
     }
 
     private onLine(line: string | null, errno?: number): void {
-        const prompt = this.getPrompt();
-        const ps2 = this.widgets.getZoneContent("ps2").join("") || "> ";
-
-        // Capture rendered input lines for potential continuation freeze.
-        this.pendingFreeze = [];
-        if (this.lastState) {
-            const bufLines = this.lastState.buf.split("\n");
-            for (let i = 0; i < bufLines.length; i++) {
-                const bufLine = bufLines[i]!;
-                const linePrompt = i === 0 ? prompt : ps2;
-                const context = i > 0 ? bufLines.slice(0, i).join("\n") : undefined;
-                const colorized = this.colorizeFn ? this.colorizeFn(bufLine, context) : bufLine;
-                const { line: rendered } = this.native.inputRenderLine(
-                    linePrompt, colorized, "", this.lastState.cols, bufLine, bufLine.length
-                );
-                this.pendingFreeze.push(rendered);
-            }
-        }
+        // Reuse the cached rendered lines from the last renderFrame call.
+        this.pendingFreeze = [...this.lastRenderedInputLines];
 
         // Pause repaints until next start() — prevents widget timers from
         // rendering stale content between onLine and the next editing session.
@@ -265,6 +250,21 @@ export class TerminalUI {
             }
         }
 
+        // Colorize the entire buffer at once (avoids O(n²) re-lexing per line).
+        let colorizedLines: string[];
+        if (this.colorizeFn && bufLines.length > 1) {
+            // Colorize full buffer, then split by newlines.
+            // ANSI escapes don't contain \n so splitting is safe.
+            const fullColorized = this.colorizeFn(state.buf);
+            colorizedLines = fullColorized.split("\n");
+            // Ensure we have the right number of lines (in case colorizer output differs).
+            while (colorizedLines.length < bufLines.length) colorizedLines.push("");
+        } else if (this.colorizeFn) {
+            colorizedLines = [this.colorizeFn(state.buf)];
+        } else {
+            colorizedLines = [...bufLines];
+        }
+
         const inputLines: string[] = [];
         let cursorCol = 0;
 
@@ -275,15 +275,7 @@ export class TerminalUI {
             const isCursorLine = i === cursorLineIdx;
             const linePrompt = isFirst ? displayPrompt : ps2;
             const lineRprompt = isLast ? displayRightPrompt : "";
-
-            // Colorize with context from previous buffer lines.
-            let colorized: string;
-            if (this.colorizeFn) {
-                const context = i > 0 ? bufLines.slice(0, i).join("\n") : undefined;
-                colorized = this.colorizeFn(bufLine, context);
-            } else {
-                colorized = bufLine;
-            }
+            const colorized = colorizedLines[i] ?? bufLine;
 
             // Pass per-line raw buffer and cursor position to C++.
             const linePos = isCursorLine ? posInLine : bufLine.length;
@@ -293,6 +285,9 @@ export class TerminalUI {
             inputLines.push(line);
             if (isCursorLine) cursorCol = col;
         }
+
+        // Cache for onLine reuse (avoids re-colorizing on Enter).
+        this.lastRenderedInputLines = inputLines;
 
         // Get header/footer from widgets.
         const headerLines = this.widgets.getZoneContent("header");

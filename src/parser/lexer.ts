@@ -139,38 +139,44 @@ export class Lexer {
         }
     }
 
+    private at(offset: number): string {
+        return this.pos + offset < this.input.length ? this.input[this.pos + offset]! : "";
+    }
+
     private tryOperator(): Token | null {
         const s = this.pos;
-        const rest = this.input.slice(this.pos);
+        const c0 = this.at(0);
+        const c1 = this.at(1);
+        const c2 = this.at(2);
 
         // @{ expr } and @!{ expr } — inline JS functions
-        if (rest.startsWith("@!{")) {
+        if (c0 === "@" && c1 === "!" && c2 === "{") {
             this.pos += 3;
             const body = this.readJsExpression();
             return { type: TokenType.JsInline, value: body, start: s, end: this.pos, jsBuffered: true };
         }
-        if (rest.startsWith("@{")) {
+        if (c0 === "@" && c1 === "{") {
             this.pos += 2;
             const body = this.readJsExpression();
             return { type: TokenType.JsInline, value: body, start: s, end: this.pos, jsBuffered: false };
         }
 
         // ;; case terminator (must come before single ;)
-        if (rest.startsWith(";;")) {
+        if (c0 === ";" && c1 === ";") {
             this.pos += 2;
             return { type: TokenType.CaseSemi, value: ";;", start: s, end: this.pos };
         }
 
         // Two-char operators first
-        if (rest.startsWith("&&")) {
+        if (c0 === "&" && c1 === "&") {
             this.pos += 2;
             return { type: TokenType.And, value: "&&", start: s, end: this.pos };
         }
-        if (rest.startsWith("||")) {
+        if (c0 === "|" && c1 === "|") {
             this.pos += 2;
             return { type: TokenType.Or, value: "||", start: s, end: this.pos };
         }
-        if (rest.startsWith("|&")) {
+        if (c0 === "|" && c1 === "&") {
             this.pos += 2;
             return { type: TokenType.PipeAnd, value: "|&", start: s, end: this.pos };
         }
@@ -218,12 +224,13 @@ export class Lexer {
 
         // Check for &> and &>>
         if (this.input[this.pos] === "&") {
-            const rest = this.input.slice(this.pos);
-            if (rest.startsWith("&>>")) {
+            const c1 = this.at(1);
+            const c2 = this.at(2);
+            if (c1 === ">" && c2 === ">") {
                 this.pos += 3;
                 return { type: TokenType.Redirect, value: "&>>", start: startPos, end: this.pos };
             }
-            if (rest.startsWith("&>")) {
+            if (c1 === ">") {
                 this.pos += 2;
                 return { type: TokenType.Redirect, value: "&>", start: startPos, end: this.pos };
             }

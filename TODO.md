@@ -242,6 +242,10 @@
 - [ ] **`$(@func)`** — command substitution from JS function (in-process, no fork)
 - [ ] **AbortSignal on pipe close** — propagate EPIPE to JS generator as cancellation
 
+### Technical debt
+
+- [ ] **Move remaining builtins to object map** — `read`, `source`, `.`, `eval`, `trap`, `return`, `command`, `break`, `continue`, `fg`, `bg`, `jobs`, `wait`, `select`, `time` are handled as special cases in `executeSimple` instead of the `builtins` map. Causes duplicate builtin name lists (executor `BUILTIN_NAMES` set and completion `BUILTINS_LIST`).
+
 ### Not planned (initial scope)
 
 - Windows support

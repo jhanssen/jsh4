@@ -20,10 +20,23 @@ export interface WidgetDef {
     render: () => string | string[] | Promise<string | string[]>;
 }
 
+function arraysEqual(a: string[] | undefined, b: string[]): boolean {
+    if (!a) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+}
+
 export class WidgetManager {
     private widgets = new Map<string, WidgetDef>();
     private cache = new Map<string, string[]>();
     private repaintFn: (() => void) | null = null;
+
+    // Per-zone content cache — invalidated when any widget in the zone changes.
+    private zoneCache = new Map<WidgetZone, string[]>();
+    private zoneDirty = new Set<WidgetZone>();
 
     setRepaintFn(fn: () => void): void {
         this.repaintFn = fn;
@@ -31,6 +44,7 @@ export class WidgetManager {
 
     add(widget: WidgetDef): WidgetHandle {
         this.widgets.set(widget.id, widget);
+        this.invalidateZone(widget.zone);
         // Initial render — try sync first.
         this._evalSync(widget);
 
@@ -43,8 +57,15 @@ export class WidgetManager {
     }
 
     remove(id: string): void {
+        const widget = this.widgets.get(id);
+        if (widget) this.invalidateZone(widget.zone);
         this.widgets.delete(id);
         this.cache.delete(id);
+    }
+
+    private invalidateZone(zone: WidgetZone): void {
+        this.zoneDirty.add(zone);
+        this.zoneCache.delete(zone);
     }
 
     /**
@@ -54,6 +75,9 @@ export class WidgetManager {
      * Returns an array of lines.
      */
     getZoneContent(zone: WidgetZone): string[] {
+        const cached = this.zoneCache.get(zone);
+        if (cached && !this.zoneDirty.has(zone)) return cached;
+
         const sorted = [...this.widgets.values()]
             .filter(w => w.zone === zone)
             .sort((a, b) => a.order - b.order);
@@ -62,24 +86,24 @@ export class WidgetManager {
         let currentLine = "";
 
         for (const w of sorted) {
-            const cached = this.cache.get(w.id);
-            if (!cached || cached.length === 0) continue;
+            const wCache = this.cache.get(w.id);
+            if (!wCache || wCache.length === 0) continue;
 
-            if (cached.length === 1) {
-                // Single string — concatenate on current line.
-                currentLine += cached[0]!;
+            if (wCache.length === 1) {
+                currentLine += wCache[0]!;
             } else {
-                // Multi-element — first element joins current line, rest are new lines.
-                currentLine += cached[0]!;
+                currentLine += wCache[0]!;
                 lines.push(currentLine);
-                for (let i = 1; i < cached.length - 1; i++) {
-                    lines.push(cached[i]!);
+                for (let i = 1; i < wCache.length - 1; i++) {
+                    lines.push(wCache[i]!);
                 }
-                currentLine = cached[cached.length - 1]!;
+                currentLine = wCache[wCache.length - 1]!;
             }
         }
 
         if (currentLine) lines.push(currentLine);
+        this.zoneCache.set(zone, lines);
+        this.zoneDirty.delete(zone);
         return lines;
     }
 
@@ -102,7 +126,8 @@ export class WidgetManager {
                     const lines = Array.isArray(r) ? r : [r];
                     const old = this.cache.get(id);
                     this.cache.set(id, lines);
-                    if (this.repaintFn && JSON.stringify(old) !== JSON.stringify(lines)) {
+                    this.invalidateZone(widget.zone);
+                    if (this.repaintFn && !arraysEqual(old, lines)) {
                         this.repaintFn();
                     }
                 }).catch(() => {});
@@ -110,7 +135,8 @@ export class WidgetManager {
                 const lines = Array.isArray(result) ? result : [result];
                 const old = this.cache.get(id);
                 this.cache.set(id, lines);
-                if (this.repaintFn && JSON.stringify(old) !== JSON.stringify(lines)) {
+                this.invalidateZone(widget.zone);
+                if (this.repaintFn && !arraysEqual(old, lines)) {
                     this.repaintFn();
                 }
             }
@@ -125,6 +151,7 @@ export class WidgetManager {
             promises.push(this._evalAsync(w));
         }
         await Promise.all(promises);
+        this.invalidateZone(zone);
     }
 
     /** Sync evaluation — try to get result immediately, kick off async if needed. */
@@ -135,6 +162,7 @@ export class WidgetManager {
                 result.then(r => {
                     const lines = Array.isArray(r) ? r : [r];
                     this.cache.set(widget.id, lines);
+                    this.invalidateZone(widget.zone);
                     if (this.repaintFn) this.repaintFn();
                 }).catch(() => {});
             } else {
