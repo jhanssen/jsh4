@@ -1620,3 +1620,56 @@ describe("executor — ulimit builtin", () => {
         assert.match(out, /open files/);
     });
 });
+
+describe("executor — compound commands in pipelines", () => {
+    it("while clause as pipeline sink", () => {
+        const out = run("echo -e 'a\\nb\\nc' | while read line; do echo \"got:$line\"; done");
+        assert.strictEqual(out, "got:a\ngot:b\ngot:c");
+    });
+
+    it("while clause as pipeline source", () => {
+        const out = run("i=0; while [ $i -lt 3 ]; do echo $i; i=$((i+1)); done | cat");
+        assert.strictEqual(out, "0\n1\n2");
+    });
+
+    it("for clause as pipeline sink", () => {
+        const out = run("echo hello | for x in a b; do cat; done");
+        // The for loop body reads stdin; first iteration consumes it
+        assert.match(out, /hello/);
+    });
+
+    it("for clause as pipeline source", () => {
+        const out = run("for x in a b c; do echo $x; done | cat");
+        assert.strictEqual(out, "a\nb\nc");
+    });
+
+    it("if clause as pipeline source", () => {
+        const out = run("if true; then echo yes; else echo no; fi | cat");
+        assert.strictEqual(out, "yes");
+    });
+
+    it("brace group as pipeline source", () => {
+        const out = run("{ echo hello; echo world; } | cat");
+        assert.strictEqual(out, "hello\nworld");
+    });
+
+    it("brace group as pipeline sink", () => {
+        const out = run("echo hello | { cat; }");
+        assert.strictEqual(out, "hello");
+    });
+
+    it("subshell as pipeline source", () => {
+        const out = run("(echo sub) | cat");
+        assert.strictEqual(out, "sub");
+    });
+
+    it("case clause as pipeline source", () => {
+        const out = run("case foo in foo) echo matched;; esac | cat");
+        assert.strictEqual(out, "matched");
+    });
+
+    it("compound command in middle of pipeline", () => {
+        const out = run("seq 3 | while read n; do echo \"x$n\"; done | cat");
+        assert.strictEqual(out, "x1\nx2\nx3");
+    });
+});

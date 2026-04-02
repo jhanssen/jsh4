@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -12,13 +13,13 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <uv.h>
 #include <unistd.h>
 
 namespace jsh {
 
 struct SpawnCtx {
     Napi::Promise::Deferred deferred;
-    Napi::ThreadSafeFunction tsfn;
     int exitCode = -1;
     bool captureOutput = false;
     std::string capturedOutput;
@@ -29,35 +30,69 @@ struct SpawnCtx {
     std::vector<pid_t> pids;     // for background/stopped jobs
 };
 
-static void OnSpawnDone(Napi::Env env, Napi::Function, SpawnCtx* ctx) {
-    Napi::HandleScope scope(env);
-    if (ctx->captureOutput) {
-        Napi::Object result = Napi::Object::New(env);
-        result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
-        result.Set("output",   Napi::String::New(env, ctx->capturedOutput));
-        ctx->deferred.Resolve(result);
-    } else {
-        Napi::Object result = Napi::Object::New(env);
-        result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
-        Napi::Array ps = Napi::Array::New(env, ctx->pipeStatus.size());
-        for (size_t i = 0; i < ctx->pipeStatus.size(); i++) {
-            ps.Set(static_cast<uint32_t>(i), Napi::Number::New(env, ctx->pipeStatus[i]));
-        }
-        result.Set("pipeStatus", ps);
-        result.Set("stopped", Napi::Boolean::New(env, ctx->stopped));
-        result.Set("stoppedSignal", Napi::Number::New(env, ctx->stoppedSignal));
-        result.Set("pgid", Napi::Number::New(env, ctx->pgid));
-        if (!ctx->pids.empty()) {
-            Napi::Array pidsArr = Napi::Array::New(env, ctx->pids.size());
-            for (size_t i = 0; i < ctx->pids.size(); i++) {
-                pidsArr.Set(static_cast<uint32_t>(i), Napi::Number::New(env, static_cast<int>(ctx->pids[i])));
-            }
-            result.Set("pids", pidsArr);
-        }
-        ctx->deferred.Resolve(result);
+// ---- Global async handle for signaling main thread -------------------------
+static napi_env g_env = nullptr;
+static uv_async_t g_async;
+static std::mutex g_done_mutex;
+static std::queue<SpawnCtx*> g_done_queue;
+static std::atomic<int> g_pending{0};  // ref-count: >0 keeps event loop alive
+
+static void refAsync() {
+    if (g_pending.fetch_add(1, std::memory_order_relaxed) == 0) {
+        uv_ref(reinterpret_cast<uv_handle_t*>(&g_async));
     }
-    ctx->tsfn.Release();
-    delete ctx;
+}
+
+static void signalDone(SpawnCtx* ctx) {
+    {
+        std::lock_guard<std::mutex> lock(g_done_mutex);
+        g_done_queue.push(ctx);
+    }
+    uv_async_send(&g_async);
+}
+
+static void OnAsyncDone(uv_async_t*) {
+    std::queue<SpawnCtx*> local;
+    {
+        std::lock_guard<std::mutex> lock(g_done_mutex);
+        std::swap(local, g_done_queue);
+    }
+    Napi::Env env(g_env);
+    Napi::HandleScope scope(env);
+    int count = static_cast<int>(local.size());
+    while (!local.empty()) {
+        SpawnCtx* ctx = local.front();
+        local.pop();
+        if (ctx->captureOutput) {
+            Napi::Object result = Napi::Object::New(env);
+            result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
+            result.Set("output",   Napi::String::New(env, ctx->capturedOutput));
+            ctx->deferred.Resolve(result);
+        } else {
+            Napi::Object result = Napi::Object::New(env);
+            result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
+            Napi::Array ps = Napi::Array::New(env, ctx->pipeStatus.size());
+            for (size_t i = 0; i < ctx->pipeStatus.size(); i++) {
+                ps.Set(static_cast<uint32_t>(i), Napi::Number::New(env, ctx->pipeStatus[i]));
+            }
+            result.Set("pipeStatus", ps);
+            result.Set("stopped", Napi::Boolean::New(env, ctx->stopped));
+            result.Set("stoppedSignal", Napi::Number::New(env, ctx->stoppedSignal));
+            result.Set("pgid", Napi::Number::New(env, ctx->pgid));
+            if (!ctx->pids.empty()) {
+                Napi::Array pidsArr = Napi::Array::New(env, ctx->pids.size());
+                for (size_t i = 0; i < ctx->pids.size(); i++) {
+                    pidsArr.Set(static_cast<uint32_t>(i), Napi::Number::New(env, static_cast<int>(ctx->pids[i])));
+                }
+                result.Set("pids", pidsArr);
+            }
+            ctx->deferred.Resolve(result);
+        }
+        delete ctx;
+    }
+    if (g_pending.fetch_sub(count, std::memory_order_relaxed) == count) {
+        uv_unref(reinterpret_cast<uv_handle_t*>(&g_async));
+    }
 }
 
 // ---- Redirection and stage specs ----------------------------------------
@@ -230,7 +265,7 @@ static void processWait(WaitRequest* req) {
             req->ctx->pids = req->pids;
             if (g_interactive && req->pgid > 0)
                 tcsetpgrp(STDIN_FILENO, getpgrp());
-            req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+            signalDone(req->ctx);
             delete req;
             return;
         }
@@ -242,7 +277,7 @@ static void processWait(WaitRequest* req) {
     if (g_interactive && req->pgid > 0)
         tcsetpgrp(STDIN_FILENO, getpgrp());
     req->ctx->exitCode = lastCode;
-    req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+    signalDone(req->ctx);
     delete req;
 }
 
@@ -317,7 +352,7 @@ struct ExecutorState {
                     close(pipes[j][1]);
                 }
                 req->ctx->exitCode = 1;
-                req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+                signalDone(req->ctx);
                 delete req;
                 return;
             }
@@ -330,7 +365,7 @@ struct ExecutorState {
             if (pipe(capturePipe) != 0) {
                 for (auto& p : pipes) { close(p[0]); close(p[1]); }
                 req->ctx->exitCode = 1;
-                req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+                signalDone(req->ctx);
                 delete req;
                 return;
             }
@@ -432,7 +467,7 @@ struct ExecutorState {
                     close(pipes[j][1]);
                 }
                 req->ctx->exitCode = 1;
-                req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+                signalDone(req->ctx);
                 delete req;
                 return;
             }
@@ -451,7 +486,7 @@ struct ExecutorState {
         if (req->background) {
             req->ctx->exitCode = 0;
             req->ctx->pids = pids;
-            req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+            signalDone(req->ctx);
             delete req;
             return;
         }
@@ -493,7 +528,7 @@ struct ExecutorState {
                 if (g_interactive && pgid > 0) {
                     tcsetpgrp(STDIN_FILENO, getpgrp());
                 }
-                req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+                signalDone(req->ctx);
                 delete req;
                 return;
             }
@@ -510,7 +545,7 @@ struct ExecutorState {
         }
 
         req->ctx->exitCode = lastExitCode;
-        req->ctx->tsfn.NonBlockingCall(req->ctx, OnSpawnDone);
+        signalDone(req->ctx);
         delete req;
     }
 };
@@ -543,6 +578,12 @@ static Napi::Value InitExecutor_(const Napi::CallbackInfo& info) {
         if (getpgrp() != pid) setpgid(pid, pid);
         tcsetpgrp(STDIN_FILENO, pid);
     }
+
+    g_env = info.Env();
+    uv_loop_t* loop;
+    napi_get_uv_event_loop(g_env, &loop);
+    uv_async_init(loop, &g_async, OnAsyncDone);
+    uv_unref(reinterpret_cast<uv_handle_t*>(&g_async));
 
     g_executor = new ExecutorState();
     g_executor->start();
@@ -585,11 +626,7 @@ static SpawnCtx* makeCtx(Napi::Env env, bool capture) {
     auto deferred = Napi::Promise::Deferred::New(env);
     auto* ctx = new SpawnCtx { deferred };
     ctx->captureOutput = capture;
-    ctx->tsfn = Napi::ThreadSafeFunction::New(
-        env,
-        Napi::Function::New(env, [](const Napi::CallbackInfo&) {}),
-        "spawn_complete", 0, 1
-    );
+    refAsync();  // ref the handle so event loop stays alive until resolved
     return ctx;
 }
 

@@ -363,6 +363,10 @@ async function buildStage(cmd: SimpleCommand): Promise<Stage | null> {
             const body = hd.quoted ? hd.body : await expandHereDocBody(hd.body);
             return { op: r.op, fd: r.fd ?? -1, target: body, isHereDoc: true };
         }
+        // Fast path: single literal segment — skip async expansion.
+        if (r.target.segments.length === 1 && seg?.type === "Literal") {
+            return { op: r.op, fd: r.fd ?? -1, target: (seg as { value: string }).value, isHereDoc: false };
+        }
         return { op: r.op, fd: r.fd ?? -1, target: await expandWordToStr(r.target), isHereDoc: false };
     }));
     return { cmd: command, args, redirs };
@@ -718,12 +722,22 @@ async function expandAliasesInPipeline(commands: ASTNode[]): Promise<ASTNode[] |
     return result;
 }
 
+const compoundTypes = new Set([
+    "WhileClause", "ForClause", "ArithmeticFor", "IfClause",
+    "BraceGroup", "Subshell", "CaseClause", "SelectClause",
+]);
+
+function isCompoundCommand(node: ASTNode): boolean {
+    return compoundTypes.has(node.type);
+}
+
 async function executePipeline(node: Pipeline): Promise<ExecResult> {
     const hasJs = node.commands.some(c => c.type === "JsFunction");
+    const hasCompound = node.commands.some(isCompoundCommand);
 
     // Check if any pipeline stage is a builtin-only command (no external equivalent).
     let hasBuiltin = false;
-    if (!hasJs) {
+    if (!hasJs && !hasCompound) {
         for (const cmd of node.commands) {
             if (cmd.type === "SimpleCommand") {
                 const sc = cmd as SimpleCommand;
@@ -738,7 +752,7 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
         }
     }
 
-    if (hasJs || hasBuiltin) {
+    if (hasJs || hasBuiltin || hasCompound) {
         let exitCode = await executeMixedPipeline(node);
         if (node.negated) exitCode = exitCode === 0 ? 1 : 0;
         return { exitCode };
@@ -815,7 +829,7 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
     }
 
     const isInProcess = (i: number) =>
-        node.commands[i]!.type === "JsFunction" || stageBuiltins.has(i);
+        node.commands[i]!.type === "JsFunction" || stageBuiltins.has(i) || isCompoundCommand(node.commands[i]!);
 
     // Fork external stages (skip builtins and JS functions).
     for (let i = 0; i < n; i++) {
@@ -878,6 +892,37 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
             // Restore stdout/stdin. dup2 implicitly closes the pipe fd copy at fd 1/0.
             native.dup2Fd(savedStdout, 1);
             native.closeFd(savedStdout);
+            if (savedStdin !== -1) { native.dup2Fd(savedStdin, 0); native.closeFd(savedStdin); }
+        }
+    }
+
+    // Run compound command stages in-process with redirected fds.
+    for (let i = 0; i < n; i++) {
+        const stageNode = node.commands[i]!;
+        if (!isCompoundCommand(stageNode)) continue;
+        const sin  = stdinFd(i);
+        const sout = stdoutFd(i);
+        const savedStdout = sout !== 1 ? native.dupFd(1) : -1;
+        const savedStdin = sin !== 0 ? native.dupFd(0) : -1;
+        if (sout !== 1) {
+            native.clearCloexec(sout);
+            native.dup2Fd(sout, 1);
+            native.closeFd(sout);
+        }
+        if (sin !== 0) {
+            native.clearCloexec(sin);
+            native.dup2Fd(sin, 0);
+            native.closeFd(sin);
+        }
+        try {
+            const result = await executeNode(stageNode);
+            stageExitCodes[i] = result.exitCode;
+        } catch (e: unknown) {
+            const code = (e as NodeJS.ErrnoException)?.code;
+            if (code !== "EPIPE" && code !== "ERR_STREAM_DESTROYED") throw e;
+            stageExitCodes[i] = 141;
+        } finally {
+            if (savedStdout !== -1) { native.dup2Fd(savedStdout, 1); native.closeFd(savedStdout); }
             if (savedStdin !== -1) { native.dup2Fd(savedStdin, 0); native.closeFd(savedStdin); }
         }
     }

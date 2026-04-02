@@ -205,10 +205,16 @@ async function expandSegmentToFragments(seg: WordSegment, quoted: boolean): Prom
 // expandWord: returns potentially multiple strings after IFS splitting,
 // brace expansion, and glob expansion.  Use this for command arguments.
 export async function expandWord(word: Word): Promise<string[]> {
-    const hasGlob = word.segments.some(s => s.type === "Glob");
+    // Fast path: single literal segment — no async, glob, brace, or IFS work needed.
+    const segs = word.segments;
+    if (segs.length === 1 && segs[0]!.type === "Literal") {
+        return [(segs[0] as LiteralSegment).value];
+    }
+
+    const hasGlob = segs.some(s => s.type === "Glob");
 
     // Check if any segment could produce IFS splitting or "$@" breaks.
-    const hasExpansion = word.segments.some(s =>
+    const hasExpansion = segs.some(s =>
         s.type === "VariableExpansion" || s.type === "CommandSubstitution" ||
         s.type === "ArithmeticExpansion" ||
         (s.type === "DoubleQuoted" && (s as DoubleQuotedSegment).segments.some(
@@ -231,7 +237,6 @@ export async function expandWord(word: Word): Promise<string[]> {
 
     // Fragment-based path: expand with IFS splitting awareness.
     // Handle tilde expansion on leading literal.
-    const segs = word.segments;
     const fragments: Fragment[] = [];
     let startIdx = 0;
     if (segs.length > 0 && segs[0]!.type === "Literal") {
@@ -267,6 +272,12 @@ export async function expandWordToStr(word: Word): Promise<string> {
     if (segs.length === 0) return "";
 
     const first = segs[0]!;
+
+    // Fast path: single literal segment — no async needed.
+    if (segs.length === 1 && first.type === "Literal") {
+        return (first as LiteralSegment).value;
+    }
+
     if (first.type === "Literal" && (first.value === "~" || first.value.startsWith("~/"))) {
         const home = String($["HOME"] ?? os.homedir());
         const rest = first.value.slice(1);
