@@ -208,7 +208,11 @@ export async function expandWord(word: Word): Promise<string[]> {
     // Fast path: single literal segment — no async, glob, brace, or IFS work needed.
     const segs = word.segments;
     if (segs.length === 1 && segs[0]!.type === "Literal") {
-        return [(segs[0] as LiteralSegment).value];
+        let val = (segs[0] as LiteralSegment).value;
+        if (val === "~" || val.startsWith("~/")) {
+            val = String($["HOME"] ?? os.homedir()) + val.slice(1);
+        }
+        return [val];
     }
 
     const hasGlob = segs.some(s => s.type === "Glob");
@@ -275,7 +279,11 @@ export async function expandWordToStr(word: Word): Promise<string> {
 
     // Fast path: single literal segment — no async needed.
     if (segs.length === 1 && first.type === "Literal") {
-        return (first as LiteralSegment).value;
+        let val = (first as LiteralSegment).value;
+        if (val === "~" || val.startsWith("~/")) {
+            val = String($["HOME"] ?? os.homedir()) + val.slice(1);
+        }
+        return val;
     }
 
     if (first.type === "Literal" && (first.value === "~" || first.value.startsWith("~/"))) {

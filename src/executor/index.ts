@@ -1806,18 +1806,37 @@ function expandHereDocVars(body: string): string {
 
 // ---- read builtin -----------------------------------------------------------
 
+const fdReadBuffers = new Map<number, { buf: Buffer; data: string }>();
+
 function readLineFromFd(fd: number): string | null {
-    const buf = Buffer.alloc(1);
-    let line = "";
-    while (true) {
-        let n: number;
-        try { n = readSync(fd, buf, 0, 1, null); }
-        catch { return line.length > 0 ? line : null; }
-        if (n === 0) return line.length > 0 ? line : null;
-        const ch = buf.toString("utf8", 0, 1);
-        if (ch === "\n") return line;
-        line += ch;
+    let state = fdReadBuffers.get(fd);
+    if (!state) {
+        state = { buf: Buffer.alloc(4096), data: "" };
+        fdReadBuffers.set(fd, state);
     }
+    while (true) {
+        const nl = state.data.indexOf("\n");
+        if (nl >= 0) {
+            const line = state.data.slice(0, nl);
+            state.data = state.data.slice(nl + 1);
+            return line;
+        }
+        let n: number;
+        try { n = readSync(fd, state.buf, 0, state.buf.length, null); }
+        catch { break; }
+        if (n === 0) break;
+        state.data += state.buf.toString("utf8", 0, n);
+    }
+    if (state.data.length > 0) {
+        const line = state.data;
+        state.data = "";
+        return line;
+    }
+    return null;
+}
+
+function clearFdReadBuffer(fd: number): void {
+    fdReadBuffers.delete(fd);
 }
 
 function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
@@ -1879,8 +1898,9 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
             process.stderr.write(`read: ${e instanceof Error ? e.message : e}\n`);
             return { exitCode: 1 };
         }
+        clearFdReadBuffer(fd);
         try { line = readLineFromFd(fd); }
-        finally { fs.closeSync(fd); }
+        finally { clearFdReadBuffer(fd); fs.closeSync(fd); }
     } else {
         if (nchars > 0) {
             // Read exactly N characters.

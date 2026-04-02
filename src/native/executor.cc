@@ -12,9 +12,12 @@
 #include <array>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <uv.h>
 #include <unistd.h>
+
+extern "C" char **environ;
 
 namespace jsh {
 
@@ -329,6 +332,19 @@ struct ExecutorState {
         }
     }
 
+    // Returns true when all stages use only simple redirections that
+    // posix_spawn_file_actions can express.  Here-docs/here-strings need
+    // a pre-fork pipe+write, so they fall back to the fork path.
+    static bool stagesCanPosixSpawn(const std::vector<StageSpec>& stages) {
+        for (const auto& stage : stages) {
+            for (const auto& r : stage.redirs) {
+                if (r.op == "<<" || r.op == "<<-" || r.op == "<<<")
+                    return false;
+            }
+        }
+        return true;
+    }
+
     void processPipeline(PipelineRequest* req) {
         const auto& stages = req->stages;
         const auto& pipeOps = req->pipeOps;
@@ -374,6 +390,145 @@ struct ExecutorState {
         pid_t pgid = -1;
         std::vector<pid_t> pids;
 
+        // ---- posix_spawn fast path ------------------------------------
+        if (stagesCanPosixSpawn(stages)) {
+            bool spawnOk = true;
+            for (int i = 0; i < n && spawnOk; i++) {
+                posix_spawnattr_t attr;
+                posix_spawn_file_actions_t actions;
+                posix_spawnattr_init(&attr);
+                posix_spawn_file_actions_init(&actions);
+
+                // Process group.
+                short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
+                posix_spawnattr_setflags(&attr, flags);
+                posix_spawnattr_setpgroup(&attr, pgid == -1 ? 0 : pgid);
+
+                // Empty signal mask.
+                sigset_t emptyMask;
+                sigemptyset(&emptyMask);
+                posix_spawnattr_setsigmask(&attr, &emptyMask);
+
+                // Reset SIGINT, SIGTTOU, SIGTTIN, SIGPIPE to default.
+                sigset_t defSigs;
+                sigemptyset(&defSigs);
+                sigaddset(&defSigs, SIGINT);
+                sigaddset(&defSigs, SIGTTOU);
+                sigaddset(&defSigs, SIGTTIN);
+                sigaddset(&defSigs, SIGPIPE);
+                posix_spawnattr_setsigdefault(&attr, &defSigs);
+
+                // Track which stdio fds have been explicitly dup2'd.
+                bool stdinSet = false, stdoutSet = false, stderrSet = false;
+
+                // Pipe wiring.
+                if (i > 0) {
+                    posix_spawn_file_actions_adddup2(&actions, pipes[i - 1][0], STDIN_FILENO);
+                    stdinSet = true;
+                }
+                if (i < n - 1) {
+                    posix_spawn_file_actions_adddup2(&actions, pipes[i][1], STDOUT_FILENO);
+                    stdoutSet = true;
+                    if (i < static_cast<int>(pipeOps.size()) && pipeOps[i] == "|&") {
+                        posix_spawn_file_actions_adddup2(&actions, pipes[i][1], STDERR_FILENO);
+                        stderrSet = true;
+                    }
+                } else if (capturePipe[1] != -1) {
+                    posix_spawn_file_actions_adddup2(&actions, capturePipe[1], STDOUT_FILENO);
+                    stdoutSet = true;
+                }
+
+                // Close all pipe fds and capture pipe fds in the child.
+                for (int j = 0; j < n - 1; j++) {
+                    posix_spawn_file_actions_addclose(&actions, pipes[j][0]);
+                    posix_spawn_file_actions_addclose(&actions, pipes[j][1]);
+                }
+                if (capturePipe[0] != -1) posix_spawn_file_actions_addclose(&actions, capturePipe[0]);
+                if (capturePipe[1] != -1) posix_spawn_file_actions_addclose(&actions, capturePipe[1]);
+
+                // Apply redirections.
+                for (const auto& r : stages[i].redirs) {
+                    if (r.op == ">" || r.op == ">>" || r.op == "&>" || r.op == "&>>") {
+                        int oflags = O_WRONLY | O_CREAT;
+                        oflags |= (r.op == ">>" || r.op == "&>>") ? O_APPEND : O_TRUNC;
+                        int dst = (r.fd >= 0) ? r.fd : STDOUT_FILENO;
+                        posix_spawn_file_actions_addopen(&actions, dst, r.target.c_str(), oflags, 0666);
+                        if (dst == STDIN_FILENO) stdinSet = true;
+                        if (dst == STDOUT_FILENO) stdoutSet = true;
+                        if (dst == STDERR_FILENO) stderrSet = true;
+                        if (r.op == "&>" || r.op == "&>>") {
+                            posix_spawn_file_actions_adddup2(&actions, dst, STDERR_FILENO);
+                            stderrSet = true;
+                        }
+                    } else if (r.op == "<") {
+                        int dst = (r.fd >= 0) ? r.fd : STDIN_FILENO;
+                        posix_spawn_file_actions_addopen(&actions, dst, r.target.c_str(), O_RDONLY, 0);
+                        if (dst == STDIN_FILENO) stdinSet = true;
+                        if (dst == STDOUT_FILENO) stdoutSet = true;
+                        if (dst == STDERR_FILENO) stderrSet = true;
+                    } else if (r.op == ">&") {
+                        int src = (r.fd >= 0) ? r.fd : STDOUT_FILENO;
+                        int dst = atoi(r.target.c_str());
+                        posix_spawn_file_actions_adddup2(&actions, dst, src);
+                        if (src == STDIN_FILENO) stdinSet = true;
+                        if (src == STDOUT_FILENO) stdoutSet = true;
+                        if (src == STDERR_FILENO) stderrSet = true;
+                    } else if (r.op == "<&") {
+                        int src = (r.fd >= 0) ? r.fd : STDIN_FILENO;
+                        int dst = atoi(r.target.c_str());
+                        posix_spawn_file_actions_adddup2(&actions, dst, src);
+                        if (src == STDIN_FILENO) stdinSet = true;
+                        if (src == STDOUT_FILENO) stdoutSet = true;
+                        if (src == STDERR_FILENO) stderrSet = true;
+                    }
+                }
+
+                // Clear CLOEXEC on stdio fds: adddup2(fd, fd) clears it in
+                // glibc's posix_spawn implementation.
+                if (!stdinSet)  posix_spawn_file_actions_adddup2(&actions, STDIN_FILENO,  STDIN_FILENO);
+                if (!stdoutSet) posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDOUT_FILENO);
+                if (!stderrSet) posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDERR_FILENO);
+
+                pid_t pid;
+                int err = posix_spawnp(&pid, stages[i].cmd.c_str(), &actions, &attr,
+                                       const_cast<char* const*>(argvs[i].data()), environ);
+
+                posix_spawnattr_destroy(&attr);
+                posix_spawn_file_actions_destroy(&actions);
+
+                if (err != 0) {
+                    writeErr("jsh: ");
+                    writeErr(stages[i].cmd.c_str());
+                    writeErr(": ");
+                    writeErr(strerror(err));
+                    writeErr("\n");
+                    // Clean up remaining pipes.
+                    for (int j = i; j < n - 1; j++) {
+                        close(pipes[j][0]);
+                        close(pipes[j][1]);
+                    }
+                    // Wait for already-spawned children.
+                    for (pid_t p : pids) {
+                        int st = 0;
+                        pid_t w;
+                        do { w = waitpid(p, &st, 0); } while (w == -1 && errno == EINTR);
+                    }
+                    for (int j = 0; j < i && j < n - 1; j++) {
+                        close(pipes[j][0]);
+                        close(pipes[j][1]);
+                    }
+                    req->ctx->exitCode = 127;
+                    signalDone(req->ctx);
+                    delete req;
+                    return;
+                }
+
+                if (pgid == -1) pgid = pid;
+                setpgid(pid, pgid);
+                pids.push_back(pid);
+            }
+        } else {
+        // ---- fork path (here-docs/here-strings) -----------------------
         for (int i = 0; i < n; i++) {
             pid_t pid = fork();
 
@@ -472,6 +627,7 @@ struct ExecutorState {
                 return;
             }
         }
+        } // end fork path
 
         // Parent: close all pipe fds so children see EOF.
         for (auto& p : pipes) {
