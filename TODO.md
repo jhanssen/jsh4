@@ -246,7 +246,7 @@
 
 - [ ] **Keybind system** — C++ action table indexed by key enum, JS sets bindings via `jsh.bindKey("ctrl-a", "move-home")`. Custom JS callbacks for `"custom"` action. Default bindings built-in, user-overridable.
 - [ ] **Named internal widgets assignable to zones** — Allow JS to place built-in UI elements (e.g. search indicator, completion menu) into any zone via `jsh.addWidget("search-indicator", "footer")` with a name instead of a render function. The engine looks up "what zone is this element in?" and renders it there. This lets users control where Ctrl-R/Ctrl-S search text, completion candidates, etc. appear in the layout.
-- [ ] **OSC 133 marks with header widgets** — Currently iTerm2 shows the prompt chevron on both the header line and the input line when header widgets are present. The renderer redraws all rows on every frame update (including cursor-up movements through the header), which confuses iTerm2's row association for OSC 133 marks. Investigate iTerm2 source code (GitHub: gnachman/iTerm2, VT100 parser) to understand how it tracks mark positions during cursor movement. Possible fix: lock widget line counts at session start so frame geometry is stable and the input line row is known.
+- [ ] **Fixed-size headers per editing session** — Lock header widget line count at session start so frame geometry is stable. Widget updates can change content but not add/remove lines. This fixes OSC 133 mark positioning (the input line row is known and doesn't shift) and simplifies the renderer. Dynamic-size content (completion menus, popups) should go in the footer zone.
 - [ ] **Dynamic overlay widgets** — Support popup menus (completion candidates, context menus) as overlays that don't affect the primary frame geometry. Needed if widget sizes are locked for OSC 133 compatibility.
 
 ### Testing
@@ -256,6 +256,10 @@
 ### Technical debt
 
 - [ ] **Move remaining builtins to object map** — `read`, `source`, `.`, `eval`, `trap`, `return`, `command`, `break`, `continue`, `fg`, `bg`, `jobs`, `wait`, `select`, `time` are handled as special cases in `executeSimple` instead of the `builtins` map. Causes duplicate builtin name lists (executor `BUILTIN_NAMES` set and completion `BUILTINS_LIST`).
+
+### Long-term exploration
+
+- [ ] **Terminal emulator with overlay API** — A terminal app (separate project) that exposes an IPC/protocol API for client programs to create/manage visual regions: overlays, floating panels, positioned widgets, z-ordering. jsh would talk to it directly instead of relying on escape sequences. Would solve OSC 133 mark issues with header widgets and enable true popup menus, completion panels, inline documentation, etc. Useful beyond jsh for any TUI application.
 
 ### Not planned (initial scope)
 
