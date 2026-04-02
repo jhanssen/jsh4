@@ -24,6 +24,7 @@ export interface Theme {
     argument?: Color;
     paren?: Color;
     jsInline?: Color;
+    suggestion?: Color;
 }
 
 const DEFAULT_THEME: Theme = {
@@ -37,6 +38,7 @@ const DEFAULT_THEME: Theme = {
     comment:         [105, 105, 105],
     paren:           [255, 203, 107],
     jsInline:        [255, 203, 107],
+    suggestion:      "dim",
 };
 
 let currentTheme: Theme = { ...DEFAULT_THEME };
@@ -54,6 +56,7 @@ interface ResolvedTheme {
     argument: string | null;
     paren: string | null;
     jsInline: string | null;
+    suggestion: string | null;
 }
 
 const NAMED_COLORS: Record<string, number> = {
@@ -99,6 +102,7 @@ function buildResolved(t: Theme): ResolvedTheme {
         argument: resolveColor(t.argument),
         paren: resolveColor(t.paren),
         jsInline: resolveColor(t.jsInline),
+        suggestion: resolveColor(t.suggestion),
     };
 }
 
@@ -111,6 +115,10 @@ export function setTheme(theme: Partial<Theme>): void {
 
 export function getCurrentTheme(): Theme {
     return currentTheme;
+}
+
+export function getResolvedColor(key: keyof ResolvedTheme): string | null {
+    return resolved[key];
 }
 
 // ---- Keyword detection ------------------------------------------------------

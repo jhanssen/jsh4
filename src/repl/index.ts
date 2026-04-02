@@ -10,7 +10,7 @@ import {
     alias, unalias, registerJsFunction, exec, registerCompletion,
 } from "../api/index.js";
 import { getCompletions } from "../completion/index.js";
-import { colorize, getCurrentTheme, registerCommandExists } from "../colorize/index.js";
+import { colorize, getCurrentTheme, registerCommandExists, getResolvedColor } from "../colorize/index.js";
 import { commandExists } from "../completion/index.js";
 import { runTrap } from "../trap/index.js";
 import { addHistoryEntry, expandHistory } from "../history/index.js";
@@ -35,6 +35,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputHistorySetMaxLen: (len: number) => void;
     inputHistorySave: (path: string) => number;
     inputHistoryLoad: (path: string) => number;
+    inputSetSuggestion: (id: number, text: string) => void;
     inputEAGAIN: () => number;
 };
 
@@ -88,6 +89,9 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         // Set up tab completion.
         ui!.setCompletion((input: string) => getCompletions(input));
 
+        // Set suggestion ghost text color from theme.
+        ui!.setSuggestionColor(getResolvedColor("suggestion") ?? "\x1b[2m");
+
         // Register default prompt if user didn't set one.
         if (!userSetPrompt) {
             ui!.addWidget("__default_prompt", "prompt", () => "$ ");
@@ -122,6 +126,7 @@ async function loadRc(customPath?: string): Promise<void> {
         $, setColorize, setTheme,
         alias, unalias, registerJsFunction, exec,
         complete: registerCompletion,
+        setSuggestion: (fn: ((input: string) => Promise<string | null>) | null) => ui?.setSuggestion(fn),
         // Widgets — unified API for all rendered regions
         addWidget: (
             id: string,

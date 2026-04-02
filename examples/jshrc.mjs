@@ -90,6 +90,22 @@ jsh.setTheme({
     comment:         [105, 105, 105],  // gray
 });
 
+// ---- Suggestions (fish-style ghost text) -----------------------------------
+
+// History-based suggestions: finds the most recent history entry matching the current input.
+jsh.setSuggestion(async (input) => {
+    // Search history by running a command — in a real setup you'd search in-memory.
+    // For demo purposes, just return a static suggestion for "foo".
+    if (input === "foo") return "foobar";
+
+    // Search for the most recent history entry starting with the current input.
+    const result = await jsh.exec(`grep -m1 "^${input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" ~/.jsh_history 2>/dev/null`);
+    if (result.ok && result.stdout && result.stdout !== input) {
+        return result.stdout;
+    }
+    return null;
+});
+
 // ---- Tab Completion --------------------------------------------------------
 
 jsh.complete('git', (ctx) => {

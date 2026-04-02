@@ -74,6 +74,8 @@ interface Theme {
     argument?: Color;
     paren?: Color;
     jsInline?: Color;
+    /** Color for fish-style suggestion ghost text (default: "dim"). */
+    suggestion?: Color;
 }
 
 // ---- Widgets ----------------------------------------------------------------
@@ -223,6 +225,26 @@ declare const jsh: {
 
     /** Remove a previously registered widget by id. */
     removeWidget(id: string): void;
+
+    // ---- Suggestions ----
+
+    /**
+     * Set a fish-style suggestion function. Called asynchronously when the user
+     * types. The function receives the current input buffer and should return
+     * the full suggested command (or null for no suggestion). Ghost text appears
+     * dimmed after the cursor. Right arrow at end-of-line accepts.
+     *
+     * Stale suggestions are automatically discarded if the user types more
+     * before the promise resolves.
+     *
+     * @example
+     * jsh.setSuggestion(async (input) => {
+     *     // Search history, call an API, etc.
+     *     const result = await jsh.exec(`grep -m1 "^${input}" ~/.jsh_history`);
+     *     return result.ok ? result.stdout : null;
+     * });
+     */
+    setSuggestion(fn: ((input: string) => Promise<string | null>) | null): void;
 
     // ---- Syntax highlighting ----
 

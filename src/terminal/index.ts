@@ -12,8 +12,11 @@ interface InputState {
     pos: number;
     len: number;
     cols: number;
-    searchQuery?: string;
+    suggestionId?: number;
+    suggestion?: string;      // ghost text (suffix after buffer)
+    searchQuery?: string;     // Ctrl-R reverse history search
     searchMatch?: boolean;
+    lineSearchQuery?: string; // Ctrl-S inline forward search
 }
 
 interface RenderLineResult {
@@ -35,6 +38,7 @@ interface NativeInputEngine {
     inputHistorySetMaxLen: (len: number) => void;
     inputHistorySave: (path: string) => number;
     inputHistoryLoad: (path: string) => number;
+    inputSetSuggestion: (id: number, text: string) => void;
     inputEAGAIN: () => number;
 }
 
@@ -45,6 +49,7 @@ export class TerminalUI {
 
     private colorizeFn: ((input: string, context?: string) => string) | null = null;
     private completionFn: ((input: string) => string[]) | null = null;
+    private suggestionFn: ((input: string) => Promise<string | null>) | null = null;
     private lastState: InputState | null = null;
     private lineCallback: ((line: string | null, errno?: number) => void) | null = null;
     private EAGAIN: number;
@@ -53,6 +58,7 @@ export class TerminalUI {
     private pendingFreeze: string[] = []; // rendered lines from last session, frozen on continuation
     private lastRenderedInputLines: string[] = []; // cached from last renderFrame for onLine reuse
     private editing = false; // true while an editing session is active
+    private suggestionColor = "\x1b[2m"; // default: dim
 
     constructor(native: NativeInputEngine) {
         this.native = native;
@@ -121,6 +127,14 @@ export class TerminalUI {
         this.completionFn = fn;
     }
 
+    setSuggestion(fn: ((input: string) => Promise<string | null>) | null): void {
+        this.suggestionFn = fn;
+    }
+
+    setSuggestionColor(color: string): void {
+        this.suggestionColor = color;
+    }
+
     // ---- Widgets ----
 
     addWidget(id: string, zone: WidgetZone, render: WidgetDef["render"], order = 0): WidgetHandle {
@@ -171,9 +185,23 @@ export class TerminalUI {
         return this.widgets.getZoneContent("rprompt").join("");
     }
 
+    private lastSuggestionId: number | undefined;
+
     private onRender(state: InputState): void {
         this.lastState = state;
         this.renderFrame(state);
+
+        // Trigger async suggestion if the buffer changed and we have a suggestion function.
+        if (this.suggestionFn && state.suggestionId !== undefined &&
+            state.suggestionId !== this.lastSuggestionId && state.buf.length > 0) {
+            this.lastSuggestionId = state.suggestionId;
+            const id = state.suggestionId;
+            this.suggestionFn(state.buf).then(result => {
+                if (result) {
+                    this.native.inputSetSuggestion(id, result);
+                }
+            }).catch(() => {});
+        }
     }
 
     private onLine(line: string | null, errno?: number): void {
@@ -230,6 +258,11 @@ export class TerminalUI {
             displayPrompt = `(${failMark}reverse-i-search)\`${state.searchQuery}': `;
             displayRightPrompt = "";
         }
+        // Inline forward search — show in prompt area (consistent with Ctrl-R).
+        if (state.lineSearchQuery !== undefined) {
+            displayPrompt = `(i-search)\`${state.lineSearchQuery}': `;
+            displayRightPrompt = "";
+        }
 
         // Split buffer on newlines for multi-line input (e.g. from history recall).
         const bufLines = state.buf.split("\n");
@@ -282,7 +315,12 @@ export class TerminalUI {
             const { line, cursorCol: col } = this.native.inputRenderLine(
                 linePrompt, colorized, lineRprompt, state.cols, bufLine, linePos
             );
-            inputLines.push(line);
+            // Append ghost text to the last line if we have a suggestion and cursor is at end.
+            if (isLast && state.suggestion && state.pos === state.len) {
+                inputLines.push(line + this.suggestionColor + state.suggestion + "\x1b[0m");
+            } else {
+                inputLines.push(line);
+            }
             if (isCursorLine) cursorCol = col;
         }
 

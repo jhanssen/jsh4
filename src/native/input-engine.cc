@@ -277,11 +277,22 @@ struct InputState {
     char search_query[256];
     size_t search_query_len = 0;
     int search_match_index = -1;  // history index of current match
+    // Suggestion (fish-style ghost text)
+    std::string suggestion;        // the full suggested line
+    uint32_t suggestion_id = 0;    // monotonic ID — incremented on each buffer change
+    // Inline forward search (Ctrl-S)
+    bool in_line_search = false;
+    char line_search_query[256];
+    size_t line_search_query_len = 0;
+    size_t line_search_start = 0;  // search from this position forward
 };
 
 static InputState g_state;
 
 // ---- Buffer editing operations ---------------------------------------------
+
+// Forward declaration — defined after EngineCtx.
+static void bufferChanged();
 
 static void editInsert(InputState *s, const char *c, size_t clen) {
     if (s->len + clen > s->buflen) return;
@@ -294,6 +305,7 @@ static void editInsert(InputState *s, const char *c, size_t clen) {
     s->pos += clen;
     s->len += clen;
     s->buf[s->len] = '\0';
+    bufferChanged();
 }
 
 static void editDelete(InputState *s) {
@@ -302,6 +314,7 @@ static void editDelete(InputState *s) {
         memmove(s->buf + s->pos, s->buf + s->pos + clen, s->len - s->pos - clen);
         s->len -= clen;
         s->buf[s->len] = '\0';
+        bufferChanged();
     }
 }
 
@@ -312,6 +325,7 @@ static void editBackspace(InputState *s) {
         s->pos -= clen;
         s->len -= clen;
         s->buf[s->len] = '\0';
+        bufferChanged();
     }
 }
 
@@ -406,6 +420,7 @@ static void editDeletePrevWord(InputState *s) {
     size_t diff = old_pos - s->pos;
     memmove(s->buf + s->pos, s->buf + old_pos, s->len - old_pos + 1);
     s->len -= diff;
+    bufferChanged();
 }
 
 static void editHistoryNav(InputState *s, int dir) {
@@ -420,6 +435,7 @@ static void editHistoryNav(InputState *s, int dir) {
     strncpy(s->buf, history[history_len - 1 - s->history_index], s->buflen);
     s->buf[s->buflen] = '\0';
     s->len = s->pos = strlen(s->buf);
+    bufferChanged();
 }
 
 // ---- Control key constants -------------------------------------------------
@@ -461,6 +477,34 @@ static void exitSearchMode(InputState *s) {
     s->search_query_len = 0;
 }
 
+// ---- Inline forward search (Ctrl-S) ----------------------------------------
+
+static void lineSearchForward(InputState *s) {
+    if (s->line_search_query_len == 0) return;
+    // Search forward from line_search_start.
+    const char *haystack = s->buf + s->line_search_start;
+    size_t remaining = s->len - s->line_search_start;
+    const char *found = static_cast<const char *>(
+        memmem(haystack, remaining, s->line_search_query, s->line_search_query_len));
+    if (found) {
+        // Cursor at end of match (zsh behavior — cursor advances with each typed char).
+        s->pos = (found - s->buf) + s->line_search_query_len;
+        s->line_search_start = (found - s->buf) + 1; // next Ctrl-S starts after this match
+    }
+}
+
+static void enterLineSearch(InputState *s) {
+    s->in_line_search = true;
+    s->line_search_query[0] = '\0';
+    s->line_search_query_len = 0;
+    s->line_search_start = s->pos; // start searching from current cursor
+}
+
+static void exitLineSearch(InputState *s) {
+    s->in_line_search = false;
+    s->line_search_query_len = 0;
+}
+
 #define CTRL_A 1
 #define CTRL_B 2
 #define CTRL_C 3
@@ -470,6 +514,7 @@ static void exitSearchMode(InputState *s) {
 #define CTRL_H 8
 #define CTRL_K 11
 #define CTRL_R 18
+#define CTRL_S 19
 #define CTRL_L 12
 #define CTRL_N 14
 #define CTRL_P 16
@@ -497,6 +542,12 @@ static int getColumns() {
     return ws.ws_col;
 }
 
+// Called whenever the buffer changes — invalidates suggestion and bumps ID.
+static void bufferChanged() {
+    g_state.suggestion.clear();
+    g_state.suggestion_id++;
+}
+
 static void notifyRender() {
     if (!g_ctx || g_ctx->onRender.IsEmpty()) return;
     Napi::Env env = g_ctx->onRender.Env();
@@ -506,9 +557,20 @@ static void notifyRender() {
     state.Set("pos", Napi::Number::New(env, static_cast<double>(g_state.pos)));
     state.Set("len", Napi::Number::New(env, static_cast<double>(g_state.len)));
     state.Set("cols", Napi::Number::New(env, static_cast<double>(getColumns())));
+    state.Set("suggestionId", Napi::Number::New(env, static_cast<double>(g_state.suggestion_id)));
+    if (!g_state.suggestion.empty()) {
+        // Ghost text: the part of the suggestion after the current buffer.
+        if (g_state.suggestion.size() > g_state.len &&
+            g_state.suggestion.compare(0, g_state.len, g_state.buf, g_state.len) == 0) {
+            state.Set("suggestion", Napi::String::New(env, g_state.suggestion.c_str() + g_state.len));
+        }
+    }
     if (g_state.in_search) {
         state.Set("searchQuery", Napi::String::New(env, g_state.search_query, g_state.search_query_len));
         state.Set("searchMatch", Napi::Boolean::New(env, g_state.search_match_index >= 0));
+    }
+    if (g_state.in_line_search) {
+        state.Set("lineSearchQuery", Napi::String::New(env, g_state.line_search_query, g_state.line_search_query_len));
     }
     g_ctx->onRender.Call({state});
 }
@@ -629,6 +691,52 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         // Fall through to normal handling of this key.
     }
 
+    // Inline forward search mode (Ctrl-S).
+    if (s->in_line_search) {
+        if (c == CTRL_S) {
+            // Repeat search forward.
+            lineSearchForward(s);
+            notifyRender();
+            return 0;
+        }
+        if (c == CTRL_C) {
+            exitLineSearch(s);
+            notifyRender();
+            return 0;
+        }
+        if (c == BACKSPACE || c == CTRL_H) {
+            if (s->line_search_query_len > 0) {
+                s->line_search_query_len--;
+                s->line_search_query[s->line_search_query_len] = '\0';
+                s->line_search_start = 0;
+                lineSearchForward(s);
+            }
+            notifyRender();
+            return 0;
+        }
+        if (c == ENTER) {
+            // Exit search and execute the line (zsh behavior).
+            exitLineSearch(s);
+            if (history_len > 0) { history_len--; free(history[history_len]); }
+            *out_line = strdup(s->buf);
+            return 1;
+        }
+        if (c >= 32 && c < 127) {
+            if (s->line_search_query_len < sizeof(s->line_search_query) - 1) {
+                s->line_search_query[s->line_search_query_len++] = c;
+                s->line_search_query[s->line_search_query_len] = '\0';
+                s->line_search_start = 0;
+                lineSearchForward(s);
+            }
+            notifyRender();
+            return 0;
+        }
+        // Any other key (ESC, control chars, etc.): exit search and fall through
+        // to normal key processing so escape sequences are handled correctly.
+        exitLineSearch(s);
+        notifyRender();
+    }
+
     // Completion handling
     if ((s->in_completion || c == 9) && !g_ctx->onCompletion.IsEmpty()) {
         int retval = completeLine(s, c);
@@ -686,12 +794,28 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
             memmove(s->buf + prevstart + currlen, s->buf + prevstart, prevlen);
             memcpy(s->buf + prevstart, tmp, currlen);
             if (s->pos + currlen <= s->len) s->pos += currlen;
+            bufferChanged();
             notifyRender();
         }
         break;
 
     case CTRL_B: editMoveLeft(s); notifyRender(); break;
-    case CTRL_F: editMoveRight(s); notifyRender(); break;
+    case CTRL_F:
+        if (s->pos == s->len && !s->suggestion.empty() &&
+            s->suggestion.size() > s->len &&
+            s->suggestion.compare(0, s->len, s->buf, s->len) == 0) {
+            size_t slen = s->suggestion.size();
+            if (slen <= s->buflen) {
+                memcpy(s->buf, s->suggestion.c_str(), slen);
+                s->buf[slen] = '\0';
+                s->pos = s->len = slen;
+                bufferChanged();
+            }
+        } else {
+            editMoveRight(s);
+        }
+        notifyRender();
+        break;
     case CTRL_P:
         if (!editMoveUp(s)) editHistoryNav(s, 1);
         notifyRender();
@@ -702,16 +826,19 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         break;
     case CTRL_A: editMoveHome(s); notifyRender(); break;
     case CTRL_E: editMoveEnd(s); notifyRender(); break;
+    case CTRL_S: enterLineSearch(s); notifyRender(); break;
 
     case CTRL_U:
         s->buf[0] = '\0';
         s->pos = s->len = 0;
+        bufferChanged();
         notifyRender();
         break;
 
     case CTRL_K:
         s->buf[s->pos] = '\0';
         s->len = s->pos;
+        bufferChanged();
         notifyRender();
         break;
 
@@ -754,7 +881,23 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
                     if (!editMoveDown(s)) editHistoryNav(s, -1);
                     notifyRender();
                     break;
-                case 'C': editMoveRight(s); notifyRender(); break;       // Right
+                case 'C': // Right
+                    if (s->pos == s->len && !s->suggestion.empty() &&
+                        s->suggestion.size() > s->len &&
+                        s->suggestion.compare(0, s->len, s->buf, s->len) == 0) {
+                        // Accept suggestion: replace buffer with the full suggestion.
+                        size_t slen = s->suggestion.size();
+                        if (slen <= s->buflen) {
+                            memcpy(s->buf, s->suggestion.c_str(), slen);
+                            s->buf[slen] = '\0';
+                            s->pos = s->len = slen;
+                            bufferChanged();
+                        }
+                    } else {
+                        editMoveRight(s);
+                    }
+                    notifyRender();
+                    break;
                 case 'D': editMoveLeft(s); notifyRender(); break;        // Left
                 case 'H': editMoveHome(s); notifyRender(); break;        // Home
                 case 'F': editMoveEnd(s); notifyRender(); break;         // End
@@ -1038,6 +1181,20 @@ static Napi::Value HistoryLoad(const Napi::CallbackInfo &info) {
     return Napi::Number::New(info.Env(), -1);
 }
 
+static Napi::Value SetSuggestion(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsString()) {
+        return env.Undefined();
+    }
+    uint32_t id = info[0].As<Napi::Number>().Uint32Value();
+    // Only accept if the ID matches the current buffer state.
+    if (id == g_state.suggestion_id && g_state.active) {
+        g_state.suggestion = info[1].As<Napi::String>().Utf8Value();
+        notifyRender();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value GetEAGAIN(const Napi::CallbackInfo &info) {
     return Napi::Number::New(info.Env(), EAGAIN);
 }
@@ -1106,6 +1263,7 @@ Napi::Object InitInputEngine(Napi::Env env, Napi::Object exports) {
     exports.Set("inputHistorySetMaxLen", Napi::Function::New(env, HistorySetMaxLen));
     exports.Set("inputHistorySave",   Napi::Function::New(env, HistorySave));
     exports.Set("inputHistoryLoad",   Napi::Function::New(env, HistoryLoad));
+    exports.Set("inputSetSuggestion", Napi::Function::New(env, SetSuggestion));
     exports.Set("inputEAGAIN",        Napi::Function::New(env, GetEAGAIN));
     // Fd utilities (previously in linenoise.cc)
     exports.Set("closeFd",            Napi::Function::New(env, CloseFd));
