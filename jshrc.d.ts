@@ -32,10 +32,6 @@ type JsPipelineFunction = (
     stdin: AsyncIterable<string> | string | null
 ) => unknown;
 
-// ---- Shell variables --------------------------------------------------------
-
-declare const $: Record<string, unknown>;
-
 // ---- Exec -------------------------------------------------------------------
 
 interface ExecResult {
@@ -138,7 +134,7 @@ interface Colors {
 
 declare const jsh: {
     /** Shell variable store. */
-    $: typeof $;
+    $: Record<string, unknown>;
 
     // ---- Prompt ----
 
