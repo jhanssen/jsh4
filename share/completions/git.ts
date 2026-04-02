@@ -1,5 +1,5 @@
 // Git tab-completion module.
-// Usage in jshrc: import { gitCompletions } from 'jsh/completions/git';
+// Usage in jshrc: import { gitCompletions } from 'jsh/share/completions/git';
 //                 gitCompletions(jsh);
 
 interface CompletionCtx { words: string[]; current: string }
@@ -8,48 +8,104 @@ interface JshApi {
     exec(cmd: string): Promise<{ ok: boolean; stdout: string }>;
 }
 
-// ---- Helpers ----------------------------------------------------------------
+// ---- Stderr suppression wrapper ---------------------------------------------
 
-/** Run one or more git commands, merge their stdout lines, filter by prefix. */
-function makeGitLines(jsh: JshApi, alreadyUsed: Set<string>, prefix: string) {
-    return async (...cmds: string[]): Promise<string[]> => {
-        const results = await Promise.all(cmds.map(c => jsh.exec(c)));
-        const lines = results.flatMap(r => r.ok ? r.stdout.split('\n') : []);
-        return lines.filter(f => f && !alreadyUsed.has(f) && f.startsWith(prefix));
-    };
+/** Run a git command with stderr suppressed (2>/dev/null). */
+async function git(jsh: JshApi, cmd: string): Promise<{ ok: boolean; stdout: string }> {
+    return jsh.exec(cmd + ' 2>/dev/null');
 }
+
+/** Run a git command, split stdout into lines. */
+async function gitLines(jsh: JshApi, cmd: string): Promise<string[]> {
+    const r = await git(jsh, cmd);
+    if (!r.ok) return [];
+    return r.stdout.split('\n').filter(f => f.length > 0);
+}
+
+// ---- Caching ----------------------------------------------------------------
+
+interface Cache<T> {
+    value: T;
+    ts: number;
+}
+
+const CACHE_TTL = 5000; // 5 seconds
+
+const cacheStore = new Map<string, Cache<unknown>>();
+
+function cached<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const now = Date.now();
+    const entry = cacheStore.get(key) as Cache<T> | undefined;
+    if (entry && now - entry.ts < CACHE_TTL) {
+        return Promise.resolve(entry.value);
+    }
+    return fn().then(value => {
+        cacheStore.set(key, { value, ts: now });
+        return value;
+    });
+}
+
+// ---- Alias resolution -------------------------------------------------------
+
+/** Load git aliases and resolve to their underlying commands.
+ *  Returns a map of alias → resolved command name. */
+async function loadAliases(jsh: JshApi): Promise<Map<string, string>> {
+    return cached('aliases', async () => {
+        const lines = await gitLines(jsh, 'git config --get-regexp "^alias\\."');
+        const aliases = new Map<string, string>();
+        for (const line of lines) {
+            // Format: "alias.foo command args..."
+            const spaceIdx = line.indexOf(' ');
+            if (spaceIdx === -1) continue;
+            const aliasName = line.slice(6, spaceIdx); // strip "alias."
+            const cmdline = line.slice(spaceIdx + 1).trim();
+            // Resolve: skip shell commands (starting with !)
+            if (cmdline.startsWith('!')) continue;
+            // Take the first word as the aliased command.
+            const cmd = cmdline.split(/\s+/)[0] ?? '';
+            if (cmd) aliases.set(aliasName, cmd);
+        }
+        // Resolve alias chains (alias pointing to another alias).
+        for (const [name, cmd] of aliases) {
+            const seen = new Set([name]);
+            let resolved = cmd;
+            while (aliases.has(resolved) && !seen.has(resolved)) {
+                seen.add(resolved);
+                resolved = aliases.get(resolved)!;
+            }
+            aliases.set(name, resolved);
+        }
+        return aliases;
+    });
+}
+
+// ---- Ref helpers ------------------------------------------------------------
 
 /** Local branches via for-each-ref (sorted by recency). */
 async function localBranches(jsh: JshApi, prefix: string): Promise<string[]> {
-    const r = await jsh.exec('git for-each-ref --format="%(refname:strip=2)" --sort=-committerdate refs/heads/');
-    if (!r.ok) return [];
-    return r.stdout.split('\n').filter(f => f && f.startsWith(prefix));
+    const lines = await gitLines(jsh, 'git for-each-ref --format="%(refname:strip=2)" --sort=-committerdate refs/heads/');
+    return lines.filter(f => f.startsWith(prefix));
 }
 
 /** All branches (local + remote) via for-each-ref. */
 async function allBranches(jsh: JshApi, prefix: string): Promise<string[]> {
     const [local, remote] = await Promise.all([
-        jsh.exec('git for-each-ref --format="%(refname:strip=2)" --sort=-committerdate refs/heads/'),
-        jsh.exec('git for-each-ref --format="%(refname:strip=2)" refs/remotes/'),
+        gitLines(jsh, 'git for-each-ref --format="%(refname:strip=2)" --sort=-committerdate refs/heads/'),
+        gitLines(jsh, 'git for-each-ref --format="%(refname:strip=2)" refs/remotes/'),
     ]);
-    const lines: string[] = [];
-    if (local.ok) lines.push(...local.stdout.split('\n'));
-    if (remote.ok) lines.push(...remote.stdout.split('\n'));
-    return [...new Set(lines)].filter(f => f && f.startsWith(prefix));
+    return [...new Set([...local, ...remote])].filter(f => f.startsWith(prefix));
 }
 
 /** Unique remote branch names (strip remote prefix, deduplicate). */
 async function uniqueRemoteBranches(jsh: JshApi, prefix: string): Promise<string[]> {
-    const r = await jsh.exec('git for-each-ref --format="%(refname:strip=3)" refs/remotes/');
-    if (!r.ok) return [];
-    return [...new Set(r.stdout.split('\n'))].filter(f => f && f !== 'HEAD' && f.startsWith(prefix));
+    const lines = await gitLines(jsh, 'git for-each-ref --format="%(refname:strip=3)" refs/remotes/');
+    return [...new Set(lines)].filter(f => f !== 'HEAD' && f.startsWith(prefix));
 }
 
 /** Tags sorted by creation date (newest first). */
 async function tagList(jsh: JshApi, prefix: string): Promise<string[]> {
-    const r = await jsh.exec('git tag --sort=-creatordate');
-    if (!r.ok) return [];
-    return r.stdout.split('\n').filter(f => f && f.startsWith(prefix));
+    const lines = await gitLines(jsh, 'git tag --sort=-creatordate');
+    return lines.filter(f => f.startsWith(prefix));
 }
 
 /** Special heads (HEAD, FETCH_HEAD, ORIG_HEAD, etc.). */
@@ -68,14 +124,10 @@ async function allRefs(jsh: JshApi, prefix: string): Promise<string[]> {
     return [...new Set([...branches, ...tags, ...heads])];
 }
 
-/** Recent commits (abbreviated hash + subject). */
+/** Recent commits (abbreviated hash). */
 async function recentCommits(jsh: JshApi, prefix: string, max = 50): Promise<string[]> {
-    const r = await jsh.exec(`git log --no-show-signature --oneline --max-count=${max}`);
-    if (!r.ok) return [];
-    // Return just the abbreviated hashes.
-    return r.stdout.split('\n')
-        .map(l => l.split(' ')[0] ?? '')
-        .filter(h => h && h.startsWith(prefix));
+    const lines = await gitLines(jsh, `git log --no-show-signature --oneline --max-count=${max}`);
+    return lines.map(l => l.split(' ')[0] ?? '').filter(h => h && h.startsWith(prefix));
 }
 
 /** Refs + recent commits. */
@@ -89,25 +141,43 @@ async function refsAndCommits(jsh: JshApi, prefix: string): Promise<string[]> {
 
 /** Remotes. */
 async function remoteList(jsh: JshApi, prefix: string): Promise<string[]> {
-    const r = await jsh.exec('git remote');
-    if (!r.ok) return [];
-    return r.stdout.split('\n').filter(f => f && f.startsWith(prefix));
+    const lines = await gitLines(jsh, 'git remote');
+    return lines.filter(f => f.startsWith(prefix));
 }
 
 /** Stash entries. */
 async function stashList(jsh: JshApi, prefix: string): Promise<string[]> {
-    const r = await jsh.exec('git stash list --format="%gd"');
-    if (!r.ok) return [];
-    return r.stdout.split('\n').filter(f => f && f.startsWith(prefix));
+    const lines = await gitLines(jsh, 'git stash list --format="%gd"');
+    return lines.filter(f => f.startsWith(prefix));
 }
 
 /** Reflog entries. */
 async function reflogList(jsh: JshApi, prefix: string): Promise<string[]> {
-    const r = await jsh.exec('git reflog --no-decorate --format="%h %gs"');
-    if (!r.ok) return [];
-    return r.stdout.split('\n')
-        .map(l => l.split(' ')[0] ?? '')
-        .filter(h => h && h.startsWith(prefix));
+    const lines = await gitLines(jsh, 'git reflog --no-decorate --format="%h %gs"');
+    return lines.map(l => l.split(' ')[0] ?? '').filter(h => h && h.startsWith(prefix));
+}
+
+// ---- Range completion (main..feature, HEAD~3...main) ------------------------
+
+/** Complete ref ranges with .. or ... operators. */
+async function refRanges(jsh: JshApi, prefix: string): Promise<string[]> {
+    // Check if prefix contains a range operator.
+    const dotIdx = prefix.indexOf('..');
+    if (dotIdx === -1) {
+        // No range operator yet — complete refs, and also offer refs with .. and ... appended.
+        const refs = await allRefs(jsh, prefix);
+        // Also return refs with range operators so typing a ref then tab can extend.
+        return refs;
+    }
+
+    // Has range operator — complete the right side.
+    const threeDot = prefix[dotIdx + 2] === '.';
+    const op = threeDot ? '...' : '..';
+    const leftSide = prefix.slice(0, dotIdx);
+    const rightPrefix = prefix.slice(dotIdx + op.length);
+
+    const refs = await allRefs(jsh, rightPrefix);
+    return refs.map(r => leftSide + op + r);
 }
 
 // ---- File status via git status --porcelain --------------------------------
@@ -130,7 +200,7 @@ async function statusFiles(jsh: JshApi, prefix: string, ...categories: FileCateg
     // Tracked file status from porcelain (without untracked — fast).
     if (catSet.size > 0) {
         promises.push((async () => {
-            const r = await jsh.exec('git status --porcelain -uno');
+            const r = await git(jsh, 'git status --porcelain -uno');
             if (!r.ok) return [];
 
             const files: string[] = [];
@@ -158,11 +228,7 @@ async function statusFiles(jsh: JshApi, prefix: string, ...categories: FileCateg
 
     // Untracked files via ls-files (separate, respects config).
     if (wantUntracked) {
-        promises.push((async () => {
-            const r = await jsh.exec('git ls-files -o --exclude-standard');
-            if (!r.ok) return [];
-            return r.stdout.split('\n').filter(f => f.length > 0);
-        })());
+        promises.push(gitLines(jsh, 'git ls-files -o --exclude-standard'));
     }
 
     const results = await Promise.all(promises);
@@ -482,19 +548,60 @@ const SUBCMDS = [
     'tag', 'worktree',
 ];
 
+const MERGE_STRATEGIES = ['resolve', 'recursive', 'octopus', 'ours', 'subtree', 'ort'];
+
 // ---- Main handler -----------------------------------------------------------
 
 export function gitCompletions(jsh: JshApi): void {
     jsh.complete('git', async (ctx) => {
+        // ---- Subcommand completion ------------------------------------------
+
         if (ctx.words.length === 2) {
-            return SUBCMDS.filter(s => s.startsWith(ctx.current));
+            const prefix = ctx.current;
+            // Include aliases alongside built-in subcommands.
+            const aliases = await loadAliases(jsh);
+            const aliasNames = [...aliases.keys()].filter(a => a.startsWith(prefix));
+            const builtins = SUBCMDS.filter(s => s.startsWith(prefix));
+            return [...new Set([...builtins, ...aliasNames])];
         }
 
-        const sub = ctx.words[1]!;
+        // ---- Resolve alias to real subcommand -------------------------------
+
+        let sub = ctx.words[1]!;
+        const aliases = await loadAliases(jsh);
+        const resolved = aliases.get(sub);
+        if (resolved) sub = resolved;
+
         const alreadyUsed = new Set(ctx.words.slice(2, -1));
         const prefix = ctx.current;
         const prev = ctx.words[ctx.words.length - 2] ?? '';
-        const gitLines = makeGitLines(jsh, alreadyUsed, prefix);
+
+        // ---- `--` separator: after --, only complete files, never flags -----
+
+        const dashDashIdx = ctx.words.indexOf('--');
+        const afterDashDash = dashDashIdx !== -1 && dashDashIdx < ctx.words.length - 1;
+
+        if (afterDashDash) {
+            // After --, only file completions (let the default file completer handle it,
+            // or offer status-based files for commands that work with files).
+            switch (sub) {
+                case 'add':
+                    return statusFiles(jsh, prefix, 'modified', 'deleted', 'untracked', 'unmerged');
+                case 'checkout':
+                case 'restore':
+                    return statusFiles(jsh, prefix, 'modified', 'deleted');
+                case 'diff':
+                    return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted');
+                case 'reset':
+                    return statusFiles(jsh, prefix, 'modified-staged', 'added', 'deleted-staged', 'renamed');
+                case 'commit':
+                    return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted', 'untracked', 'added');
+                case 'rm':
+                    return gitLines(jsh, 'git ls-files');
+                default:
+                    return [];  // Fall through to default file completion.
+            }
+        }
 
         // ---- Flag completion ------------------------------------------------
 
@@ -526,7 +633,7 @@ export function gitCompletions(jsh: JshApi): void {
             }
 
             case 'blame':
-                return gitLines('git ls-files');
+                return gitLines(jsh, 'git ls-files');
 
             case 'branch': {
                 if (prev === '-d' || prev === '-D' || prev === '--delete') {
@@ -543,7 +650,6 @@ export function gitCompletions(jsh: JshApi): void {
 
             case 'checkout': {
                 if (prev === '-b' || prev === '-B') return [];
-                // Offer local branches, unique remote branches, and modified files.
                 const [branches, remote, files] = await Promise.all([
                     localBranches(jsh, prefix),
                     uniqueRemoteBranches(jsh, prefix),
@@ -553,25 +659,23 @@ export function gitCompletions(jsh: JshApi): void {
             }
 
             case 'cherry-pick':
-                return refsAndCommits(jsh, prefix);
+                return refRanges(jsh, prefix);
 
             case 'clean':
                 return statusFiles(jsh, prefix, 'untracked');
 
             case 'clone':
-                return [];  // URL or path — no useful completion
+                return [];
 
             case 'commit':
                 return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted', 'untracked', 'added');
 
             case 'config': {
-                // Complete config keys.
-                const r = await jsh.exec('git help --config-for-completion');
+                const r = await git(jsh, 'git help --config-for-completion');
                 if (r.ok) {
                     return r.stdout.split('\n').filter(k => k && k.startsWith(prefix));
                 }
-                // Fallback: list existing keys.
-                const r2 = await jsh.exec('git config --name-only --list');
+                const r2 = await git(jsh, 'git config --name-only --list');
                 if (r2.ok) {
                     return [...new Set(r2.stdout.split('\n'))].filter(k => k && k.startsWith(prefix));
                 }
@@ -582,10 +686,12 @@ export function gitCompletions(jsh: JshApi): void {
                 return refsAndCommits(jsh, prefix);
 
             case 'diff': {
-                // Offer refs for first positional arg, then files.
+                // Support range completion (main..feature).
+                if (prefix.includes('..')) {
+                    return refRanges(jsh, prefix);
+                }
                 const positionals = ctx.words.slice(2).filter(w => !w.startsWith('-'));
                 if (positionals.length <= 1 && !prefix.startsWith('.') && !prefix.includes('/')) {
-                    // Could be a ref or a file — offer both.
                     const [refs, files] = await Promise.all([
                         allRefs(jsh, prefix),
                         statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted'),
@@ -595,8 +701,10 @@ export function gitCompletions(jsh: JshApi): void {
                 return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted');
             }
 
-            case 'difftool':
+            case 'difftool': {
+                if (prefix.includes('..')) return refRanges(jsh, prefix);
                 return allRefs(jsh, prefix);
+            }
 
             case 'fetch': {
                 const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
@@ -606,10 +714,11 @@ export function gitCompletions(jsh: JshApi): void {
             }
 
             case 'format-patch':
+                if (prefix.includes('..')) return refRanges(jsh, prefix);
                 return refsAndCommits(jsh, prefix);
 
             case 'grep':
-                return [];  // Pattern — no useful completion
+                return [];
 
             case 'help':
                 return SUBCMDS.filter(s => s.startsWith(prefix));
@@ -618,22 +727,27 @@ export function gitCompletions(jsh: JshApi): void {
                 return [];
 
             case 'log':
+                if (prefix.includes('..')) return refRanges(jsh, prefix);
                 return refsAndCommits(jsh, prefix);
 
-            case 'merge':
+            case 'merge': {
+                if (prev === '-s' || prev === '--strategy') {
+                    return MERGE_STRATEGIES.filter(s => s.startsWith(prefix));
+                }
                 return allRefs(jsh, prefix);
+            }
 
             case 'mergetool':
                 return statusFiles(jsh, prefix, 'unmerged');
 
             case 'mv':
-                return gitLines('git ls-files');
+                return gitLines(jsh, 'git ls-files');
 
             case 'pull': {
-                const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
                 if (prev === '-s' || prev === '--strategy') {
-                    return ['resolve', 'recursive', 'octopus', 'ours', 'subtree'].filter(s => s.startsWith(prefix));
+                    return MERGE_STRATEGIES.filter(s => s.startsWith(prefix));
                 }
+                const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
                 if (argPos === 3) return remoteList(jsh, prefix);
                 if (argPos === 4) return allBranches(jsh, prefix);
                 return [];
@@ -642,14 +756,22 @@ export function gitCompletions(jsh: JshApi): void {
             case 'push': {
                 const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
                 if (argPos === 3) return remoteList(jsh, prefix);
-                if (argPos === 4) return localBranches(jsh, prefix);
+                if (argPos === 4) {
+                    // Offer branches, and +branch for force-push.
+                    const branches = await localBranches(jsh, prefix.replace(/^\+/, ''));
+                    const normal = branches.filter(b => b.startsWith(prefix));
+                    const force = prefix.startsWith('+')
+                        ? branches.map(b => '+' + b).filter(b => b.startsWith(prefix))
+                        : [];
+                    return [...new Set([...normal, ...force])];
+                }
                 return [];
             }
 
             case 'rebase': {
                 if (prev === '--onto') return allRefs(jsh, prefix);
                 if (prev === '-s' || prev === '--strategy') {
-                    return ['resolve', 'recursive', 'octopus', 'ours', 'subtree'].filter(s => s.startsWith(prefix));
+                    return MERGE_STRATEGIES.filter(s => s.startsWith(prefix));
                 }
                 return allRefs(jsh, prefix);
             }
@@ -686,7 +808,6 @@ export function gitCompletions(jsh: JshApi): void {
                 if (prev === '--soft' || prev === '--mixed' || prev === '--hard' || prev === '--keep' || prev === '--merge') {
                     return refsAndCommits(jsh, prefix);
                 }
-                // Could be a ref or a staged file.
                 const [refs, files] = await Promise.all([
                     refsAndCommits(jsh, prefix),
                     statusFiles(jsh, prefix, 'modified-staged', 'added', 'deleted-staged', 'renamed'),
@@ -709,9 +830,10 @@ export function gitCompletions(jsh: JshApi): void {
                 return refsAndCommits(jsh, prefix);
 
             case 'rm':
-                return gitLines('git ls-files');
+                return gitLines(jsh, 'git ls-files');
 
             case 'shortlog':
+                if (prefix.includes('..')) return refRanges(jsh, prefix);
                 return refsAndCommits(jsh, prefix);
 
             case 'show':
@@ -727,7 +849,6 @@ export function gitCompletions(jsh: JshApi): void {
                     return stashList(jsh, prefix);
                 }
                 if (stashSub === 'branch') {
-                    // After branch name, complete stash refs.
                     if (ctx.words.length >= 5) return stashList(jsh, prefix);
                     return [];
                 }
@@ -738,7 +859,7 @@ export function gitCompletions(jsh: JshApi): void {
             }
 
             case 'status':
-                return [];  // No useful argument completion
+                return [];
 
             case 'submodule': {
                 const subSub = ctx.words[2];
@@ -754,7 +875,6 @@ export function gitCompletions(jsh: JshApi): void {
                 if (ctx.words.includes('-d') || ctx.words.includes('--detach')) {
                     return refsAndCommits(jsh, prefix);
                 }
-                // Local branches + unique remote branches (DWIM).
                 const [branches, remote] = await Promise.all([
                     localBranches(jsh, prefix),
                     uniqueRemoteBranches(jsh, prefix),
@@ -779,7 +899,6 @@ export function gitCompletions(jsh: JshApi): void {
                     return wtCmds.filter(s => s.startsWith(prefix));
                 }
                 if (wtSub === 'add') {
-                    // After path, complete branches.
                     if (ctx.words.length >= 5) return allBranches(jsh, prefix);
                     return [];
                 }
