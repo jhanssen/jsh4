@@ -257,6 +257,10 @@
 
 - [ ] **Move remaining builtins to object map** — `read`, `source`, `.`, `eval`, `trap`, `return`, `command`, `break`, `continue`, `fg`, `bg`, `jobs`, `wait`, `select`, `time` are handled as special cases in `executeSimple` instead of the `builtins` map. Causes duplicate builtin name lists (executor `BUILTIN_NAMES` set and completion `BUILTINS_LIST`).
 
+### Completion
+
+- [ ] **Bash completion compat shim** — Implement `compgen`, `complete`, `compopt` builtins and `COMP_WORDS`/`COMP_CWORD`/`COMP_LINE`/`COMP_POINT`/`COMPREPLY` variables so bash completion scripts (e.g. `git-completion.bash`) can be eval'd directly, similar to zsh's approach. jsh already has arrays, `${var%%pat}`, `${var:offset:len}`, and `declare`. Missing pieces: `compgen -W/-f/-d`, `compopt -o nospace`, `declare -F`, and the `COMP_*` ↔ `jsh.complete()` bridge.
+
 ### Long-term exploration
 
 - [ ] **Terminal emulator with overlay API** — A terminal app (separate project) that exposes an IPC/protocol API for client programs to create/manage visual regions: overlays, floating panels, positioned widgets, z-ordering. jsh would talk to it directly instead of relying on escape sequences. Would solve OSC 133 mark issues with header widgets and enable true popup menus, completion panels, inline documentation, etc. Useful beyond jsh for any TUI application.

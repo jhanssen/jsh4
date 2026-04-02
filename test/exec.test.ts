@@ -137,3 +137,45 @@ describe("jsh.exec() — stderr option", () => {
         assert.ok(lines.length > 0);
     });
 });
+
+describe("jsh.exec() — compound commands", () => {
+    it("should handle && (both succeed)", async () => {
+        const { stdout, ok } = await exec("echo a && echo b");
+        assert.strictEqual(stdout, "a\nb");
+        assert.strictEqual(ok, true);
+    });
+
+    it("should handle && (first fails)", async () => {
+        const { stdout, ok } = await exec("false && echo b");
+        assert.strictEqual(stdout, "");
+        assert.strictEqual(ok, false);
+    });
+
+    it("should handle || (first succeeds)", async () => {
+        const { stdout, ok } = await exec("echo a || echo b");
+        assert.strictEqual(stdout, "a");
+        assert.strictEqual(ok, true);
+    });
+
+    it("should handle || (first fails)", async () => {
+        const { stdout, ok } = await exec("false || echo b");
+        assert.strictEqual(stdout, "b");
+        assert.strictEqual(ok, true);
+    });
+
+    it("should handle semicolon-separated commands", async () => {
+        const { stdout } = await exec("echo a; echo b");
+        assert.strictEqual(stdout, "a\nb");
+    });
+
+    it("should handle mixed && and ||", async () => {
+        const { stdout } = await exec("true && echo yes || echo no");
+        assert.strictEqual(stdout, "yes");
+    });
+
+    it("should iterate lines from compound command", async () => {
+        const lines: string[] = [];
+        for await (const line of exec("echo x && echo y")) lines.push(line);
+        assert.deepStrictEqual(lines, ["x", "y"]);
+    });
+});
