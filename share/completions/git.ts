@@ -554,358 +554,364 @@ const MERGE_STRATEGIES = ['resolve', 'recursive', 'octopus', 'ours', 'subtree', 
 
 export function gitCompletions(jsh: JshApi): void {
     jsh.complete('git', async (ctx) => {
-        // ---- Subcommand completion ------------------------------------------
+        const results = await completeGit(jsh, ctx);
 
-        if (ctx.words.length === 2) {
-            const prefix = ctx.current;
-            // Include aliases alongside built-in subcommands.
-            const aliases = await loadAliases(jsh);
-            const aliasNames = [...aliases.keys()].filter(a => a.startsWith(prefix));
-            const builtins = SUBCMDS.filter(s => s.startsWith(prefix));
-            return [...new Set([...builtins, ...aliasNames])];
+        // Filter out args already present on the command line.
+        if (ctx.words.length > 2) {
+            const alreadyUsed = new Set(ctx.words.slice(2, -1));
+            return results.filter(r => !alreadyUsed.has(r));
         }
+        return results;
+    });
+}
 
-        // ---- Resolve alias to real subcommand -------------------------------
+async function completeGit(jsh: JshApi, ctx: CompletionCtx): Promise<string[]> {
+    // ---- Subcommand completion ------------------------------------------
 
-        let sub = ctx.words[1]!;
-        const aliases = await loadAliases(jsh);
-        const resolved = aliases.get(sub);
-        if (resolved) sub = resolved;
-
-        const alreadyUsed = new Set(ctx.words.slice(2, -1));
+    if (ctx.words.length === 2) {
         const prefix = ctx.current;
-        const prev = ctx.words[ctx.words.length - 2] ?? '';
+        // Include aliases alongside built-in subcommands.
+        const aliases = await loadAliases(jsh);
+        const aliasNames = [...aliases.keys()].filter(a => a.startsWith(prefix));
+        const builtins = SUBCMDS.filter(s => s.startsWith(prefix));
+        return [...new Set([...builtins, ...aliasNames])];
+    }
 
-        // ---- `--` separator: after --, only complete files, never flags -----
+    // ---- Resolve alias to real subcommand -------------------------------
 
-        const dashDashIdx = ctx.words.indexOf('--');
-        const afterDashDash = dashDashIdx !== -1 && dashDashIdx < ctx.words.length - 1;
+    let sub = ctx.words[1]!;
+    const aliases = await loadAliases(jsh);
+    const resolved = aliases.get(sub);
+    if (resolved) sub = resolved;
 
-        if (afterDashDash) {
-            // After --, only file completions (let the default file completer handle it,
-            // or offer status-based files for commands that work with files).
-            switch (sub) {
-                case 'add':
-                    return statusFiles(jsh, prefix, 'modified', 'deleted', 'untracked', 'unmerged');
-                case 'checkout':
-                case 'restore':
-                    return statusFiles(jsh, prefix, 'modified', 'deleted');
-                case 'diff':
-                    return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted');
-                case 'reset':
-                    return statusFiles(jsh, prefix, 'modified-staged', 'added', 'deleted-staged', 'renamed');
-                case 'commit':
-                    return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted', 'untracked', 'added');
-                case 'rm':
-                    return gitLines(jsh, 'git ls-files');
-                default:
-                    return [];  // Fall through to default file completion.
-            }
-        }
+    const prefix = ctx.current;
+    const prev = ctx.words[ctx.words.length - 2] ?? '';
 
-        // ---- Flag completion ------------------------------------------------
+    // ---- `--` separator: after --, only complete files, never flags -----
 
-        if (prefix.startsWith('-')) {
-            const key = sub === 'cherry-pick' ? 'cherry' : sub;
-            const flags = flagMap[key] ?? [];
-            return flags.filter(f => f.startsWith(prefix) && !alreadyUsed.has(f));
-        }
+    const dashDashIdx = ctx.words.indexOf('--');
+    const afterDashDash = dashDashIdx !== -1 && dashDashIdx < ctx.words.length - 1;
 
-        // ---- Argument completion per subcommand -----------------------------
-
+    if (afterDashDash) {
         switch (sub) {
             case 'add':
                 return statusFiles(jsh, prefix, 'modified', 'deleted', 'untracked', 'unmerged');
-
-            case 'bisect': {
-                const bisectSub = ctx.words[2];
-                const bisectCmds = ['start', 'bad', 'good', 'new', 'old', 'skip', 'reset', 'log', 'replay', 'run', 'visualize', 'view', 'help', 'terms'];
-                if (ctx.words.length === 3) {
-                    return bisectCmds.filter(s => s.startsWith(prefix));
-                }
-                if (bisectSub === 'bad' || bisectSub === 'good' || bisectSub === 'new' || bisectSub === 'old' || bisectSub === 'skip') {
-                    return refsAndCommits(jsh, prefix);
-                }
-                if (bisectSub === 'reset') {
-                    return localBranches(jsh, prefix);
-                }
-                return [];
-            }
-
-            case 'blame':
-                return gitLines(jsh, 'git ls-files');
-
-            case 'branch': {
-                if (prev === '-d' || prev === '-D' || prev === '--delete') {
-                    return localBranches(jsh, prefix);
-                }
-                if (prev === '--set-upstream-to') {
-                    return allBranches(jsh, prefix);
-                }
-                if (prev === '--contains' || prev === '--no-contains' || prev === '--merged' || prev === '--no-merged' || prev === '--points-at') {
-                    return refsAndCommits(jsh, prefix);
-                }
-                return localBranches(jsh, prefix);
-            }
-
-            case 'checkout': {
-                if (prev === '-b' || prev === '-B') return [];
-                const [branches, remote, files] = await Promise.all([
-                    localBranches(jsh, prefix),
-                    uniqueRemoteBranches(jsh, prefix),
-                    statusFiles(jsh, prefix, 'modified', 'deleted'),
-                ]);
-                return [...new Set([...branches, ...remote, ...files])];
-            }
-
-            case 'cherry-pick':
-                return refRanges(jsh, prefix);
-
-            case 'clean':
-                return statusFiles(jsh, prefix, 'untracked');
-
-            case 'clone':
-                return [];
-
+            case 'checkout':
+            case 'restore':
+                return statusFiles(jsh, prefix, 'modified', 'deleted');
+            case 'diff':
+                return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted');
+            case 'reset':
+                return statusFiles(jsh, prefix, 'modified-staged', 'added', 'deleted-staged', 'renamed');
             case 'commit':
                 return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted', 'untracked', 'added');
-
-            case 'config': {
-                const r = await git(jsh, 'git help --config-for-completion');
-                if (r.ok) {
-                    return r.stdout.split('\n').filter(k => k && k.startsWith(prefix));
-                }
-                const r2 = await git(jsh, 'git config --name-only --list');
-                if (r2.ok) {
-                    return [...new Set(r2.stdout.split('\n'))].filter(k => k && k.startsWith(prefix));
-                }
-                return [];
-            }
-
-            case 'describe':
-                return refsAndCommits(jsh, prefix);
-
-            case 'diff': {
-                // Support range completion (main..feature).
-                if (prefix.includes('..')) {
-                    return refRanges(jsh, prefix);
-                }
-                const positionals = ctx.words.slice(2).filter(w => !w.startsWith('-'));
-                if (positionals.length <= 1 && !prefix.startsWith('.') && !prefix.includes('/')) {
-                    const [refs, files] = await Promise.all([
-                        allRefs(jsh, prefix),
-                        statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted'),
-                    ]);
-                    return [...new Set([...refs, ...files])];
-                }
-                return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted');
-            }
-
-            case 'difftool': {
-                if (prefix.includes('..')) return refRanges(jsh, prefix);
-                return allRefs(jsh, prefix);
-            }
-
-            case 'fetch': {
-                const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
-                if (argPos === 3) return remoteList(jsh, prefix);
-                if (argPos === 4) return allBranches(jsh, prefix);
-                return [];
-            }
-
-            case 'format-patch':
-                if (prefix.includes('..')) return refRanges(jsh, prefix);
-                return refsAndCommits(jsh, prefix);
-
-            case 'grep':
-                return [];
-
-            case 'help':
-                return SUBCMDS.filter(s => s.startsWith(prefix));
-
-            case 'init':
-                return [];
-
-            case 'log':
-                if (prefix.includes('..')) return refRanges(jsh, prefix);
-                return refsAndCommits(jsh, prefix);
-
-            case 'merge': {
-                if (prev === '-s' || prev === '--strategy') {
-                    return MERGE_STRATEGIES.filter(s => s.startsWith(prefix));
-                }
-                return allRefs(jsh, prefix);
-            }
-
-            case 'mergetool':
-                return statusFiles(jsh, prefix, 'unmerged');
-
-            case 'mv':
+            case 'rm':
                 return gitLines(jsh, 'git ls-files');
-
-            case 'pull': {
-                if (prev === '-s' || prev === '--strategy') {
-                    return MERGE_STRATEGIES.filter(s => s.startsWith(prefix));
-                }
-                const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
-                if (argPos === 3) return remoteList(jsh, prefix);
-                if (argPos === 4) return allBranches(jsh, prefix);
+            default:
                 return [];
-            }
+        }
+    }
 
-            case 'push': {
-                const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
-                if (argPos === 3) return remoteList(jsh, prefix);
-                if (argPos === 4) {
-                    // Offer branches, and +branch for force-push.
-                    const branches = await localBranches(jsh, prefix.replace(/^\+/, ''));
-                    const normal = branches.filter(b => b.startsWith(prefix));
-                    const force = prefix.startsWith('+')
-                        ? branches.map(b => '+' + b).filter(b => b.startsWith(prefix))
-                        : [];
-                    return [...new Set([...normal, ...force])];
-                }
-                return [];
-            }
+    // ---- Flag completion ------------------------------------------------
 
-            case 'rebase': {
-                if (prev === '--onto') return allRefs(jsh, prefix);
-                if (prev === '-s' || prev === '--strategy') {
-                    return MERGE_STRATEGIES.filter(s => s.startsWith(prefix));
-                }
-                return allRefs(jsh, prefix);
-            }
+    if (prefix.startsWith('-')) {
+        const key = sub === 'cherry-pick' ? 'cherry' : sub;
+        const flags = flagMap[key] ?? [];
+        return flags.filter(f => f.startsWith(prefix));
+    }
 
-            case 'reflog': {
-                const reflogSub = ctx.words[2];
-                const reflogCmds = ['show', 'expire', 'delete', 'exists'];
-                if (ctx.words.length === 3) {
-                    return reflogCmds.filter(s => s.startsWith(prefix));
-                }
-                if (reflogSub === 'show' || reflogSub === 'delete') {
-                    return reflogList(jsh, prefix);
-                }
-                return [];
-            }
+    // ---- Argument completion per subcommand -----------------------------
 
-            case 'remote': {
-                const remoteSub = ctx.words[2];
-                const remoteCmds = ['add', 'remove', 'rename', 'show', 'prune',
-                    'get-url', 'set-url', 'set-head', 'set-branches', 'update'];
-                if (ctx.words.length === 3) {
-                    return remoteCmds.filter(s => s.startsWith(prefix));
-                }
-                if (remoteSub === 'remove' || remoteSub === 'rm' || remoteSub === 'rename' ||
-                    remoteSub === 'show' || remoteSub === 'prune' || remoteSub === 'get-url' ||
-                    remoteSub === 'set-url' || remoteSub === 'set-head' || remoteSub === 'set-branches' ||
-                    remoteSub === 'update') {
-                    return remoteList(jsh, prefix);
-                }
-                return [];
-            }
+    switch (sub) {
+        case 'add':
+            return statusFiles(jsh, prefix, 'modified', 'deleted', 'untracked', 'unmerged');
 
-            case 'reset': {
-                if (prev === '--soft' || prev === '--mixed' || prev === '--hard' || prev === '--keep' || prev === '--merge') {
-                    return refsAndCommits(jsh, prefix);
-                }
+        case 'bisect': {
+            const bisectSub = ctx.words[2];
+            const bisectCmds = ['start', 'bad', 'good', 'new', 'old', 'skip', 'reset', 'log', 'replay', 'run', 'visualize', 'view', 'help', 'terms'];
+            if (ctx.words.length === 3) {
+                return bisectCmds.filter(s => s.startsWith(prefix));
+            }
+            if (bisectSub === 'bad' || bisectSub === 'good' || bisectSub === 'new' || bisectSub === 'old' || bisectSub === 'skip') {
+                return refsAndCommits(jsh, prefix);
+            }
+            if (bisectSub === 'reset') {
+                return localBranches(jsh, prefix);
+            }
+            return [];
+        }
+
+        case 'blame':
+            return gitLines(jsh, 'git ls-files');
+
+        case 'branch': {
+            if (prev === '-d' || prev === '-D' || prev === '--delete') {
+                return localBranches(jsh, prefix);
+            }
+            if (prev === '--set-upstream-to') {
+                return allBranches(jsh, prefix);
+            }
+            if (prev === '--contains' || prev === '--no-contains' || prev === '--merged' || prev === '--no-merged' || prev === '--points-at') {
+                return refsAndCommits(jsh, prefix);
+            }
+            return localBranches(jsh, prefix);
+        }
+
+        case 'checkout': {
+            if (prev === '-b' || prev === '-B') return [];
+            const [branches, remote, files] = await Promise.all([
+                localBranches(jsh, prefix),
+                uniqueRemoteBranches(jsh, prefix),
+                statusFiles(jsh, prefix, 'modified', 'deleted'),
+            ]);
+            return [...new Set([...branches, ...remote, ...files])];
+        }
+
+        case 'cherry-pick':
+            return refRanges(jsh, prefix);
+
+        case 'clean':
+            return statusFiles(jsh, prefix, 'untracked');
+
+        case 'clone':
+            return [];
+
+        case 'commit':
+            return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted', 'untracked', 'added');
+
+        case 'config': {
+            const r = await git(jsh, 'git help --config-for-completion');
+            if (r.ok) {
+                return r.stdout.split('\n').filter(k => k && k.startsWith(prefix));
+            }
+            const r2 = await git(jsh, 'git config --name-only --list');
+            if (r2.ok) {
+                return [...new Set(r2.stdout.split('\n'))].filter(k => k && k.startsWith(prefix));
+            }
+            return [];
+        }
+
+        case 'describe':
+            return refsAndCommits(jsh, prefix);
+
+        case 'diff': {
+            if (prefix.includes('..')) {
+                return refRanges(jsh, prefix);
+            }
+            const positionals = ctx.words.slice(2).filter(w => !w.startsWith('-'));
+            if (positionals.length <= 1 && !prefix.startsWith('.') && !prefix.includes('/')) {
                 const [refs, files] = await Promise.all([
-                    refsAndCommits(jsh, prefix),
-                    statusFiles(jsh, prefix, 'modified-staged', 'added', 'deleted-staged', 'renamed'),
+                    allRefs(jsh, prefix),
+                    statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted'),
                 ]);
                 return [...new Set([...refs, ...files])];
             }
-
-            case 'restore': {
-                if (prev === '-s' || prev === '--source') {
-                    return allRefs(jsh, prefix);
-                }
-                const hasStaged = ctx.words.includes('--staged') || ctx.words.includes('-S');
-                if (hasStaged) {
-                    return statusFiles(jsh, prefix, 'modified-staged', 'added', 'deleted-staged', 'renamed');
-                }
-                return statusFiles(jsh, prefix, 'modified', 'deleted');
-            }
-
-            case 'revert':
-                return refsAndCommits(jsh, prefix);
-
-            case 'rm':
-                return gitLines(jsh, 'git ls-files');
-
-            case 'shortlog':
-                if (prefix.includes('..')) return refRanges(jsh, prefix);
-                return refsAndCommits(jsh, prefix);
-
-            case 'show':
-                return refsAndCommits(jsh, prefix);
-
-            case 'stash': {
-                const stashSub = ctx.words[2];
-                const stashCmds = ['push', 'pop', 'apply', 'drop', 'show', 'list', 'clear', 'branch', 'create', 'save'];
-                if (ctx.words.length === 3) {
-                    return stashCmds.filter(s => s.startsWith(prefix));
-                }
-                if (stashSub === 'pop' || stashSub === 'apply' || stashSub === 'drop' || stashSub === 'show') {
-                    return stashList(jsh, prefix);
-                }
-                if (stashSub === 'branch') {
-                    if (ctx.words.length >= 5) return stashList(jsh, prefix);
-                    return [];
-                }
-                if (stashSub === 'push') {
-                    return statusFiles(jsh, prefix, 'modified', 'deleted', 'untracked');
-                }
-                return [];
-            }
-
-            case 'status':
-                return [];
-
-            case 'submodule': {
-                const subSub = ctx.words[2];
-                const subCmds = ['add', 'status', 'init', 'deinit', 'update', 'set-branch', 'set-url', 'summary', 'foreach', 'sync', 'absorbgitdirs'];
-                if (ctx.words.length === 3) {
-                    return subCmds.filter(s => s.startsWith(prefix));
-                }
-                return [];
-            }
-
-            case 'switch': {
-                if (prev === '-c' || prev === '-C' || prev === '--create' || prev === '--force-create') return [];
-                if (ctx.words.includes('-d') || ctx.words.includes('--detach')) {
-                    return refsAndCommits(jsh, prefix);
-                }
-                const [branches, remote] = await Promise.all([
-                    localBranches(jsh, prefix),
-                    uniqueRemoteBranches(jsh, prefix),
-                ]);
-                return [...new Set([...branches, ...remote])];
-            }
-
-            case 'tag': {
-                if (prev === '-d' || prev === '--delete' || prev === '-v' || prev === '--verify') {
-                    return tagList(jsh, prefix);
-                }
-                if (prev === '--contains' || prev === '--no-contains' || prev === '--merged' || prev === '--no-merged' || prev === '--points-at') {
-                    return refsAndCommits(jsh, prefix);
-                }
-                return tagList(jsh, prefix);
-            }
-
-            case 'worktree': {
-                const wtSub = ctx.words[2];
-                const wtCmds = ['add', 'list', 'lock', 'move', 'prune', 'remove', 'repair', 'unlock'];
-                if (ctx.words.length === 3) {
-                    return wtCmds.filter(s => s.startsWith(prefix));
-                }
-                if (wtSub === 'add') {
-                    if (ctx.words.length >= 5) return allBranches(jsh, prefix);
-                    return [];
-                }
-                return [];
-            }
+            return statusFiles(jsh, prefix, 'modified', 'modified-staged', 'deleted');
         }
 
-        return [];
-    });
+        case 'difftool': {
+            if (prefix.includes('..')) return refRanges(jsh, prefix);
+            return allRefs(jsh, prefix);
+        }
+
+        case 'fetch': {
+            const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
+            if (argPos === 3) return remoteList(jsh, prefix);
+            if (argPos === 4) return allBranches(jsh, prefix);
+            return [];
+        }
+
+        case 'format-patch':
+            if (prefix.includes('..')) return refRanges(jsh, prefix);
+            return refsAndCommits(jsh, prefix);
+
+        case 'grep':
+            return [];
+
+        case 'help':
+            return SUBCMDS.filter(s => s.startsWith(prefix));
+
+        case 'init':
+            return [];
+
+        case 'log':
+            if (prefix.includes('..')) return refRanges(jsh, prefix);
+            return refsAndCommits(jsh, prefix);
+
+        case 'merge': {
+            if (prev === '-s' || prev === '--strategy') {
+                return MERGE_STRATEGIES.filter(s => s.startsWith(prefix));
+            }
+            return allRefs(jsh, prefix);
+        }
+
+        case 'mergetool':
+            return statusFiles(jsh, prefix, 'unmerged');
+
+        case 'mv':
+            return gitLines(jsh, 'git ls-files');
+
+        case 'pull': {
+            if (prev === '-s' || prev === '--strategy') {
+                return MERGE_STRATEGIES.filter(s => s.startsWith(prefix));
+            }
+            const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
+            if (argPos === 3) return remoteList(jsh, prefix);
+            if (argPos === 4) return allBranches(jsh, prefix);
+            return [];
+        }
+
+        case 'push': {
+            const argPos = ctx.words.filter(w => !w.startsWith('-')).length;
+            if (argPos === 3) return remoteList(jsh, prefix);
+            if (argPos === 4) {
+                const branches = await localBranches(jsh, prefix.replace(/^\+/, ''));
+                const normal = branches.filter(b => b.startsWith(prefix));
+                const force = prefix.startsWith('+')
+                    ? branches.map(b => '+' + b).filter(b => b.startsWith(prefix))
+                    : [];
+                return [...new Set([...normal, ...force])];
+            }
+            return [];
+        }
+
+        case 'rebase': {
+            if (prev === '--onto') return allRefs(jsh, prefix);
+            if (prev === '-s' || prev === '--strategy') {
+                return MERGE_STRATEGIES.filter(s => s.startsWith(prefix));
+            }
+            return allRefs(jsh, prefix);
+        }
+
+        case 'reflog': {
+            const reflogSub = ctx.words[2];
+            const reflogCmds = ['show', 'expire', 'delete', 'exists'];
+            if (ctx.words.length === 3) {
+                return reflogCmds.filter(s => s.startsWith(prefix));
+            }
+            if (reflogSub === 'show' || reflogSub === 'delete') {
+                return reflogList(jsh, prefix);
+            }
+            return [];
+        }
+
+        case 'remote': {
+            const remoteSub = ctx.words[2];
+            const remoteCmds = ['add', 'remove', 'rename', 'show', 'prune',
+                'get-url', 'set-url', 'set-head', 'set-branches', 'update'];
+            if (ctx.words.length === 3) {
+                return remoteCmds.filter(s => s.startsWith(prefix));
+            }
+            if (remoteSub === 'remove' || remoteSub === 'rm' || remoteSub === 'rename' ||
+                remoteSub === 'show' || remoteSub === 'prune' || remoteSub === 'get-url' ||
+                remoteSub === 'set-url' || remoteSub === 'set-head' || remoteSub === 'set-branches' ||
+                remoteSub === 'update') {
+                return remoteList(jsh, prefix);
+            }
+            return [];
+        }
+
+        case 'reset': {
+            if (prev === '--soft' || prev === '--mixed' || prev === '--hard' || prev === '--keep' || prev === '--merge') {
+                return refsAndCommits(jsh, prefix);
+            }
+            const [refs, files] = await Promise.all([
+                refsAndCommits(jsh, prefix),
+                statusFiles(jsh, prefix, 'modified-staged', 'added', 'deleted-staged', 'renamed'),
+            ]);
+            return [...new Set([...refs, ...files])];
+        }
+
+        case 'restore': {
+            if (prev === '-s' || prev === '--source') {
+                return allRefs(jsh, prefix);
+            }
+            const hasStaged = ctx.words.includes('--staged') || ctx.words.includes('-S');
+            if (hasStaged) {
+                return statusFiles(jsh, prefix, 'modified-staged', 'added', 'deleted-staged', 'renamed');
+            }
+            return statusFiles(jsh, prefix, 'modified', 'deleted');
+        }
+
+        case 'revert':
+            return refsAndCommits(jsh, prefix);
+
+        case 'rm':
+            return gitLines(jsh, 'git ls-files');
+
+        case 'shortlog':
+            if (prefix.includes('..')) return refRanges(jsh, prefix);
+            return refsAndCommits(jsh, prefix);
+
+        case 'show':
+            return refsAndCommits(jsh, prefix);
+
+        case 'stash': {
+            const stashSub = ctx.words[2];
+            const stashCmds = ['push', 'pop', 'apply', 'drop', 'show', 'list', 'clear', 'branch', 'create', 'save'];
+            if (ctx.words.length === 3) {
+                return stashCmds.filter(s => s.startsWith(prefix));
+            }
+            if (stashSub === 'pop' || stashSub === 'apply' || stashSub === 'drop' || stashSub === 'show') {
+                return stashList(jsh, prefix);
+            }
+            if (stashSub === 'branch') {
+                if (ctx.words.length >= 5) return stashList(jsh, prefix);
+                return [];
+            }
+            if (stashSub === 'push') {
+                return statusFiles(jsh, prefix, 'modified', 'deleted', 'untracked');
+            }
+            return [];
+        }
+
+        case 'status':
+            return [];
+
+        case 'submodule': {
+            const subSub = ctx.words[2];
+            const subCmds = ['add', 'status', 'init', 'deinit', 'update', 'set-branch', 'set-url', 'summary', 'foreach', 'sync', 'absorbgitdirs'];
+            if (ctx.words.length === 3) {
+                return subCmds.filter(s => s.startsWith(prefix));
+            }
+            return [];
+        }
+
+        case 'switch': {
+            if (prev === '-c' || prev === '-C' || prev === '--create' || prev === '--force-create') return [];
+            if (ctx.words.includes('-d') || ctx.words.includes('--detach')) {
+                return refsAndCommits(jsh, prefix);
+            }
+            const [branches, remote] = await Promise.all([
+                localBranches(jsh, prefix),
+                uniqueRemoteBranches(jsh, prefix),
+            ]);
+            return [...new Set([...branches, ...remote])];
+        }
+
+        case 'tag': {
+            if (prev === '-d' || prev === '--delete' || prev === '-v' || prev === '--verify') {
+                return tagList(jsh, prefix);
+            }
+            if (prev === '--contains' || prev === '--no-contains' || prev === '--merged' || prev === '--no-merged' || prev === '--points-at') {
+                return refsAndCommits(jsh, prefix);
+            }
+            return tagList(jsh, prefix);
+        }
+
+        case 'worktree': {
+            const wtSub = ctx.words[2];
+            const wtCmds = ['add', 'list', 'lock', 'move', 'prune', 'remove', 'repair', 'unlock'];
+            if (ctx.words.length === 3) {
+                return wtCmds.filter(s => s.startsWith(prefix));
+            }
+            if (wtSub === 'add') {
+                if (ctx.words.length >= 5) return allBranches(jsh, prefix);
+                return [];
+            }
+            return [];
+        }
+    }
+
+    return [];
 }
