@@ -8,10 +8,7 @@ import { registerJsFunction } from "../src/jsfunctions/index.js";
 
 const require = createRequire(import.meta.url);
 
-before(() => {
-    const native = require("../build/Release/jsh_native.node");
-    native.initExecutor();
-});
+// No before hook needed — tests spawn jsh subprocesses.
 
 // Run commands through jsh subprocess and return trimmed stdout.
 function run(cmd: string): string {

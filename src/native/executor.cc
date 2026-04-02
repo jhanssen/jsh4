@@ -250,6 +250,7 @@ struct ExecutorState {
 
     void start() {
         thread = std::thread(&ExecutorState::run, this);
+        thread.detach();
     }
 
     void enqueue(PipelineRequest* req) {

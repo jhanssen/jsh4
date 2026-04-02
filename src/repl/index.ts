@@ -3,15 +3,16 @@ import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { readFileSync } from "node:fs";
 import { parse, IncompleteInputError } from "../parser/index.js";
-import { execute, executeString, setCommandText, reapJobs } from "../executor/index.js";
+import { execute, executeString, setCommandText, reapJobs, hasShellFunction } from "../executor/index.js";
 import { $ } from "../variables/index.js";
 import {
     getPromptAsync, setPrompt, setRightPrompt, getRightPromptAsync,
-    setColorize, getColorize, setTheme,
+    setColorize, getColorize, setTheme, getAlias,
     alias, unalias, registerJsFunction, exec, registerCompletion,
 } from "../api/index.js";
 import { getCompletions } from "../completion/index.js";
-import { colorize, getCurrentTheme } from "../colorize/index.js";
+import { colorize, getCurrentTheme, registerCommandExists } from "../colorize/index.js";
+import { commandExists } from "../completion/index.js";
 import { runTrap } from "../trap/index.js";
 import { addHistoryEntry, expandHistory } from "../history/index.js";
 import { TerminalUI } from "../terminal/index.js";
@@ -45,6 +46,14 @@ export interface ReplOptions {
 
 export async function startRepl(opts?: ReplOptions): Promise<void> {
     native.initExecutor();
+
+    // Register command-exists check for the colorizer (breaks circular import).
+    registerCommandExists((name: string) => {
+        if (commandExists(name)) return true;
+        if (getAlias(name) !== undefined) return true;
+        if (hasShellFunction(name)) return true;
+        return false;
+    });
 
     if (process.stdin.isTTY) {
         // Create TerminalUI before loading rc so jshrc can register widgets.

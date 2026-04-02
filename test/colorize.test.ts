@@ -1,6 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { colorize, setTheme, getCurrentTheme } from "../src/colorize/index.js";
+import { colorize, setTheme, getCurrentTheme, registerCommandExists } from "../src/colorize/index.js";
+import { commandExists } from "../src/completion/index.js";
+
+// Register command lookup so colorizer can detect valid commands.
+registerCommandExists((name: string) => commandExists(name));
 
 const RESET = "\x1b[0m";
 

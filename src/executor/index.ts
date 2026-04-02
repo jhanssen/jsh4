@@ -16,7 +16,6 @@ import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot, declar
 import { pushParams, popParams, shiftParams, snapshotParams, restoreParams, getAllParams } from "../variables/positional.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { getAlias } from "../api/index.js";
-import { commandExists } from "../completion/index.js";
 import { shellOpts, saveShellOpts, restoreShellOpts } from "../shellopts/index.js";
 
 // Sentinels for flow control in shell functions and loops.
@@ -72,6 +71,14 @@ export interface ExecResult {
 
 // Shell function registry.
 const shellFunctions = new Map<string, ASTNode>();
+
+function isBuiltinName(name: string): boolean {
+    return name in builtins;
+}
+
+function isBuiltinOnly(name: string): boolean {
+    return name in builtins && !builtins[name]!.external;
+}
 
 // Directory stack for pushd/popd.
 const dirStack: string[] = [];
@@ -485,16 +492,16 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         if (args[0] === "-v" || args[0] === "-V") {
             if (args.length < 2) return { exitCode: 1 };
             const name = args[1]!;
-            // Check builtins, PATH, aliases, functions
-            if (commandExists(name)) {
+            if (isBuiltinName(name) || shellFunctions.has(name) || getAlias(name) !== undefined) {
                 process.stdout.write(name + "\n");
                 return { exitCode: 0 };
             }
-            // Check shell functions
-            if (shellFunctions.has(name)) {
-                process.stdout.write(name + "\n");
-                return { exitCode: 0 };
-            }
+            // Check PATH — try to resolve via which
+            try {
+                const { execSync } = require("node:child_process") as typeof import("node:child_process");
+                const result = execSync(`which ${name} 2>/dev/null`, { encoding: "utf8" }).trim();
+                if (result) { process.stdout.write(result + "\n"); return { exitCode: 0 }; }
+            } catch {}
             return { exitCode: 1 };
         }
         // command NAME ARGS — run NAME bypassing functions and aliases
@@ -545,11 +552,24 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     if (command === "jobs") return runJobs();
     if (command === "wait") return runWait(args);
 
-    // Builtins only run in-process when there are no redirections.
-    const builtin = redirs.length === 0 ? runBuiltin(command, args) : null;
-    if (builtin !== null) {
-        $["PIPESTATUS"] = [builtin.exitCode];
-        return builtin;
+    // Run builtins in-process. If redirections present, apply fd-level redirection.
+    const builtinFn = () => runBuiltin(command, args);
+    if (redirs.length === 0) {
+        const builtin = builtinFn();
+        if (builtin !== null) {
+            $["PIPESTATUS"] = [builtin.exitCode];
+            return builtin;
+        }
+    } else {
+        // Test if it's a builtin by checking the name (don't execute yet).
+        if (isBuiltinName(command)) {
+            const r = await withRedirections(cmd.redirections, async () => {
+                const result = builtinFn();
+                return result ?? { exitCode: 0 };
+            });
+            $["PIPESTATUS"] = [r.exitCode];
+            return r;
+        }
     }
 
     const result = await native.spawnPipeline([{ cmd: command, args, redirs }], []);
@@ -588,7 +608,25 @@ async function expandAliasesInPipeline(commands: ASTNode[]): Promise<ASTNode[] |
 
 async function executePipeline(node: Pipeline): Promise<ExecResult> {
     const hasJs = node.commands.some(c => c.type === "JsFunction");
-    if (hasJs) {
+
+    // Check if any pipeline stage is a builtin-only command (no external equivalent).
+    let hasBuiltin = false;
+    if (!hasJs) {
+        for (const cmd of node.commands) {
+            if (cmd.type === "SimpleCommand") {
+                const sc = cmd as SimpleCommand;
+                if (sc.words.length > 0) {
+                    const firstWord = sc.words[0]!.segments[0];
+                    if (firstWord && firstWord.type === "Literal" && isBuiltinOnly((firstWord as { value: string }).value)) {
+                        hasBuiltin = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (hasJs || hasBuiltin) {
         let exitCode = await executeMixedPipeline(node);
         if (node.negated) exitCode = exitCode === 0 ? 1 : 0;
         return { exitCode };
@@ -652,10 +690,25 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
     const pidToStage: number[] = [];
     let pgid = 0;
 
-    // Fork all external stages first so they're running while JS stages process.
+    // Classify stages: find builtin-only stages that must run in-process.
+    const stageBuiltins = new Map<number, Stage>();
     for (let i = 0; i < n; i++) {
         const stageNode = node.commands[i]!;
-        if (stageNode.type !== "SimpleCommand") continue;
+        if (stageNode.type === "SimpleCommand") {
+            const stage = await buildStage(stageNode as SimpleCommand);
+            if (stage && isBuiltinOnly(stage.cmd)) {
+                stageBuiltins.set(i, stage);
+            }
+        }
+    }
+
+    const isInProcess = (i: number) =>
+        node.commands[i]!.type === "JsFunction" || stageBuiltins.has(i);
+
+    // Fork external stages (skip builtins and JS functions).
+    for (let i = 0; i < n; i++) {
+        const stageNode = node.commands[i]!;
+        if (stageNode.type !== "SimpleCommand" || stageBuiltins.has(i)) continue;
 
         const stage = await buildStage(stageNode as SimpleCommand);
         if (!stage) { process.stderr.write("jsh: empty stage\n"); continue; }
@@ -669,14 +722,11 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         pidToStage.push(i);
     }
 
-    // Close write ends that external stages are now writing into, and read ends
-    // that external stages are now reading from — the parent doesn't need them.
+    // Close pipe ends owned by external stages.
     for (let i = 0; i < n - 1; i++) {
         const [r, w] = pipes[i]!;
-        const prevIsJs = node.commands[i]!.type === "JsFunction";
-        const nextIsJs = node.commands[i + 1]!.type === "JsFunction";
-        if (!nextIsJs) native.closeFd(r);
-        if (!prevIsJs) native.closeFd(w);
+        if (!isInProcess(i + 1)) native.closeFd(r);
+        if (!isInProcess(i)) native.closeFd(w);
     }
 
     // Run JS function stages in-process.
@@ -688,6 +738,36 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         stageExitCodes[i] = await executeJsStageRaw(stageNode as JsFunction, sin, sout);
         if (sout !== 1) native.closeFd(sout);
         if (sin  !== 0) native.closeFd(sin);
+    }
+
+    // Run builtin stages in-process using raw fd writes (not process.stdout).
+    for (const [i, stage] of stageBuiltins) {
+        const sin  = stdinFd(i);
+        const sout = stdoutFd(i);
+        // Create a writable stream for the pipe fd so builtins write to the pipe.
+        const savedStdout = native.dupFd(1);
+        const savedStdin = sin !== 0 ? native.dupFd(0) : -1;
+        native.clearCloexec(sout);
+        native.dup2Fd(sout, 1);
+        native.closeFd(sout);  // Close original — fd 1 is now the only write end
+        if (sin !== 0) {
+            native.clearCloexec(sin);
+            native.dup2Fd(sin, 0);
+            native.closeFd(sin);  // Close original — fd 0 is now the only read end
+        }
+        try {
+            const result = runBuiltin(stage.cmd, stage.args);
+            stageExitCodes[i] = result?.exitCode ?? 0;
+        } catch (e: unknown) {
+            const code = (e as NodeJS.ErrnoException)?.code;
+            if (code !== "EPIPE" && code !== "ERR_STREAM_DESTROYED") throw e;
+            stageExitCodes[i] = 141;
+        } finally {
+            // Restore stdout/stdin. dup2 implicitly closes the pipe fd copy at fd 1/0.
+            native.dup2Fd(savedStdout, 1);
+            native.closeFd(savedStdout);
+            if (savedStdin !== -1) { native.dup2Fd(savedStdin, 0); native.closeFd(savedStdin); }
+        }
     }
 
     // Wait for all external processes.
@@ -1848,208 +1928,153 @@ function consumeEscape(s: string, i: number): { char: string; next: number } {
     }
 }
 
-function runBuiltin(name: string, args: string[]): ExecResult | null {
-    switch (name) {
-        case "cd": {
-            let target = args[0] ?? String($["HOME"] ?? process.env["HOME"] ?? "/");
-            if (target === "-") {
-                const oldPwd = String($["OLDPWD"] ?? "");
-                if (!oldPwd) { process.stderr.write("cd: OLDPWD not set\n"); return { exitCode: 1 }; }
-                target = oldPwd;
-                process.stdout.write(target + "\n");
-            }
-            const oldCwd = process.cwd();
-            // Try target directly first, then search CDPATH for non-absolute/non-relative paths.
-            let resolved = false;
-            if (!target.startsWith("/") && !target.startsWith("./") && !target.startsWith("../")) {
-                try { process.chdir(target); resolved = true; } catch {}
-                if (!resolved) {
-                    const cdpath = String($["CDPATH"] ?? "");
-                    if (cdpath) {
-                        for (const dir of cdpath.split(":")) {
-                            const candidate = dir ? `${dir}/${target}` : target;
-                            try { process.chdir(candidate); resolved = true; break; } catch {}
-                        }
+interface Builtin {
+    run(args: string[]): ExecResult;
+    external: boolean;
+}
+
+const builtins: Record<string, Builtin> = {
+    cd: { external: false, run(args) {
+        let target = args[0] ?? String($["HOME"] ?? process.env["HOME"] ?? "/");
+        if (target === "-") {
+            const oldPwd = String($["OLDPWD"] ?? "");
+            if (!oldPwd) { process.stderr.write("cd: OLDPWD not set\n"); return { exitCode: 1 }; }
+            target = oldPwd;
+            process.stdout.write(target + "\n");
+        }
+        const oldCwd = process.cwd();
+        let resolved = false;
+        if (!target.startsWith("/") && !target.startsWith("./") && !target.startsWith("../")) {
+            try { process.chdir(target); resolved = true; } catch {}
+            if (!resolved) {
+                const cdpath = String($["CDPATH"] ?? "");
+                if (cdpath) {
+                    for (const dir of cdpath.split(":")) {
+                        const candidate = dir ? `${dir}/${target}` : target;
+                        try { process.chdir(candidate); resolved = true; break; } catch {}
                     }
                 }
             }
-            if (!resolved) {
-                try { process.chdir(target); resolved = true; } catch {}
-            }
-            if (resolved) {
-                $["OLDPWD"] = oldCwd;
-                $["PWD"] = process.cwd();
-                return { exitCode: 0 };
-            }
-            process.stderr.write(`cd: no such file or directory: ${target}\n`);
-            return { exitCode: 1 };
         }
-        case "export": {
-            if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
-                for (const [key, val] of Object.entries(process.env)) {
-                    if (val !== undefined) process.stdout.write(`declare -x ${key}=${JSON.stringify(val)}\n`);
-                }
-                return { exitCode: 0 };
-            }
-            for (const arg of args) {
-                const eq = arg.indexOf("=");
-                if (eq > 0) {
-                    const key = arg.slice(0, eq);
-                    const val = arg.slice(eq + 1);
-                    $[key] = val; process.env[key] = val;
-                } else if (arg) {
-                    const val = $[arg];
-                    if (val !== undefined) process.env[arg] = String(val);
-                }
+        if (!resolved) { try { process.chdir(target); resolved = true; } catch {} }
+        if (resolved) { $["OLDPWD"] = oldCwd; $["PWD"] = process.cwd(); return { exitCode: 0 }; }
+        process.stderr.write(`cd: no such file or directory: ${target}\n`);
+        return { exitCode: 1 };
+    }},
+    export: { external: false, run(args) {
+        if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
+            for (const [key, val] of Object.entries(process.env)) {
+                if (val !== undefined) process.stdout.write(`declare -x ${key}=${JSON.stringify(val)}\n`);
             }
             return { exitCode: 0 };
         }
-        case "unset":
-            for (const arg of args) delete $[arg];
-            return { exitCode: 0 };
-        case "true":  return { exitCode: 0 };
-        case "false": return { exitCode: 1 };
-        case "echo": {
-            let newline = true;
-            let escapes = false;
-            let startIdx = 0;
-            // Parse flags: -n (no newline), -e (enable escapes), -E (disable escapes)
-            while (startIdx < args.length) {
-                const a = args[startIdx]!;
-                if (a === "-n") { newline = false; startIdx++; }
-                else if (a === "-e") { escapes = true; startIdx++; }
-                else if (a === "-E") { escapes = false; startIdx++; }
-                else if (a === "-ne" || a === "-en") { newline = false; escapes = true; startIdx++; }
-                else if (a === "-nE" || a === "-En") { newline = false; escapes = false; startIdx++; }
-                else break;
-            }
-            let out = args.slice(startIdx).join(" ");
-            if (escapes) out = echoEscape(out);
-            process.stdout.write(out + (newline ? "\n" : ""));
-            return { exitCode: 0 };
+        for (const arg of args) {
+            const eq = arg.indexOf("=");
+            if (eq > 0) { const k = arg.slice(0, eq), v = arg.slice(eq + 1); $[k] = v; process.env[k] = v; }
+            else if (arg) { const v = $[arg]; if (v !== undefined) process.env[arg] = String(v); }
         }
-        case "test":
-            return runTest(args);
-        case "[": {
-            if (args.length === 0 || args[args.length - 1] !== "]") {
-                process.stderr.write("[: missing ']'\n");
-                return { exitCode: 2 };
-            }
-            return runTest(args.slice(0, -1));
+        return { exitCode: 0 };
+    }},
+    unset:    { external: false, run(args) { for (const a of args) delete $[a]; return { exitCode: 0 }; }},
+    true:     { external: true,  run() { return { exitCode: 0 }; }},
+    false:    { external: true,  run() { return { exitCode: 1 }; }},
+    echo: { external: true, run(args) {
+        let newline = true, escapes = false, startIdx = 0;
+        while (startIdx < args.length) {
+            const a = args[startIdx]!;
+            if (a === "-n") { newline = false; startIdx++; }
+            else if (a === "-e") { escapes = true; startIdx++; }
+            else if (a === "-E") { escapes = false; startIdx++; }
+            else if (a === "-ne" || a === "-en") { newline = false; escapes = true; startIdx++; }
+            else if (a === "-nE" || a === "-En") { newline = false; escapes = false; startIdx++; }
+            else break;
         }
-        case "set":
-            return runSet(args);
-        case "local": {
-            for (const arg of args) {
-                const eq = arg.indexOf("=");
-                if (eq > 0) {
-                    const key = arg.slice(0, eq);
-                    const val = arg.slice(eq + 1);
-                    declareLocal(key);
-                    $[key] = val;
-                } else if (arg) {
-                    declareLocal(arg);
-                }
-            }
-            return { exitCode: 0 };
+        let out = args.slice(startIdx).join(" ");
+        if (escapes) out = echoEscape(out);
+        process.stdout.write(out + (newline ? "\n" : ""));
+        return { exitCode: 0 };
+    }},
+    test:     { external: true,  run: (args) => runTest(args) },
+    "[":      { external: true,  run(args) {
+        if (args.length === 0 || args[args.length - 1] !== "]") {
+            process.stderr.write("[: missing ']'\n"); return { exitCode: 2 };
         }
-        case "shift": {
-            const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
-            if (isNaN(n) || n < 0) {
-                process.stderr.write(`shift: ${args[0]}: numeric argument required\n`);
-                return { exitCode: 1 };
-            }
-            return { exitCode: shiftParams(n) ? 0 : 1 };
+        return runTest(args.slice(0, -1));
+    }},
+    set:      { external: false, run: (args) => runSet(args) },
+    local:    { external: false, run(args) {
+        for (const arg of args) {
+            const eq = arg.indexOf("=");
+            if (eq > 0) { declareLocal(arg.slice(0, eq)); $[arg.slice(0, eq)] = arg.slice(eq + 1); }
+            else if (arg) declareLocal(arg);
         }
-        case "exec":
-            // No args: exec with no command is a no-op (POSIX: redirections-only form not yet supported)
-            if (args.length === 0) return { exitCode: 0 };
-            return runExec(name, args);
-        case "type":
-            return runType(args);
-        case "which":
-            return runWhich(args);
-        case "pushd": {
-            const target = args[0] ?? String($["HOME"] ?? "/");
-            const cwd = process.cwd();
-            try {
-                process.chdir(target);
-                dirStack.push(cwd);
-                $["PWD"] = process.cwd();
-                process.stdout.write(printDirStack() + "\n");
-            } catch (e: unknown) {
-                process.stderr.write(`pushd: ${e instanceof Error ? e.message : e}\n`);
-                return { exitCode: 1 };
-            }
-            return { exitCode: 0 };
-        }
-        case "popd": {
-            if (dirStack.length === 0) {
-                process.stderr.write("popd: directory stack empty\n");
-                return { exitCode: 1 };
-            }
-            const target = dirStack.pop()!;
-            try {
-                process.chdir(target);
-                $["PWD"] = process.cwd();
-                process.stdout.write(printDirStack() + "\n");
-            } catch (e: unknown) {
-                process.stderr.write(`popd: ${e instanceof Error ? e.message : e}\n`);
-                return { exitCode: 1 };
+        return { exitCode: 0 };
+    }},
+    shift:    { external: false, run(args) {
+        const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
+        if (isNaN(n) || n < 0) { process.stderr.write(`shift: ${args[0]}: numeric argument required\n`); return { exitCode: 1 }; }
+        return { exitCode: shiftParams(n) ? 0 : 1 };
+    }},
+    exec:     { external: false, run(args) {
+        if (args.length === 0) return { exitCode: 0 };
+        return runExec("exec", args);
+    }},
+    type:     { external: false, run: (args) => runType(args) },
+    which:    { external: false, run: (args) => runWhich(args) },
+    pushd:    { external: false, run(args) {
+        const target = args[0] ?? String($["HOME"] ?? "/");
+        const cwd = process.cwd();
+        try { process.chdir(target); dirStack.push(cwd); $["PWD"] = process.cwd(); process.stdout.write(printDirStack() + "\n"); }
+        catch (e: unknown) { process.stderr.write(`pushd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
+        return { exitCode: 0 };
+    }},
+    popd:     { external: false, run() {
+        if (dirStack.length === 0) { process.stderr.write("popd: directory stack empty\n"); return { exitCode: 1 }; }
+        const target = dirStack.pop()!;
+        try { process.chdir(target); $["PWD"] = process.cwd(); process.stdout.write(printDirStack() + "\n"); }
+        catch (e: unknown) { process.stderr.write(`popd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
+        return { exitCode: 0 };
+    }},
+    dirs:     { external: false, run() { process.stdout.write(printDirStack() + "\n"); return { exitCode: 0 }; }},
+    basename: { external: true, run(args) {
+        if (args.length === 0) { process.stderr.write("basename: missing operand\n"); return { exitCode: 1 }; }
+        let nm = args[0]!;
+        while (nm.length > 1 && nm.endsWith("/")) nm = nm.slice(0, -1);
+        const sl = nm.lastIndexOf("/");
+        nm = sl >= 0 ? nm.slice(sl + 1) : nm;
+        if (args[1] && nm.endsWith(args[1]) && nm !== args[1]) nm = nm.slice(0, -args[1].length);
+        process.stdout.write(nm + "\n");
+        return { exitCode: 0 };
+    }},
+    dirname:  { external: true, run(args) {
+        if (args.length === 0) { process.stderr.write("dirname: missing operand\n"); return { exitCode: 1 }; }
+        let nm = args[0]!;
+        while (nm.length > 1 && nm.endsWith("/")) nm = nm.slice(0, -1);
+        const sl = nm.lastIndexOf("/");
+        process.stdout.write((sl > 0 ? nm.slice(0, sl) : sl === 0 ? "/" : ".") + "\n");
+        return { exitCode: 0 };
+    }},
+    readonly: { external: false, run(args) {
+        if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
+            for (const [nm, val] of getReadonlyVars()) {
+                process.stdout.write(`declare -r ${nm}=${JSON.stringify(String(val ?? ""))}\n`);
             }
             return { exitCode: 0 };
         }
-        case "dirs":
-            process.stdout.write(printDirStack() + "\n");
-            return { exitCode: 0 };
-        case "basename": {
-            if (args.length === 0) { process.stderr.write("basename: missing operand\n"); return { exitCode: 1 }; }
-            let name = args[0]!;
-            // Remove trailing slashes.
-            while (name.length > 1 && name.endsWith("/")) name = name.slice(0, -1);
-            const lastSlash = name.lastIndexOf("/");
-            name = lastSlash >= 0 ? name.slice(lastSlash + 1) : name;
-            // Remove suffix if provided.
-            if (args[1] && name.endsWith(args[1]) && name !== args[1]) {
-                name = name.slice(0, -args[1].length);
-            }
-            process.stdout.write(name + "\n");
-            return { exitCode: 0 };
+        for (const arg of args) {
+            const eq = arg.indexOf("=");
+            if (eq > 0) declareReadonly(arg.slice(0, eq), arg.slice(eq + 1));
+            else if (arg) declareReadonly(arg);
         }
-        case "dirname": {
-            if (args.length === 0) { process.stderr.write("dirname: missing operand\n"); return { exitCode: 1 }; }
-            let name = args[0]!;
-            while (name.length > 1 && name.endsWith("/")) name = name.slice(0, -1);
-            const lastSlash = name.lastIndexOf("/");
-            process.stdout.write((lastSlash > 0 ? name.slice(0, lastSlash) : lastSlash === 0 ? "/" : ".") + "\n");
-            return { exitCode: 0 };
-        }
-        case "readonly": {
-            if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
-                for (const [name, val] of getReadonlyVars()) {
-                    process.stdout.write(`declare -r ${name}=${JSON.stringify(String(val ?? ""))}\n`);
-                }
-                return { exitCode: 0 };
-            }
-            for (const arg of args) {
-                const eq = arg.indexOf("=");
-                if (eq > 0) {
-                    const key = arg.slice(0, eq);
-                    const val = arg.slice(eq + 1);
-                    declareReadonly(key, val);
-                } else if (arg) {
-                    declareReadonly(arg);
-                }
-            }
-            return { exitCode: 0 };
-        }
-        case "getopts":
-            return runGetopts(args);
-        case "printf":
-            return runPrintf(args);
-        default:
-            return null;
-    }
+        return { exitCode: 0 };
+    }},
+    getopts:  { external: false, run: (args) => runGetopts(args) },
+    printf:   { external: true,  run: (args) => runPrintf(args) },
+};
+
+function runBuiltin(name: string, args: string[]): ExecResult | null {
+    const b = builtins[name];
+    return b ? b.run(args) : null;
 }
 
 // ---- [[ conditional expression ]] -------------------------------------------

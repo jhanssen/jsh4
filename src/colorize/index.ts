@@ -1,10 +1,9 @@
 // Syntax highlighting for the line editor.
 
 import { Lexer, TokenType } from "../parser/index.js";
-import { commandExists } from "../completion/index.js";
-import { hasShellFunction } from "../executor/index.js";
-import { getAlias } from "../api/index.js";
-import { lookupJsFunction } from "../jsfunctions/index.js";
+// Command resolution is injected to avoid circular imports.
+let commandExistsImpl: (name: string) => boolean = () => false;
+export function registerCommandExists(fn: (name: string) => boolean): void { commandExistsImpl = fn; }
 
 // ---- Color types and resolution ---------------------------------------------
 
@@ -93,12 +92,8 @@ const KEYWORDS = new Set([
 
 function isValidCommand(name: string): boolean {
     if (KEYWORDS.has(name)) return true;
-    if (commandExists(name)) return true;
-    if (getAlias(name) !== undefined) return true;
-    if (hasShellFunction(name)) return true;
-    // Absolute/relative path
     if (name.includes("/")) return true;
-    return false;
+    return commandExistsImpl(name);
 }
 
 // ---- Separator detection for "command position" ----------------------------
