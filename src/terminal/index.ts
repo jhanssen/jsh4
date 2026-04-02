@@ -2,10 +2,10 @@
 
 import { Renderer } from "./renderer.js";
 import { WidgetManager } from "./widgets.js";
-import type { WidgetDef, WidgetHandle, WidgetZone } from "./widgets.js";
+import type { WidgetDef, WidgetHandle, WidgetZone, WidgetOptions } from "./widgets.js";
 import type { Frame } from "./renderer.js";
 
-export type { WidgetDef, WidgetHandle, WidgetZone } from "./widgets.js";
+export type { WidgetDef, WidgetHandle, WidgetZone, WidgetOptions } from "./widgets.js";
 
 interface InputState {
     buf: string;
@@ -137,8 +137,14 @@ export class TerminalUI {
 
     // ---- Widgets ----
 
-    addWidget(id: string, zone: WidgetZone, render: WidgetDef["render"], order = 0): WidgetHandle {
-        return this.widgets.add({ id, zone, order, render });
+    addWidget(id: string, zone: WidgetZone, render: WidgetDef["render"], opts?: WidgetOptions | number): WidgetHandle {
+        const options = typeof opts === "number" ? { line: opts } : (opts ?? {});
+        return this.widgets.add({
+            id, zone,
+            line: options.line ?? 0,
+            align: options.align ?? "left",
+            render,
+        });
     }
 
     removeWidget(id: string): void {
@@ -328,8 +334,8 @@ export class TerminalUI {
         this.lastRenderedInputLines = inputLines;
 
         // Get header/footer from widgets.
-        const headerLines = this.widgets.getZoneContent("header");
-        const footerLines = this.widgets.getZoneContent("footer");
+        const headerLines = this.widgets.getZoneContent("header", state.cols);
+        const footerLines = this.widgets.getZoneContent("footer", state.cols);
 
         // Cursor row is on the cursor's line within inputLines.
         const frame: Frame = { headerLines, frozenLines: this.frozenLines, inputLines, cursorCol, footerLines };

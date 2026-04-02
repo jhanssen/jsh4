@@ -83,16 +83,31 @@ interface Theme {
 /**
  * Widget zones control where content renders in the terminal layout:
  *
- * - `"header"` — above the input line
+ * - `"header"` — above the input line (line 0 = closest, -1 above, -2 above that...)
  * - `"prompt"` — left side of input line
  * - `"rprompt"` — right side of input line
  * - `"ps2"` — left side of continuation lines
- * - `"footer"` — below the input line
+ * - `"footer"` — below the input line (line 0 = closest, 1 below, 2 below that...)
  *
- * Multiple widgets in the same zone concatenate on one line (sorted by order).
- * Return a multi-element array from the render function to add explicit line breaks.
+ * Widgets on the same line concatenate. Use `align` to control horizontal position.
+ * Multi-line widgets (returning string[]) start at their declared line and grow downward.
  */
 type WidgetZone = "header" | "footer" | "prompt" | "rprompt" | "ps2";
+
+/** Horizontal alignment within a line. */
+type WidgetAlign = "left" | "right" | "center";
+
+interface WidgetOptions {
+    /**
+     * Line number within the zone.
+     * Header: 0 = closest to input, -1 above that, etc.
+     * Footer: 0 = closest to input, 1 below that, etc.
+     * Ignored for prompt/rprompt/ps2.
+     */
+    line?: number;
+    /** Horizontal alignment. Default: "left". */
+    align?: WidgetAlign;
+}
 
 /**
  * Handle returned by addWidget. Use update() to re-evaluate the render function
@@ -184,43 +199,39 @@ declare const jsh: {
      * For prompt/rprompt/ps2 zones, the render function should return a string.
      * For header/footer zones, it can return a string or string[].
      *
-     * Multiple widgets in the same zone are ordered by the `order` parameter
-     * and concatenate on one line. Return a multi-element array from the render
-     * function to add explicit line breaks.
+     * Widgets on the same line concatenate. Use `align` for horizontal positioning.
+     * Multi-line widgets (returning string[]) start at their declared line and grow downward.
      *
      * @param id      Unique identifier
      * @param zone    Where to render: "header", "footer", "prompt", "rprompt", "ps2"
      * @param render  Function returning content (may be async)
-     * @param order   Sort order within the zone (default 0)
+     * @param opts    Options: { line?, align? } or just a line number
      *
      * @example
-     * // Prompt — re-evaluated on each new line
-     * const ps1 = jsh.addWidget("ps1", "prompt", async () => {
+     * // Prompt
+     * jsh.addWidget("ps1", "prompt", async () => {
      *     const b = await jsh.exec("git branch --show-current");
      *     return `${b.ok ? b.stdout + " " : ""}$ `;
      * });
      *
-     * // Right prompt
-     * jsh.addWidget("time", "rprompt", () => new Date().toLocaleTimeString());
+     * // Header: git left, clock right, same line
+     * jsh.addWidget("git", "header", () => `  ${branch}`);
+     * jsh.addWidget("clock", "header", () => `${time}  `, { align: "right" });
      *
-     * // Continuation prompt
-     * jsh.addWidget("ps2", "ps2", () => "> ");
-     *
-     * // Footer with live clock — interval is userland
+     * // Footer with live clock
      * const clock = jsh.addWidget("clock", "footer", () => {
      *     return jsh.style`${jsh.colors.dim}${new Date().toLocaleTimeString()}`;
      * });
      * setInterval(() => clock.update(), 1000);
      *
-     * // Header updated from event
-     * const status = jsh.addWidget("net", "header", () => networkStatus);
-     * someEmitter.on("change", () => status.update());
+     * // Multi-line footer starting at line 1 (below line 0)
+     * jsh.addWidget("menu", "footer", () => ["option 1", "option 2"], { line: 1 });
      */
     addWidget(
         id: string,
         zone: WidgetZone,
         render: () => string | string[] | Promise<string | string[]>,
-        order?: number,
+        opts?: WidgetOptions | number,
     ): WidgetHandle;
 
     /** Remove a previously registered widget by id. */
@@ -290,6 +301,11 @@ declare const jsh: {
      * // → "\x1b[1m\x1b[32mhello world\x1b[0m"
      */
     style(strings: TemplateStringsArray, ...values: unknown[]): string;
+
+    // ---- Terminal info ----
+
+    /** Current terminal width in columns. */
+    readonly columns: number;
 
     // ---- Aliases ----
 

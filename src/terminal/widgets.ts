@@ -1,8 +1,8 @@
-// Widget registry — unified system for all rendered regions (header, footer, prompt, rprompt, ps2).
+// Widget registry — unified system for all rendered regions.
 // Each widget has a render function and a handle with update()/remove().
-// The engine calls render on update() or when it needs fresh content (e.g. new editing session).
 
 export type WidgetZone = "header" | "footer" | "prompt" | "rprompt" | "ps2";
+export type WidgetAlign = "left" | "right" | "center";
 
 export interface WidgetHandle {
     /** Re-evaluate the render function and repaint if content changed. */
@@ -13,10 +13,18 @@ export interface WidgetHandle {
     readonly id: string;
 }
 
+export interface WidgetOptions {
+    /** Starting line number. Header: 0 = closest to input, -1 above. Footer: 0 = closest, 1 below. */
+    line?: number;
+    /** Horizontal alignment on the line. Default: "left". */
+    align?: WidgetAlign;
+}
+
 export interface WidgetDef {
     id: string;
     zone: WidgetZone;
-    order: number;
+    line: number;
+    align: WidgetAlign;
     render: () => string | string[] | Promise<string | string[]>;
 }
 
@@ -31,10 +39,10 @@ function arraysEqual(a: string[] | undefined, b: string[]): boolean {
 
 export class WidgetManager {
     private widgets = new Map<string, WidgetDef>();
-    private cache = new Map<string, string[]>();
+    private cache = new Map<string, string[]>(); // per-widget cached render result
     private repaintFn: (() => void) | null = null;
 
-    // Per-zone content cache — invalidated when any widget in the zone changes.
+    // Per-zone assembled line cache.
     private zoneCache = new Map<WidgetZone, string[]>();
     private zoneDirty = new Set<WidgetZone>();
 
@@ -45,7 +53,6 @@ export class WidgetManager {
     add(widget: WidgetDef): WidgetHandle {
         this.widgets.set(widget.id, widget);
         this.invalidateZone(widget.zone);
-        // Initial render — try sync first.
         this._evalSync(widget);
 
         const handle: WidgetHandle = {
@@ -69,39 +76,140 @@ export class WidgetManager {
     }
 
     /**
-     * Get cached content for a zone, sorted by widget order.
-     * Widgets returning a single string concatenate on the same line.
-     * Widgets returning a multi-element array add separate lines.
-     * Returns an array of lines.
+     * Get assembled lines for a multi-line zone (header/footer).
+     * Each line is composed from widgets at that line number,
+     * with left/center/right alignment groups.
      */
-    getZoneContent(zone: WidgetZone): string[] {
+    getZoneContent(zone: WidgetZone, cols?: number): string[] {
+        if (zone === "prompt" || zone === "rprompt" || zone === "ps2") {
+            return this._getInlineZoneContent(zone);
+        }
+
+        // Don't cache header/footer — composition depends on terminal width
+        // which can change. Widget render results are cached separately.
+
+        // Collect all widgets in this zone with their rendered lines.
+        const entries: Array<{ widget: WidgetDef; lines: string[] }> = [];
+        for (const w of this.widgets.values()) {
+            if (w.zone !== zone) continue;
+            const wLines = this.cache.get(w.id);
+            if (!wLines || wLines.length === 0) continue;
+            // Skip empty single-line widgets.
+            if (wLines.length === 1 && wLines[0] === "") continue;
+            entries.push({ widget: w, lines: wLines });
+        }
+
+        if (entries.length === 0) return [];
+
+        // Determine the line range.
+        // Header: line numbers are <= 0 (0 closest to input, -1 above, etc.)
+        //   Widget at line -1 with 2 rendered lines occupies lines -1 and 0.
+        // Footer: line numbers are >= 0 (0 closest to input, 1 below, etc.)
+        //   Widget at line 0 with 2 rendered lines occupies lines 0 and 1.
+        let minLine = Infinity;
+        let maxLine = -Infinity;
+
+        for (const { widget, lines } of entries) {
+            const start = widget.line;
+            const end = start + lines.length - 1;
+            if (start < minLine) minLine = start;
+            if (end > maxLine) maxLine = end;
+        }
+
+        // Build each output line by composing widgets at that line number.
+        const result: string[] = [];
+        for (let lineNum = minLine; lineNum <= maxLine; lineNum++) {
+            let left = "";
+            let center = "";
+            let right = "";
+
+            for (const { widget, lines } of entries) {
+                const offset = lineNum - widget.line;
+                if (offset < 0 || offset >= lines.length) continue;
+                const content = lines[offset]!;
+                switch (widget.align) {
+                    case "left": left += content; break;
+                    case "right": right += content; break;
+                    case "center": center += content; break;
+                }
+            }
+
+            result.push(this._composeLine(left, center, right, cols ?? 80));
+        }
+
+        return result;
+    }
+
+    /** Compose a line from left/center/right segments using terminal width. */
+    private _composeLine(left: string, center: string, right: string, cols: number): string {
+        // Common case: only left content.
+        if (!center && !right) return left;
+        if (!left && !right && !center) return "";
+
+        const leftW = this._displayWidth(left);
+        const centerW = this._displayWidth(center);
+        const rightW = this._displayWidth(right);
+
+        if (!center) {
+            // Left + right: pad between them.
+            const pad = Math.max(0, cols - leftW - rightW);
+            return left + " ".repeat(pad) + right;
+        }
+        if (!left && !right) {
+            // Center only.
+            const pad = Math.max(0, Math.floor((cols - centerW) / 2));
+            return " ".repeat(pad) + center;
+        }
+        // All three: left, center in middle, right at edge.
+        const centerPos = Math.max(leftW, Math.floor((cols - centerW) / 2));
+        const rightPos = Math.max(centerPos + centerW, cols - rightW);
+        const padLeft = Math.max(0, centerPos - leftW);
+        const padRight = Math.max(0, rightPos - centerPos - centerW);
+        return left + " ".repeat(padLeft) + center + " ".repeat(padRight) + right;
+    }
+
+    /** ANSI-aware display width. */
+    private _displayWidth(s: string): number {
+        let width = 0;
+        let i = 0;
+        while (i < s.length) {
+            if (s.charCodeAt(i) === 0x1b && i + 1 < s.length && s[i + 1] === "[") {
+                i += 2;
+                while (i < s.length && s.charCodeAt(i) < 0x40) i++;
+                if (i < s.length) i++;
+                continue;
+            }
+            if (s.charCodeAt(i) === 0x1b && i + 1 < s.length && s[i + 1] === "]") {
+                i += 2;
+                while (i < s.length) {
+                    if (s.charCodeAt(i) === 0x07) { i++; break; }
+                    if (s.charCodeAt(i) === 0x1b && i + 1 < s.length && s[i + 1] === "\\") { i += 2; break; }
+                    i++;
+                }
+                continue;
+            }
+            width++;
+            i++;
+        }
+        return width;
+    }
+
+    /** Get content for inline zones (prompt/rprompt/ps2) — simple concatenation. */
+    private _getInlineZoneContent(zone: WidgetZone): string[] {
         const cached = this.zoneCache.get(zone);
         if (cached && !this.zoneDirty.has(zone)) return cached;
 
         const sorted = [...this.widgets.values()]
             .filter(w => w.zone === zone)
-            .sort((a, b) => a.order - b.order);
+            .sort((a, b) => a.line - b.line);
 
-        const lines: string[] = [];
-        let currentLine = "";
-
+        let result = "";
         for (const w of sorted) {
             const wCache = this.cache.get(w.id);
-            if (!wCache || wCache.length === 0) continue;
-
-            if (wCache.length === 1) {
-                currentLine += wCache[0]!;
-            } else {
-                currentLine += wCache[0]!;
-                lines.push(currentLine);
-                for (let i = 1; i < wCache.length - 1; i++) {
-                    lines.push(wCache[i]!);
-                }
-                currentLine = wCache[wCache.length - 1]!;
-            }
+            if (wCache && wCache.length > 0) result += wCache[0] ?? "";
         }
 
-        if (currentLine) lines.push(currentLine);
+        const lines = result ? [result] : [];
         this.zoneCache.set(zone, lines);
         this.zoneDirty.delete(zone);
         return lines;
@@ -143,7 +251,7 @@ export class WidgetManager {
         } catch {}
     }
 
-    /** Re-evaluate all widgets in a zone. Returns a promise that resolves when all are done. */
+    /** Re-evaluate all widgets in a zone. */
     async refreshZone(zone: WidgetZone): Promise<void> {
         const promises: Promise<void>[] = [];
         for (const w of this.widgets.values()) {
@@ -154,7 +262,6 @@ export class WidgetManager {
         this.invalidateZone(zone);
     }
 
-    /** Sync evaluation — try to get result immediately, kick off async if needed. */
     private _evalSync(widget: WidgetDef): void {
         try {
             const result = widget.render();
@@ -172,7 +279,6 @@ export class WidgetManager {
         } catch {}
     }
 
-    /** Async evaluation — always awaits. */
     private async _evalAsync(widget: WidgetDef): Promise<void> {
         try {
             const result = await widget.render();

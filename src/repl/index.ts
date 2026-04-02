@@ -15,7 +15,7 @@ import { commandExists } from "../completion/index.js";
 import { runTrap } from "../trap/index.js";
 import { addHistoryEntry, expandHistory } from "../history/index.js";
 import { TerminalUI } from "../terminal/index.js";
-import type { WidgetHandle, WidgetZone } from "../terminal/index.js";
+import type { WidgetHandle, WidgetZone, WidgetOptions } from "../terminal/index.js";
 import { colors, makeFgColor, makeBgColor, makeUlColor, style } from "../terminal/colors.js";
 import type { JsPipelineFunction } from "../jsfunctions/index.js";
 
@@ -132,12 +132,14 @@ async function loadRc(customPath?: string): Promise<void> {
             id: string,
             zone: WidgetZone,
             render: () => string | string[] | Promise<string | string[]>,
-            order?: number,
+            opts?: WidgetOptions | number,
         ): WidgetHandle | undefined => {
             if (zone === "prompt") userSetPrompt = true;
-            return ui?.addWidget(id, zone, render, order);
+            return ui?.addWidget(id, zone, render, opts);
         },
         removeWidget: (id: string) => ui?.removeWidget(id),
+        // Terminal info
+        get columns() { return native.inputGetCols(); },
         // Colors
         colors,
         makeFgColor,
