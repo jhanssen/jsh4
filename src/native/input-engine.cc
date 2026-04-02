@@ -272,8 +272,10 @@ struct InputState {
     bool active = false;
     int in_completion = 0;
     size_t completion_idx = 0;
-    bool waiting_for_completions = false; // true while async completions pending
-    std::vector<std::string> pending_completions; // set by inputSetCompletions
+    bool waiting_for_completions = false;
+    // Cached completion state: original buffer + candidates from first Tab.
+    std::string completion_original; // buffer before first completion applied
+    std::vector<std::string> completion_entries; // cached candidates
     // Reverse search (Ctrl-R)
     bool in_search = false;
     char search_query[256];
@@ -588,60 +590,84 @@ static std::vector<std::string> extractCompletionArray(Napi::Array arr) {
     return entries;
 }
 
-// Apply completions to the buffer (TAB cycling).
-static void applyCompletions(InputState *s, const std::vector<std::string> &entries) {
-    if (entries.empty()) return;
-
-    if (!s->in_completion) {
-        s->in_completion = 1;
-        s->completion_idx = 0;
-    } else {
-        s->completion_idx = (s->completion_idx + 1) % (entries.size() + 1);
-    }
-
-    if (s->completion_idx == entries.size()) {
-        // Cycled back to original — leave buffer as-is.
-    } else {
-        const std::string &entry = entries[s->completion_idx];
+// Apply current completion entry to the buffer.
+// Does NOT call bufferChanged() — completion cycling shouldn't reset the cache.
+static void applyCurrentCompletion(InputState *s) {
+    s->suggestion.clear(); // Hide ghost text during completion cycling.
+    if (s->completion_idx < s->completion_entries.size()) {
+        const std::string &entry = s->completion_entries[s->completion_idx];
         strncpy(s->buf, entry.c_str(), s->buflen);
+        s->buf[s->buflen] = '\0';
+        s->len = s->pos = strlen(s->buf);
+    } else {
+        // Cycled back to original.
+        strncpy(s->buf, s->completion_original.c_str(), s->buflen);
         s->buf[s->buflen] = '\0';
         s->len = s->pos = strlen(s->buf);
     }
     notifyRender();
 }
 
-// Returns: 0 = consumed (sync completions applied or async started),
-//          c = pass through (no completions or non-TAB accepted).
+// Start completion with a set of entries.
+static void startCompletion(InputState *s, std::vector<std::string> entries) {
+    if (entries.empty()) return;
+    s->completion_original = std::string(s->buf, s->len);
+    s->completion_entries = std::move(entries);
+    s->completion_idx = 0;
+    s->in_completion = 1;
+    applyCurrentCompletion(s);
+}
+
+// Cycle to next completion entry.
+static void nextCompletion(InputState *s) {
+    s->completion_idx = (s->completion_idx + 1) % (s->completion_entries.size() + 1);
+    applyCurrentCompletion(s);
+}
+
+// Returns: 0 = consumed, c = pass through.
 static int completeLine(InputState *s, char c) {
     if (!g_ctx || g_ctx->onCompletion.IsEmpty()) return c;
 
     if (c == 9) { // TAB
-        // Call the JS completion callback.
+        if (s->in_completion) {
+            // Already completing — cycle to next.
+            nextCompletion(s);
+            return 0;
+        }
+        // First Tab — fetch completions from JS.
         Napi::Env env = g_ctx->onCompletion.Env();
         Napi::HandleScope scope(env);
         Napi::Value result = g_ctx->onCompletion.Call({Napi::String::New(env, s->buf)});
 
         if (result.IsArray()) {
-            // Sync: got results immediately.
             auto entries = extractCompletionArray(result.As<Napi::Array>());
             if (entries.empty()) return c;
-            applyCompletions(s, entries);
+            startCompletion(s, std::move(entries));
             return 0;
         }
         if (result.IsPromise()) {
-            // Async: stop polling, wait for results.
             s->waiting_for_completions = true;
             if (g_ctx->poll) {
                 uv_poll_stop(g_ctx->poll);
             }
-            // JS will call inputSetCompletions when the promise resolves.
             return 0;
         }
-        return c; // No results.
+        return c;
     }
 
     // Non-TAB while in completion: accept current completion and process char.
+    // If completion ends with '/' and user types '/', swallow the duplicate.
+    if (c == '/' && s->len > 0 && s->buf[s->len - 1] == '/') {
+        s->in_completion = 0;
+        s->completion_entries.clear();
+        s->completion_original.clear();
+        bufferChanged();
+        notifyRender();
+        return 0; // Swallowed.
+    }
     s->in_completion = 0;
+    s->completion_entries.clear();
+    s->completion_original.clear();
     return c;
 }
 
@@ -758,6 +784,7 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
     if ((s->in_completion || c == 9) && !g_ctx->onCompletion.IsEmpty()) {
         int retval = completeLine(s, c);
         if (retval == 0) return 0; // Consumed by completion
+        if (c == 9 && retval == 9) return 0; // Tab with no completions — don't insert literal tab
         c = retval;
     }
 
@@ -1241,7 +1268,7 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
 
     // Apply completions.
     if (!entries.empty()) {
-        applyCompletions(&g_state, entries);
+        startCompletion(&g_state, std::move(entries));
     }
 
     // Resume stdin polling.
