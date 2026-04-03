@@ -483,11 +483,19 @@ struct ExecutorState {
                     }
                 }
 
-                // Clear CLOEXEC on stdio fds: adddup2(fd, fd) clears it in
-                // glibc's posix_spawn implementation.
+                // Clear CLOEXEC on stdio fds so the child inherits them.
+                // On Linux, glibc's posix_spawn handles dup2(fd,fd) specially
+                // to clear CLOEXEC. On macOS, dup2(fd,fd) is a no-op, so we
+                // use the macOS-specific addinherit_np instead.
+#ifdef __APPLE__
+                if (!stdinSet)  posix_spawn_file_actions_addinherit_np(&actions, STDIN_FILENO);
+                if (!stdoutSet) posix_spawn_file_actions_addinherit_np(&actions, STDOUT_FILENO);
+                if (!stderrSet) posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO);
+#else
                 if (!stdinSet)  posix_spawn_file_actions_adddup2(&actions, STDIN_FILENO,  STDIN_FILENO);
                 if (!stdoutSet) posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDOUT_FILENO);
                 if (!stderrSet) posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDERR_FILENO);
+#endif
 
                 pid_t pid;
                 int err = posix_spawnp(&pid, stages[i].cmd.c_str(), &actions, &attr,
