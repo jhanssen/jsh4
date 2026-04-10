@@ -256,6 +256,7 @@
 ### Technical debt
 
 - [ ] **Move remaining builtins to object map** — `read`, `source`, `.`, `eval`, `trap`, `return`, `command`, `break`, `continue`, `fg`, `bg`, `jobs`, `wait`, `select`, `time` are handled as special cases in `executeSimple` instead of the `builtins` map. Causes duplicate builtin name lists (executor `BUILTIN_NAMES` set and completion `BUILTINS_LIST`).
+- [ ] **Arithmetic evaluation via `new Function()`** — Currently uses JS semantics, not POSIX arithmetic. Differences include floating-point instead of integer-only, JS operator precedence edge cases, and no integer overflow behavior. Consider a dedicated integer arithmetic evaluator for correctness.
 
 ### Completion
 
