@@ -1,0 +1,3 @@
+[submodule "3rdparty/libgrapheme"]
+	path = 3rdparty/libgrapheme
+	url = https://github.com/FRIGN/libgrapheme.git

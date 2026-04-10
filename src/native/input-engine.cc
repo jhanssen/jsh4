@@ -9,6 +9,10 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 
+extern "C" {
+#include <grapheme.h>
+}
+
 namespace jsh {
 
 // ---- UTF-8 helpers (extracted from linenoise.c) ----------------------------
@@ -83,12 +87,54 @@ static int utf8CharWidth(uint32_t cp) {
     return 1;
 }
 
+// ---- Grapheme cluster helpers ------------------------------------------------
+
+// Returns the byte length of the grapheme cluster starting at buf[pos].
+static size_t graphemeNextLen(const char *buf, size_t pos, size_t len) {
+    if (pos >= len) return 0;
+    return grapheme_next_character_break_utf8(buf + pos, len - pos);
+}
+
+// Returns the byte length of the grapheme cluster ending at buf[pos].
+// Scans forward from `from` (typically line start) to find the cluster boundary.
+static size_t graphemePrevLen(const char *buf, size_t pos, size_t from) {
+    if (pos == 0 || pos <= from) return 0;
+    size_t prev = from;
+    size_t cur = from;
+    while (cur < pos) {
+        prev = cur;
+        cur += grapheme_next_character_break_utf8(buf + cur, pos - cur);
+    }
+    return pos - prev;
+}
+
+// Display width of a single grapheme cluster (handles VS16 widening, ZWJ sequences, etc.)
+static int graphemeClusterWidth(const char *s, size_t clen) {
+    if (clen == 0) return 0;
+    size_t i = 0;
+    size_t blen;
+    uint32_t baseCp = utf8DecodeChar(s, &blen, clen);
+    int w = utf8CharWidth(baseCp);
+    i += blen;
+    // Check remaining codepoints in the cluster for VS16 widening
+    while (i < clen) {
+        uint32_t cp = utf8DecodeChar(s + i, &blen, clen - i);
+        if (cp == 0xFE0F && w == 1) {
+            // VS16 widens an emoji presentation base from 1 to 2 cells
+            w = 2;
+        }
+        // Other combining/extending characters don't add width
+        i += blen;
+    }
+    return w;
+}
+
+// Cluster-aware string width: iterates by grapheme cluster, not by codepoint.
 static size_t utf8StrWidth(const char *s, size_t len) {
     size_t width = 0, i = 0;
     while (i < len) {
-        size_t clen;
-        uint32_t cp = utf8DecodeChar(s + i, &clen, len - i);
-        width += utf8CharWidth(cp);
+        size_t clen = grapheme_next_character_break_utf8(s + i, len - i);
+        width += graphemeClusterWidth(s + i, clen);
         i += clen;
     }
     return width;
@@ -113,9 +159,8 @@ static size_t utf8StrWidthAnsi(const char *s, size_t len) {
             }
             continue;
         }
-        size_t clen;
-        uint32_t cp = utf8DecodeChar(s + i, &clen, len - i);
-        width += utf8CharWidth(cp);
+        size_t clen = grapheme_next_character_break_utf8(s + i, len - i);
+        width += graphemeClusterWidth(s + i, clen);
         i += clen;
     }
     return width;
@@ -296,8 +341,9 @@ static InputState g_state;
 
 // ---- Buffer editing operations ---------------------------------------------
 
-// Forward declaration — defined after EngineCtx.
+// Forward declarations — defined later in this file.
 static void bufferChanged();
+static size_t lineStart(const char *buf, size_t pos);
 
 static void editInsert(InputState *s, const char *c, size_t clen) {
     if (s->len + clen > s->buflen) return;
@@ -315,7 +361,8 @@ static void editInsert(InputState *s, const char *c, size_t clen) {
 
 static void editDelete(InputState *s) {
     if (s->len > 0 && s->pos < s->len) {
-        size_t clen = utf8NextCharLen(s->buf, s->pos, s->len);
+        size_t clen = graphemeNextLen(s->buf, s->pos, s->len);
+        if (clen == 0) return;
         memmove(s->buf + s->pos, s->buf + s->pos + clen, s->len - s->pos - clen);
         s->len -= clen;
         s->buf[s->len] = '\0';
@@ -325,7 +372,9 @@ static void editDelete(InputState *s) {
 
 static void editBackspace(InputState *s) {
     if (s->pos > 0 && s->len > 0) {
-        size_t clen = utf8PrevCharLen(s->buf, s->pos);
+        size_t from = lineStart(s->buf, s->pos);
+        size_t clen = graphemePrevLen(s->buf, s->pos, from);
+        if (clen == 0) return;
         memmove(s->buf + s->pos - clen, s->buf + s->pos, s->len - s->pos);
         s->pos -= clen;
         s->len -= clen;
@@ -336,13 +385,14 @@ static void editBackspace(InputState *s) {
 
 static void editMoveLeft(InputState *s) {
     if (s->pos > 0) {
-        s->pos -= utf8PrevCharLen(s->buf, s->pos);
+        size_t from = lineStart(s->buf, s->pos);
+        s->pos -= graphemePrevLen(s->buf, s->pos, from);
     }
 }
 
 static void editMoveRight(InputState *s) {
     if (s->pos < s->len) {
-        s->pos += utf8NextCharLen(s->buf, s->pos, s->len);
+        s->pos += graphemeNextLen(s->buf, s->pos, s->len);
     }
 }
 
@@ -382,9 +432,9 @@ static bool editMoveUp(InputState *s) {
     size_t i = prevLineStart;
     size_t w = 0;
     while (i < prevLineEnd) {
-        size_t clen = utf8NextCharLen(s->buf, i, prevLineEnd);
-        size_t avail = prevLineEnd - i;
-        int cw = utf8CharWidth(utf8DecodeChar(s->buf + i, &clen, avail));
+        size_t clen = graphemeNextLen(s->buf, i, prevLineEnd);
+        if (clen == 0) break;
+        int cw = graphemeClusterWidth(s->buf + i, clen);
         if (w + cw > col) break;
         w += cw;
         i += clen;
@@ -407,9 +457,9 @@ static bool editMoveDown(InputState *s) {
     size_t i = nextLineStart;
     size_t w = 0;
     while (i < nextLineEnd) {
-        size_t clen = utf8NextCharLen(s->buf, i, nextLineEnd);
-        size_t avail = nextLineEnd - i;
-        int cw = utf8CharWidth(utf8DecodeChar(s->buf + i, &clen, avail));
+        size_t clen = graphemeNextLen(s->buf, i, nextLineEnd);
+        if (clen == 0) break;
+        int cw = graphemeClusterWidth(s->buf + i, clen);
         if (w + cw > col) break;
         w += cw;
         i += clen;
@@ -1161,8 +1211,9 @@ static Napi::Value InputRenderLine(const Napi::CallbackInfo &info) {
     size_t skipBytes = 0;
     size_t skipWidth = 0;
     while (pwidth + poscol - skipWidth >= (size_t)cols) {
-        size_t clen = utf8NextCharLen(rawBuf, skipBytes, rawLen);
-        int cwidth = utf8CharWidth(utf8DecodeChar(rawBuf + skipBytes, &clen, rawLen - skipBytes));
+        size_t clen = graphemeNextLen(rawBuf, skipBytes, rawLen);
+        if (clen == 0) break;
+        int cwidth = graphemeClusterWidth(rawBuf + skipBytes, clen);
         skipBytes += clen;
         skipWidth += cwidth;
     }
@@ -1172,9 +1223,9 @@ static Napi::Value InputRenderLine(const Napi::CallbackInfo &info) {
     // Trim from right if still doesn't fit.
     size_t displayLen = rawLen - skipBytes;
     while (pwidth + lencol > (size_t)cols) {
-        size_t clen = utf8PrevCharLen(rawBuf + skipBytes, displayLen);
-        int cw;
-        { size_t cl; cw = utf8CharWidth(utf8DecodeChar(rawBuf + skipBytes + displayLen - clen, &cl, clen)); }
+        size_t clen = graphemePrevLen(rawBuf + skipBytes, displayLen, 0);
+        if (clen == 0) break;
+        int cw = graphemeClusterWidth(rawBuf + skipBytes + displayLen - clen, clen);
         displayLen -= clen;
         lencol -= cw;
     }
