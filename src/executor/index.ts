@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
-import { createReadStream, createWriteStream, read as fsRead, readFileSync, readSync, accessSync, openSync, closeSync, constants as fsConstants } from "node:fs";
+import { createReadStream, createWriteStream, read as fsRead, readFileSync, readSync, writeSync, accessSync, openSync, closeSync, constants as fsConstants } from "node:fs";
 import { resolve } from "node:path";
 import { constants as osConstants } from "node:os";
 import { promisify } from "node:util";
@@ -30,6 +30,15 @@ import {
 import { setTrap, getAllTraps, runTrap } from "../trap/index.js";
 
 const require = createRequire(import.meta.url);
+
+// Builtins run in-process in pipeline stages with dup2'd fd 1/2. Node's
+// process.stdout/stderr streams buffer async writes that may flush to the
+// wrong fd after the stage restores stdio. Use writeSync so output lands on
+// the current fd before the caller dup2's it back. EPIPE is surfaced as a
+// thrown Error with code "EPIPE", which the pipeline machinery already catches.
+function writeStdout(s: string): void { writeSync(1, s); }
+function writeStderr(s: string): void { writeSync(2, s); }
+
 interface PipelineResult {
     exitCode: number;
     pipeStatus: number[];
@@ -204,7 +213,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         case "ConditionalExpr": return executeConditionalExpr(node as ConditionalExpr);
         case "JsFunction":     return executeJsStage(node as JsFunction, 0, 1);
         default:
-            process.stderr.write(`jsh: unimplemented: ${node.type}\n`);
+            writeStderr(`jsh: unimplemented: ${node.type}\n`);
             return { exitCode: 1 };
     }
 }
@@ -251,7 +260,7 @@ async function withRedirections(redirs: Redirection[], body: () => Promise<ExecR
                     if (r.op === ">" && shellOpts.noclobber) {
                         try {
                             accessSync(target, fsConstants.F_OK);
-                            process.stderr.write(`jsh: ${target}: cannot overwrite existing file\n`);
+                            writeStderr(`jsh: ${target}: cannot overwrite existing file\n`);
                             return { exitCode: 1 };
                         } catch {
                             // File doesn't exist — proceed.
@@ -389,11 +398,11 @@ async function captureAst(node: ASTNode): Promise<string> {
         const stages: Stage[] = [];
         for (const stageNode of pipe.commands) {
             if (stageNode.type !== "SimpleCommand") {
-                process.stderr.write("jsh: $(): complex pipeline stage not supported\n");
+                writeStderr("jsh: $(): complex pipeline stage not supported\n");
                 return "";
             }
             const stage = await buildStage(stageNode as SimpleCommand);
-            if (!stage) { process.stderr.write("jsh: $(): empty stage\n"); return ""; }
+            if (!stage) { writeStderr("jsh: $(): empty stage\n"); return ""; }
             stages.push(stage);
         }
         const result = await native.captureOutput(stages, pipe.pipeOps);
@@ -436,7 +445,7 @@ async function captureAst(node: ASTNode): Promise<string> {
 async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     for (const a of cmd.assignments) {
         if (isReadonly(a.name)) {
-            process.stderr.write(`jsh: ${a.name}: readonly variable\n`);
+            writeStderr(`jsh: ${a.name}: readonly variable\n`);
             return { exitCode: 1 };
         }
         if (a.array) {
@@ -488,7 +497,7 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     // xtrace: print command before execution
     if (shellOpts.xtrace) {
         const trace = [command, ...args].join(" ");
-        process.stderr.write(`+ ${trace}\n`);
+        writeStderr(`+ ${trace}\n`);
     }
 
     // time keyword: measure execution time
@@ -501,9 +510,9 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         const elapsed = Number(process.hrtime.bigint() - startTime) / 1e9;
         const mins = Math.floor(elapsed / 60);
         const secs = elapsed - mins * 60;
-        process.stderr.write(`\nreal\t${mins}m${secs.toFixed(3)}s\n`);
-        process.stderr.write(`user\t0m0.000s\n`);
-        process.stderr.write(`sys\t0m0.000s\n`);
+        writeStderr(`\nreal\t${mins}m${secs.toFixed(3)}s\n`);
+        writeStderr(`user\t0m0.000s\n`);
+        writeStderr(`sys\t0m0.000s\n`);
         return result;
     }
 
@@ -536,7 +545,7 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     // source / . — read file, parse, execute in current context
     if (command === "source" || command === ".") {
         if (args.length === 0) {
-            process.stderr.write(`${command}: filename argument required\n`);
+            writeStderr(`${command}: filename argument required\n`);
             $["PIPESTATUS"] = [2];
             return { exitCode: 2 };
         }
@@ -567,12 +576,12 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
             if (args.length < 2) return { exitCode: 1 };
             const name = args[1]!;
             if (isBuiltinName(name) || shellFunctions.has(name) || getAlias(name) !== undefined) {
-                process.stdout.write(name + "\n");
+                writeStdout(name + "\n");
                 return { exitCode: 0 };
             }
             // Check PATH
             const resolved = findInPath(name);
-            if (resolved) { process.stdout.write(resolved + "\n"); return { exitCode: 0 }; }
+            if (resolved) { writeStdout(resolved + "\n"); return { exitCode: 0 }; }
             return { exitCode: 1 };
         }
         // command NAME ARGS — run NAME bypassing functions and aliases
@@ -612,7 +621,7 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
             $["PIPESTATUS"] = [r.exitCode];
             return r;
         } catch (e: unknown) {
-            process.stderr.write(`eval: ${e instanceof Error ? e.message : e}\n`);
+            writeStderr(`eval: ${e instanceof Error ? e.message : e}\n`);
             return { exitCode: 1 };
         }
     }
@@ -693,7 +702,7 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         const pids = result.pids ?? [];
         const cmdText = [command, ...args].join(" ");
         const job = addJob(result.pgid, pids, cmdText, "stopped");
-        process.stderr.write(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
+        writeStderr(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
         return { exitCode: 128 + result.stoppedSignal };
     }
     $["PIPESTATUS"] = result.pipeStatus;
@@ -715,7 +724,7 @@ async function expandAliasesInPipeline(commands: ASTNode[]): Promise<ASTNode[] |
         const restWords = (await Promise.all(sc.words.slice(1).map(expandWord))).flat();
         const expanded = [expansion, ...restWords].join(" ").trim();
         const ast = parse(expanded);
-        if (!ast) { process.stderr.write(`jsh: bad alias expansion: ${expanded}\n`); return null; }
+        if (!ast) { writeStderr(`jsh: bad alias expansion: ${expanded}\n`); return null; }
         // Inline the expanded command (may itself be a pipeline segment).
         result.push(ast);
     }
@@ -766,11 +775,11 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
     const stages: Stage[] = [];
     for (const stageNode of resolvedCommands) {
         if (stageNode.type !== "SimpleCommand") {
-            process.stderr.write(`jsh: unsupported pipeline stage: ${stageNode.type}\n`);
+            writeStderr(`jsh: unsupported pipeline stage: ${stageNode.type}\n`);
             return { exitCode: 1 };
         }
         const stage = await buildStage(stageNode as SimpleCommand);
-        if (!stage) { process.stderr.write("jsh: empty pipeline stage\n"); return { exitCode: 1 }; }
+        if (!stage) { writeStderr("jsh: empty pipeline stage\n"); return { exitCode: 1 }; }
         stages.push(stage);
     }
     const result = await native.spawnPipeline(stages, node.pipeOps);
@@ -780,7 +789,7 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
         const pids = result.pids ?? [];
         const cmdText = stages.map(s => [s.cmd, ...s.args].join(" ")).join(" | ");
         const job = addJob(result.pgid, pids, cmdText, "stopped");
-        process.stderr.write(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
+        writeStderr(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
         return { exitCode: 128 + result.stoppedSignal };
     }
 
@@ -837,7 +846,7 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         if (stageNode.type !== "SimpleCommand" || stageBuiltins.has(i)) continue;
 
         const stage = await buildStage(stageNode as SimpleCommand);
-        if (!stage) { process.stderr.write("jsh: empty stage\n"); continue; }
+        if (!stage) { writeStderr("jsh: empty stage\n"); continue; }
 
         const sin  = stdinFd(i);
         const sout = stdoutFd(i);
@@ -855,18 +864,10 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         if (!isInProcess(i)) native.closeFd(w);
     }
 
-    // Run JS function stages in-process.
-    for (let i = 0; i < n; i++) {
-        const stageNode = node.commands[i]!;
-        if (stageNode.type !== "JsFunction") continue;
-        const sin  = stdinFd(i);
-        const sout = stdoutFd(i);
-        stageExitCodes[i] = await executeJsStageRaw(stageNode as JsFunction, sin, sout);
-        if (sout !== 1) native.closeFd(sout);
-        if (sin  !== 0) native.closeFd(sin);
-    }
-
-    // Run builtin stages in-process using raw fd writes (not process.stdout).
+    // Builtin stages run first: synchronous, small-output, and close their
+    // downstream pipe end on exit so later JS/compound stages can read cleanly.
+    // If a builtin's output exceeds the pipe buffer (~64KB on macOS), writeSync
+    // will block and deadlock — real buffering for that case would need threads.
     for (const [i, stage] of stageBuiltins) {
         const sin  = stdinFd(i);
         const sout = stdoutFd(i);
@@ -894,6 +895,17 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
             native.closeFd(savedStdout);
             if (savedStdin !== -1) { native.dup2Fd(savedStdin, 0); native.closeFd(savedStdin); }
         }
+    }
+
+    // Run JS function stages in-process.
+    for (let i = 0; i < n; i++) {
+        const stageNode = node.commands[i]!;
+        if (stageNode.type !== "JsFunction") continue;
+        const sin  = stdinFd(i);
+        const sout = stdoutFd(i);
+        stageExitCodes[i] = await executeJsStageRaw(stageNode as JsFunction, sin, sout);
+        if (sout !== 1) native.closeFd(sout);
+        if (sin  !== 0) native.closeFd(sin);
     }
 
     // Run compound command stages in-process with redirected fds.
@@ -983,13 +995,13 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
                 return 0;
             }
         } catch (e) {
-            process.stderr.write(`jsh: @{}: ${e instanceof Error ? e.message : e}\n`);
+            writeStderr(`jsh: @{}: ${e instanceof Error ? e.message : e}\n`);
             return 1;
         }
     } else {
         const found = lookupJsFunction(node.name);
         if (!found) {
-            process.stderr.write(`jsh: @${node.name}: function not found\n`);
+            writeStderr(`jsh: @${node.name}: function not found\n`);
             return 1;
         }
         fn = found;
@@ -1050,7 +1062,7 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
         return 0;
     } catch (e: unknown) {
         if (e !== null && e !== undefined) {
-            process.stderr.write(`jsh: @${node.name || "{"}: ${e instanceof Error ? e.message : e}\n`);
+            writeStderr(`jsh: @${node.name || "{"}: ${e instanceof Error ? e.message : e}\n`);
         }
         return 1;
     } finally {
@@ -1137,7 +1149,7 @@ async function executeBackground(node: ASTNode): Promise<ExecResult> {
     }
 
     if (!stages || stages.length === 0) {
-        process.stderr.write("jsh: background not supported for this command type\n");
+        writeStderr("jsh: background not supported for this command type\n");
         return executeNode(node);
     }
 
@@ -1147,7 +1159,7 @@ async function executeBackground(node: ASTNode): Promise<ExecResult> {
     const job = addJob(result.pgid, pids, cmdText, "running");
     const lastPid = pids.length > 0 ? pids[pids.length - 1]! : result.pgid;
     $["!"] = lastPid;
-    process.stderr.write(`[${job.id}] ${lastPid}\n`);
+    writeStderr(`[${job.id}] ${lastPid}\n`);
     return { exitCode: 0 };
 }
 
@@ -1157,10 +1169,10 @@ async function runFg(args: string[]): Promise<ExecResult> {
     const spec = args[0] ?? "%%";
     const job = getJobBySpec(spec) ?? getCurrentJob();
     if (!job) {
-        process.stderr.write("jsh: fg: no current job\n");
+        writeStderr("jsh: fg: no current job\n");
         return { exitCode: 1 };
     }
-    process.stderr.write(`${job.command}\n`);
+    writeStderr(`${job.command}\n`);
     markJobRunning(job.id);
     native.tcsetpgrpFg(job.pgid);
     native.sendSignal(-job.pgid, native.SIGCONT);
@@ -1168,7 +1180,7 @@ async function runFg(args: string[]): Promise<ExecResult> {
     native.tcsetpgrpShell();
     if (result.stopped) {
         markJobStopped(job.id, result.stoppedSignal);
-        process.stderr.write(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
+        writeStderr(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
         return { exitCode: 128 + result.stoppedSignal };
     }
     removeJob(job.id);
@@ -1180,12 +1192,12 @@ async function runBg(args: string[]): Promise<ExecResult> {
     const spec = args[0] ?? "%%";
     const job = getJobBySpec(spec) ?? getCurrentJob();
     if (!job || job.status !== "stopped") {
-        process.stderr.write("jsh: bg: no stopped job\n");
+        writeStderr("jsh: bg: no stopped job\n");
         return { exitCode: 1 };
     }
     markJobRunning(job.id);
     native.sendSignal(-job.pgid, native.SIGCONT);
-    process.stderr.write(`[${job.id}]+ ${job.command} &\n`);
+    writeStderr(`[${job.id}]+ ${job.command} &\n`);
     return { exitCode: 0 };
 }
 
@@ -1194,7 +1206,7 @@ function runJobs(): ExecResult {
     for (const job of getAllJobs()) {
         const marker = job === currentJob ? "+" : " ";
         const status = job.status === "running" ? "Running" : "Stopped";
-        process.stdout.write(`[${job.id}]${marker}  ${status}\t\t${job.command}\n`);
+        writeStdout(`[${job.id}]${marker}  ${status}\t\t${job.command}\n`);
     }
     return { exitCode: 0 };
 }
@@ -1233,7 +1245,7 @@ const SIGNAL_MAP: Record<string, number> = {};
 
 function runKill(args: string[]): ExecResult {
     if (args.length === 0) {
-        process.stderr.write("kill: usage: kill [-signal] pid ...\n");
+        writeStderr("kill: usage: kill [-signal] pid ...\n");
         return { exitCode: 1 };
     }
     // -l: list signals
@@ -1241,7 +1253,7 @@ function runKill(args: string[]): ExecResult {
         const sigs = osConstants.signals as Record<string, number>;
         const entries = Object.entries(sigs).filter(([n]) => n.startsWith("SIG")).sort((a, b) => a[1] - b[1]);
         for (const [name, num] of entries) {
-            process.stdout.write(`${num}) ${name}\n`);
+            writeStdout(`${num}) ${name}\n`);
         }
         return { exitCode: 0 };
     }
@@ -1257,7 +1269,7 @@ function runKill(args: string[]): ExecResult {
         } else {
             const resolved = SIGNAL_MAP[sigSpec] ?? SIGNAL_MAP["SIG" + sigSpec];
             if (resolved === undefined) {
-                process.stderr.write(`kill: ${args[0]}: invalid signal specification\n`);
+                writeStderr(`kill: ${args[0]}: invalid signal specification\n`);
                 return { exitCode: 1 };
             }
             signal = resolved;
@@ -1266,7 +1278,7 @@ function runKill(args: string[]): ExecResult {
     }
 
     if (startIdx >= args.length) {
-        process.stderr.write("kill: usage: kill [-signal] pid ...\n");
+        writeStderr("kill: usage: kill [-signal] pid ...\n");
         return { exitCode: 1 };
     }
 
@@ -1277,7 +1289,7 @@ function runKill(args: string[]): ExecResult {
         if (arg.startsWith("%")) {
             const job = getJobBySpec(arg);
             if (!job) {
-                process.stderr.write(`kill: ${arg}: no such job\n`);
+                writeStderr(`kill: ${arg}: no such job\n`);
                 exitCode = 1;
                 continue;
             }
@@ -1285,14 +1297,14 @@ function runKill(args: string[]): ExecResult {
         } else {
             pid = parseInt(arg, 10);
             if (isNaN(pid)) {
-                process.stderr.write(`kill: ${arg}: invalid pid\n`);
+                writeStderr(`kill: ${arg}: invalid pid\n`);
                 exitCode = 1;
                 continue;
             }
         }
         const r = native.sendSignal(pid, signal);
         if (r !== 0) {
-            process.stderr.write(`kill: (${pid}) - No such process\n`);
+            writeStderr(`kill: (${pid}) - No such process\n`);
             exitCode = 1;
         }
     }
@@ -1306,7 +1318,7 @@ function runDisown(args: string[]): ExecResult {
         // Disown current job
         const job = getCurrentJob();
         if (!job) {
-            process.stderr.write("jsh: disown: no current job\n");
+            writeStderr("jsh: disown: no current job\n");
             return { exitCode: 1 };
         }
         removeJob(job.id);
@@ -1328,7 +1340,7 @@ function runDisown(args: string[]): ExecResult {
         }
         const job = getJobBySpec(arg);
         if (!job) {
-            process.stderr.write(`jsh: disown: ${arg}: no such job\n`);
+            writeStderr(`jsh: disown: ${arg}: no such job\n`);
             exitCode = 1;
             continue;
         }
@@ -1344,11 +1356,11 @@ const hashTable = new Map<string, string>();
 function runHash(args: string[]): ExecResult {
     if (args.length === 0) {
         if (hashTable.size === 0) {
-            process.stderr.write("hash: hash table empty\n");
+            writeStderr("hash: hash table empty\n");
             return { exitCode: 0 };
         }
         for (const [name, path] of hashTable) {
-            process.stdout.write(`${name}=${path}\n`);
+            writeStdout(`${name}=${path}\n`);
         }
         return { exitCode: 0 };
     }
@@ -1363,7 +1375,7 @@ function runHash(args: string[]): ExecResult {
         if (path) {
             hashTable.set(name, path);
         } else {
-            process.stderr.write(`hash: ${name}: not found\n`);
+            writeStderr(`hash: ${name}: not found\n`);
             exitCode = 1;
         }
     }
@@ -1379,7 +1391,7 @@ export function hashLookup(name: string): string | undefined {
 
 function runLet(args: string[]): ExecResult {
     if (args.length === 0) {
-        process.stderr.write("let: usage: let expression ...\n");
+        writeStderr("let: usage: let expression ...\n");
         return { exitCode: 1 };
     }
     let lastResult = 0;
@@ -1399,9 +1411,9 @@ function runDeclare(args: string[]): ExecResult {
             const val = $[key];
             if (Array.isArray(val)) {
                 const elements = (val as unknown[]).map((v, i) => `[${i}]="${v}"`).join(" ");
-                process.stdout.write(`declare -a ${key}=(${elements})\n`);
+                writeStdout(`declare -a ${key}=(${elements})\n`);
             } else {
-                process.stdout.write(`declare -- ${key}="${val}"\n`);
+                writeStdout(`declare -- ${key}="${val}"\n`);
             }
         }
         return { exitCode: 0 };
@@ -1426,7 +1438,7 @@ function runDeclare(args: string[]): ExecResult {
                 case "r": isReadonly = true; break;
                 case "p": isPrint = true; break;
                 default:
-                    process.stderr.write(`declare: -${f}: invalid option\n`);
+                    writeStderr(`declare: -${f}: invalid option\n`);
                     return { exitCode: 1 };
             }
         }
@@ -1439,9 +1451,9 @@ function runDeclare(args: string[]): ExecResult {
             if (isArray && !Array.isArray(val)) continue;
             if (Array.isArray(val)) {
                 const elements = (val as unknown[]).map((v, i) => `[${i}]="${v}"`).join(" ");
-                process.stdout.write(`declare -a ${key}=(${elements})\n`);
+                writeStdout(`declare -a ${key}=(${elements})\n`);
             } else {
-                process.stdout.write(`declare -- ${key}="${val}"\n`);
+                writeStdout(`declare -- ${key}="${val}"\n`);
             }
         }
         return { exitCode: 0 };
@@ -1619,13 +1631,13 @@ async function executeSelect(node: SelectClause): Promise<ExecResult> {
 
     // Display menu.
     for (let i = 0; i < items.length; i++) {
-        process.stderr.write(`${i + 1}) ${items[i]}\n`);
+        writeStderr(`${i + 1}) ${items[i]}\n`);
     }
 
     let last: ExecResult = { exitCode: 0 };
     // Loop: read choice from stdin.
     while (true) {
-        process.stderr.write("#? ");
+        writeStderr("#? ");
         const line = readLineFromFd(0);
         if (line === null) break; // EOF
         const trimmed = line.trim();
@@ -1860,7 +1872,7 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
         else if (arg === "-n" && i + 1 < args.length) { nchars = parseInt(args[i + 1]!, 10); i += 2; }
         else if (arg === "-a" && i + 1 < args.length) { arrayName = args[i + 1]!; i += 2; }
         else if (arg.startsWith("-") && arg.length > 1 && !/^[a-zA-Z_]/.test(arg[1]!)) {
-            process.stderr.write(`read: ${arg}: unsupported option\n`);
+            writeStderr(`read: ${arg}: unsupported option\n`);
             return { exitCode: 2 };
         } else {
             varNames.push(arg);
@@ -1868,7 +1880,7 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
         }
     }
 
-    if (prompt) process.stderr.write(prompt);
+    if (prompt) writeStderr(prompt);
 
     // For -s (silent): disable terminal echo while reading.
     let savedTermios: Buffer | null = null;
@@ -1895,7 +1907,7 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
         let fd: number;
         try { fd = fs.openSync(stdinRedir.target, "r"); }
         catch (e) {
-            process.stderr.write(`read: ${e instanceof Error ? e.message : e}\n`);
+            writeStderr(`read: ${e instanceof Error ? e.message : e}\n`);
             return { exitCode: 1 };
         }
         clearFdReadBuffer(fd);
@@ -1938,7 +1950,7 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
             const { execSync } = require("node:child_process") as typeof import("node:child_process");
             execSync(`stty ${savedTermios.toString().trim()}`, { stdio: "inherit" });
         } catch {}
-        process.stderr.write("\n"); // Echo the newline that was suppressed.
+        writeStderr("\n"); // Echo the newline that was suppressed.
     }
 
     if (line === null) return { exitCode: 1 };
@@ -2006,7 +2018,7 @@ async function runSource(file: string, extraArgs: string[]): Promise<ExecResult>
                 try { accessSync(candidate, fsConstants.R_OK); path = candidate; found = true; break; } catch {}
             }
             if (!found) {
-                process.stderr.write(`source: ${file}: No such file or directory\n`);
+                writeStderr(`source: ${file}: No such file or directory\n`);
                 return { exitCode: 1 };
             }
         }
@@ -2015,14 +2027,14 @@ async function runSource(file: string, extraArgs: string[]): Promise<ExecResult>
     try {
         content = readFileSync(path, "utf8");
     } catch (e) {
-        process.stderr.write(`source: ${e instanceof Error ? e.message : e}\n`);
+        writeStderr(`source: ${e instanceof Error ? e.message : e}\n`);
         return { exitCode: 1 };
     }
     let ast;
     try {
         ast = parse(content);
     } catch (e) {
-        process.stderr.write(`source: ${path}: ${e instanceof Error ? e.message : e}\n`);
+        writeStderr(`source: ${path}: ${e instanceof Error ? e.message : e}\n`);
         return { exitCode: 1 };
     }
     if (!ast) return { exitCode: 0 };
@@ -2040,7 +2052,7 @@ function runTest(args: string[]): ExecResult {
     try {
         return { exitCode: evalTestExpr(args, 0, args.length)[0] ? 0 : 1 };
     } catch (e) {
-        process.stderr.write(`test: ${e instanceof Error ? e.message : e}\n`);
+        writeStderr(`test: ${e instanceof Error ? e.message : e}\n`);
         return { exitCode: 2 };
     }
 }
@@ -2182,7 +2194,7 @@ function toInt(s: string): number {
 
 function runGetopts(args: string[]): ExecResult {
     if (args.length < 2) {
-        process.stderr.write("getopts: usage: getopts optstring name [args]\n");
+        writeStderr("getopts: usage: getopts optstring name [args]\n");
         return { exitCode: 2 };
     }
     const optstring = args[0]!;
@@ -2230,7 +2242,7 @@ function runGetopts(args: string[]): ExecResult {
             $["OPTIND"] = String(optind + 1);
             $["_OPTPOS"] = "1";
         }
-        if (optstring[0] !== ":") process.stderr.write(`jsh: getopts: illegal option -- ${ch}\n`);
+        if (optstring[0] !== ":") writeStderr(`jsh: getopts: illegal option -- ${ch}\n`);
         return { exitCode: 0 };
     }
 
@@ -2255,7 +2267,7 @@ function runGetopts(args: string[]): ExecResult {
             $["OPTARG"] = ch;
             $["OPTIND"] = String(optind + 1);
             $["_OPTPOS"] = "1";
-            if (optstring[0] !== ":") process.stderr.write(`jsh: getopts: option requires an argument -- ${ch}\n`);
+            if (optstring[0] !== ":") writeStderr(`jsh: getopts: option requires an argument -- ${ch}\n`);
         }
     } else {
         // No argument needed
@@ -2315,14 +2327,14 @@ function runTrapBuiltin(args: string[]): ExecResult {
     // No args: list current traps
     if (args.length === 0) {
         for (const [sig, action] of getAllTraps()) {
-            process.stdout.write(`trap -- ${shellQuote(action)} ${sig}\n`);
+            writeStdout(`trap -- ${shellQuote(action)} ${sig}\n`);
         }
         return { exitCode: 0 };
     }
 
     // trap -l: list signal names (not standard, but useful)
     if (args[0] === "-l") {
-        process.stdout.write("EXIT INT TERM HUP QUIT ERR DEBUG RETURN\n");
+        writeStdout("EXIT INT TERM HUP QUIT ERR DEBUG RETURN\n");
         return { exitCode: 0 };
     }
 
@@ -2332,7 +2344,7 @@ function runTrapBuiltin(args: string[]): ExecResult {
         // Single arg could be a signal to display
         const action = getAllTraps().get(args[0]!.toUpperCase().replace(/^SIG/, ""));
         if (action !== undefined) {
-            process.stdout.write(`trap -- ${shellQuote(action)} ${args[0]}\n`);
+            writeStdout(`trap -- ${shellQuote(action)} ${args[0]}\n`);
         }
         return { exitCode: 0 };
     }
@@ -2401,7 +2413,7 @@ function printfEscape(s: string): string {
 
 function runPrintf(args: string[]): ExecResult {
     if (args.length === 0) {
-        process.stderr.write("printf: usage: printf format [arguments]\n");
+        writeStderr("printf: usage: printf format [arguments]\n");
         return { exitCode: 1 };
     }
 
@@ -2462,7 +2474,7 @@ function runPrintf(args: string[]): ExecResult {
             output += fmt[i]; i++;
         }
 
-        process.stdout.write(output);
+        writeStdout(output);
 
         // If no args were consumed this pass, stop (avoid infinite loop on format with no specifiers).
         if (argIdx === startArgIdx) break;
@@ -2508,9 +2520,9 @@ const builtins: Record<string, Builtin> = {
         let target = args[0] ?? String($["HOME"] ?? process.env["HOME"] ?? "/");
         if (target === "-") {
             const oldPwd = String($["OLDPWD"] ?? "");
-            if (!oldPwd) { process.stderr.write("cd: OLDPWD not set\n"); return { exitCode: 1 }; }
+            if (!oldPwd) { writeStderr("cd: OLDPWD not set\n"); return { exitCode: 1 }; }
             target = oldPwd;
-            process.stdout.write(target + "\n");
+            writeStdout(target + "\n");
         }
         const oldCwd = process.cwd();
         let resolved = false;
@@ -2528,13 +2540,13 @@ const builtins: Record<string, Builtin> = {
         }
         if (!resolved) { try { process.chdir(target); resolved = true; } catch {} }
         if (resolved) { $["OLDPWD"] = oldCwd; $["PWD"] = process.cwd(); return { exitCode: 0 }; }
-        process.stderr.write(`cd: no such file or directory: ${target}\n`);
+        writeStderr(`cd: no such file or directory: ${target}\n`);
         return { exitCode: 1 };
     }},
     export: { external: false, run(args) {
         if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
             for (const [key, val] of Object.entries(process.env)) {
-                if (val !== undefined) process.stdout.write(`declare -x ${key}=${JSON.stringify(val)}\n`);
+                if (val !== undefined) writeStdout(`declare -x ${key}=${JSON.stringify(val)}\n`);
             }
             return { exitCode: 0 };
         }
@@ -2558,7 +2570,7 @@ const builtins: Record<string, Builtin> = {
     }},
     true:     { external: true,  run() { return { exitCode: 0 }; }},
     false:    { external: true,  run() { return { exitCode: 1 }; }},
-    echo: { external: true, run(args) {
+    echo: { external: false, run(args) {
         let newline = true, escapes = false, startIdx = 0;
         while (startIdx < args.length) {
             const a = args[startIdx]!;
@@ -2571,13 +2583,13 @@ const builtins: Record<string, Builtin> = {
         }
         let out = args.slice(startIdx).join(" ");
         if (escapes) out = echoEscape(out);
-        process.stdout.write(out + (newline ? "\n" : ""));
+        writeStdout(out + (newline ? "\n" : ""));
         return { exitCode: 0 };
     }},
     test:     { external: true,  run: (args) => runTest(args) },
     "[":      { external: true,  run(args) {
         if (args.length === 0 || args[args.length - 1] !== "]") {
-            process.stderr.write("[: missing ']'\n"); return { exitCode: 2 };
+            writeStderr("[: missing ']'\n"); return { exitCode: 2 };
         }
         return runTest(args.slice(0, -1));
     }},
@@ -2592,7 +2604,7 @@ const builtins: Record<string, Builtin> = {
     }},
     shift:    { external: false, run(args) {
         const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
-        if (isNaN(n) || n < 0) { process.stderr.write(`shift: ${args[0]}: numeric argument required\n`); return { exitCode: 1 }; }
+        if (isNaN(n) || n < 0) { writeStderr(`shift: ${args[0]}: numeric argument required\n`); return { exitCode: 1 }; }
         return { exitCode: shiftParams(n) ? 0 : 1 };
     }},
     exec:     { external: false, run(args) {
@@ -2606,40 +2618,40 @@ const builtins: Record<string, Builtin> = {
     pushd:    { external: false, run(args) {
         const target = args[0] ?? String($["HOME"] ?? "/");
         const cwd = process.cwd();
-        try { process.chdir(target); dirStack.push(cwd); $["PWD"] = process.cwd(); process.stdout.write(printDirStack() + "\n"); }
-        catch (e: unknown) { process.stderr.write(`pushd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
+        try { process.chdir(target); dirStack.push(cwd); $["PWD"] = process.cwd(); writeStdout(printDirStack() + "\n"); }
+        catch (e: unknown) { writeStderr(`pushd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
         return { exitCode: 0 };
     }},
     popd:     { external: false, run() {
-        if (dirStack.length === 0) { process.stderr.write("popd: directory stack empty\n"); return { exitCode: 1 }; }
+        if (dirStack.length === 0) { writeStderr("popd: directory stack empty\n"); return { exitCode: 1 }; }
         const target = dirStack.pop()!;
-        try { process.chdir(target); $["PWD"] = process.cwd(); process.stdout.write(printDirStack() + "\n"); }
-        catch (e: unknown) { process.stderr.write(`popd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
+        try { process.chdir(target); $["PWD"] = process.cwd(); writeStdout(printDirStack() + "\n"); }
+        catch (e: unknown) { writeStderr(`popd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
         return { exitCode: 0 };
     }},
-    dirs:     { external: false, run() { process.stdout.write(printDirStack() + "\n"); return { exitCode: 0 }; }},
+    dirs:     { external: false, run() { writeStdout(printDirStack() + "\n"); return { exitCode: 0 }; }},
     basename: { external: true, run(args) {
-        if (args.length === 0) { process.stderr.write("basename: missing operand\n"); return { exitCode: 1 }; }
+        if (args.length === 0) { writeStderr("basename: missing operand\n"); return { exitCode: 1 }; }
         let nm = args[0]!;
         while (nm.length > 1 && nm.endsWith("/")) nm = nm.slice(0, -1);
         const sl = nm.lastIndexOf("/");
         nm = sl >= 0 ? nm.slice(sl + 1) : nm;
         if (args[1] && nm.endsWith(args[1]) && nm !== args[1]) nm = nm.slice(0, -args[1].length);
-        process.stdout.write(nm + "\n");
+        writeStdout(nm + "\n");
         return { exitCode: 0 };
     }},
     dirname:  { external: true, run(args) {
-        if (args.length === 0) { process.stderr.write("dirname: missing operand\n"); return { exitCode: 1 }; }
+        if (args.length === 0) { writeStderr("dirname: missing operand\n"); return { exitCode: 1 }; }
         let nm = args[0]!;
         while (nm.length > 1 && nm.endsWith("/")) nm = nm.slice(0, -1);
         const sl = nm.lastIndexOf("/");
-        process.stdout.write((sl > 0 ? nm.slice(0, sl) : sl === 0 ? "/" : ".") + "\n");
+        writeStdout((sl > 0 ? nm.slice(0, sl) : sl === 0 ? "/" : ".") + "\n");
         return { exitCode: 0 };
     }},
     readonly: { external: false, run(args) {
         if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
             for (const [nm, val] of getReadonlyVars()) {
-                process.stdout.write(`declare -r ${nm}=${JSON.stringify(String(val ?? ""))}\n`);
+                writeStdout(`declare -r ${nm}=${JSON.stringify(String(val ?? ""))}\n`);
             }
             return { exitCode: 0 };
         }
@@ -2663,26 +2675,26 @@ const builtins: Record<string, Builtin> = {
         if (args.includes("-P")) {
             try {
                 const { realpathSync } = require("node:fs") as typeof import("node:fs");
-                process.stdout.write(realpathSync(process.cwd()) + "\n");
+                writeStdout(realpathSync(process.cwd()) + "\n");
             } catch {
-                process.stdout.write(process.cwd() + "\n");
+                writeStdout(process.cwd() + "\n");
             }
         } else {
-            process.stdout.write((String($["PWD"] ?? process.cwd())) + "\n");
+            writeStdout((String($["PWD"] ?? process.cwd())) + "\n");
         }
         return { exitCode: 0 };
     }},
     umask:    { external: false, run(args) {
         if (args.length === 0) {
             const mask = process.umask();
-            process.stdout.write("0" + mask.toString(8).padStart(3, "0") + "\n");
+            writeStdout("0" + mask.toString(8).padStart(3, "0") + "\n");
             // umask() with no args in Node returns current and sets to same value
             process.umask(mask);
             return { exitCode: 0 };
         }
         const val = parseInt(args[0]!, 8);
         if (isNaN(val)) {
-            process.stderr.write(`umask: ${args[0]}: invalid octal number\n`);
+            writeStderr(`umask: ${args[0]}: invalid octal number\n`);
             return { exitCode: 1 };
         }
         process.umask(val);
@@ -2692,24 +2704,24 @@ const builtins: Record<string, Builtin> = {
         // Minimal ulimit — only supports -n (nofile) which is the most commonly used.
         if (args.length === 0 || args[0] === "-n") {
             // Node doesn't expose getrlimit, report "unlimited" or use a default
-            process.stdout.write("unlimited\n");
+            writeStdout("unlimited\n");
             return { exitCode: 0 };
         }
         if (args[0] === "-a") {
-            process.stdout.write("core file size          (blocks, -c) unlimited\n");
-            process.stdout.write("data seg size           (kbytes, -d) unlimited\n");
-            process.stdout.write("file size               (blocks, -f) unlimited\n");
-            process.stdout.write("max locked memory       (kbytes, -l) unlimited\n");
-            process.stdout.write("max memory size         (kbytes, -m) unlimited\n");
-            process.stdout.write("open files                      (-n) unlimited\n");
-            process.stdout.write("pipe size            (512 bytes, -p) 1\n");
-            process.stdout.write("stack size              (kbytes, -s) unlimited\n");
-            process.stdout.write("cpu time               (seconds, -t) unlimited\n");
-            process.stdout.write("max user processes              (-u) unlimited\n");
-            process.stdout.write("virtual memory          (kbytes, -v) unlimited\n");
+            writeStdout("core file size          (blocks, -c) unlimited\n");
+            writeStdout("data seg size           (kbytes, -d) unlimited\n");
+            writeStdout("file size               (blocks, -f) unlimited\n");
+            writeStdout("max locked memory       (kbytes, -l) unlimited\n");
+            writeStdout("max memory size         (kbytes, -m) unlimited\n");
+            writeStdout("open files                      (-n) unlimited\n");
+            writeStdout("pipe size            (512 bytes, -p) 1\n");
+            writeStdout("stack size              (kbytes, -s) unlimited\n");
+            writeStdout("cpu time               (seconds, -t) unlimited\n");
+            writeStdout("max user processes              (-u) unlimited\n");
+            writeStdout("virtual memory          (kbytes, -v) unlimited\n");
             return { exitCode: 0 };
         }
-        process.stderr.write(`ulimit: ${args[0]}: unsupported option\n`);
+        writeStderr(`ulimit: ${args[0]}: unsupported option\n`);
         return { exitCode: 1 };
     }},
 };
@@ -2730,7 +2742,7 @@ async function executeConditionalExpr(node: ConditionalExpr): Promise<ExecResult
     try {
         return { exitCode: evalCondExpr(args, 0, args.length)[0] ? 0 : 1 };
     } catch (e) {
-        process.stderr.write(`[[: ${e instanceof Error ? e.message : e}\n`);
+        writeStderr(`[[: ${e instanceof Error ? e.message : e}\n`);
         return { exitCode: 2 };
     }
 }
@@ -2851,9 +2863,9 @@ function runType(args: string[]): ExecResult {
     for (const name of args) {
         const info = classifyCommand(name);
         if (info) {
-            process.stdout.write(info.detail + "\n");
+            writeStdout(info.detail + "\n");
         } else {
-            process.stderr.write(`type: ${name}: not found\n`);
+            writeStderr(`type: ${name}: not found\n`);
             exitCode = 1;
         }
     }
@@ -2865,11 +2877,11 @@ function runWhich(args: string[]): ExecResult {
     for (const name of args) {
         const path = findInPath(name);
         if (path) {
-            process.stdout.write(path + "\n");
+            writeStdout(path + "\n");
         } else if (BUILTIN_NAMES.has(name)) {
-            process.stdout.write(`${name}: shell built-in command\n`);
+            writeStdout(`${name}: shell built-in command\n`);
         } else {
-            process.stderr.write(`which: ${name}: not found\n`);
+            writeStderr(`which: ${name}: not found\n`);
             exitCode = 1;
         }
     }
@@ -2884,7 +2896,7 @@ function runExec(_name: string, args: string[]): ExecResult {
         native.execvp(cmd, rest);
     } catch (e) {
         // execvp failed — print error and exit
-        process.stderr.write(`exec: ${cmd}: ${e instanceof Error ? e.message : e}\n`);
+        writeStderr(`exec: ${cmd}: ${e instanceof Error ? e.message : e}\n`);
         process.exit(127);
     }
     // Unreachable on success (process replaced), but TypeScript needs a return.
@@ -2914,7 +2926,7 @@ function runSet(args: string[]): ExecResult {
     if (args.length === 0) {
         // Print all shell options
         for (const [name, val] of Object.entries(shellOpts)) {
-            process.stdout.write(`${name}\t${val ? "on" : "off"}\n`);
+            writeStdout(`${name}\t${val ? "on" : "off"}\n`);
         }
         return { exitCode: 0 };
     }
@@ -2931,7 +2943,7 @@ function runSet(args: string[]): ExecResult {
             const enable = arg[0] === "-";
             const name = args[++i];
             if (!name || !(name in longOptMap)) {
-                process.stderr.write(`set: ${name ?? ""}: invalid option\n`);
+                writeStderr(`set: ${name ?? ""}: invalid option\n`);
                 return { exitCode: 1 };
             }
             shellOpts[longOptMap[name]!] = enable;
@@ -2940,7 +2952,7 @@ function runSet(args: string[]): ExecResult {
                 const ch = arg[j]!;
                 const opt = shortOptMap[ch];
                 if (!opt) {
-                    process.stderr.write(`set: -${ch}: invalid option\n`);
+                    writeStderr(`set: -${ch}: invalid option\n`);
                     return { exitCode: 1 };
                 }
                 shellOpts[opt] = true;
@@ -2950,13 +2962,13 @@ function runSet(args: string[]): ExecResult {
                 const ch = arg[j]!;
                 const opt = shortOptMap[ch];
                 if (!opt) {
-                    process.stderr.write(`set: +${ch}: invalid option\n`);
+                    writeStderr(`set: +${ch}: invalid option\n`);
                     return { exitCode: 1 };
                 }
                 shellOpts[opt] = false;
             }
         } else {
-            process.stderr.write(`set: ${arg}: invalid argument\n`);
+            writeStderr(`set: ${arg}: invalid argument\n`);
             return { exitCode: 1 };
         }
     }
