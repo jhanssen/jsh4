@@ -1,0 +1,13 @@
+{
+  "name": "jsh-mb-applet",
+  "private": true,
+  "version": "0.1.0",
+  "description": "MasterBandit applet shipped with jsh: WS server + popup router",
+  "type": "module",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.0"
+  }
+}

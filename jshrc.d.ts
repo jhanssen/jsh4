@@ -122,6 +122,25 @@ interface WidgetHandle {
     readonly id: string;
 }
 
+// ---- MasterBandit bridge ----------------------------------------------------
+
+interface MbPopupHandle {
+    readonly id: string;
+    /** Write data to the popup's terminal (ANSI accepted). */
+    write(data: string): void;
+    /** Close the popup. */
+    close(): void;
+    /** Register a callback fired when the popup is closed (by us or by the user). */
+    onClose(fn: () => void): void;
+}
+
+interface MbApi {
+    /** Create a popup on the shell's pane. Resolves once MB confirms creation. */
+    createPopup(opts: { x: number; y: number; w: number; h: number }): Promise<MbPopupHandle>;
+    /** True while the WS connection to the applet is live. */
+    readonly connected: boolean;
+}
+
 // ---- Color constants --------------------------------------------------------
 
 interface Colors {
@@ -184,6 +203,12 @@ interface Colors {
 declare const jsh: {
     /** Shell variable store. */
     $: Record<string, unknown>;
+
+    /**
+     * MasterBandit bridge. `null` if jsh is not running under MasterBandit or
+     * the mb-applet isn't loaded. Present → connection to the applet is live.
+     */
+    mb: MbApi | null;
 
     // ---- Widgets ----
 

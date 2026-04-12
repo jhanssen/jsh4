@@ -18,6 +18,9 @@ import { TerminalUI } from "../terminal/index.js";
 import type { WidgetHandle, WidgetZone, WidgetOptions } from "../terminal/index.js";
 import { colors, makeFgColor, makeBgColor, makeUlColor, style } from "../terminal/colors.js";
 import type { JsPipelineFunction } from "../jsfunctions/index.js";
+import { handshake } from "../mb/handshake.js";
+import { connectMb } from "../mb/client.js";
+import type { MbApi } from "../mb/client.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
@@ -64,10 +67,18 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         ui = new TerminalUI(native);
     }
 
+    // MasterBandit handshake (cooked mode, before the line editor takes over).
+    // Runs only on TTYs. Silent on non-MB terminals.
+    let mbApi: MbApi | null = null;
+    if (process.stdin.isTTY && process.stdout.isTTY) {
+        const hs = await handshake();
+        if (hs) mbApi = await connectMb(hs);
+    }
+
     // Register ESM loader hook so jshrc files can `import ... from 'jsh/...'`.
     register('../loader-hooks.js', import.meta.url);
 
-    await loadRc(opts?.jshrc);
+    await loadRc(opts?.jshrc, mbApi);
 
     if (process.stdin.isTTY) {
         const historyFile = join(String($["HOME"] ?? homedir()), ".jsh_history");
@@ -123,7 +134,7 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
 let userSetPrompt = false;
 let continuationBuffer = ""; // accumulated buffer from previous lines for colorizer context
 
-async function loadRc(customPath?: string): Promise<void> {
+async function loadRc(customPath: string | undefined, mb: MbApi | null): Promise<void> {
     const rcPath = customPath
         ? resolve(customPath)
         : join(String($["HOME"] ?? homedir()), ".jshrc");
@@ -132,6 +143,7 @@ async function loadRc(customPath?: string): Promise<void> {
         $, setColorize, setTheme,
         alias, unalias, registerJsFunction, exec,
         complete: registerCompletion,
+        mb,
         setSuggestion: (fn: ((input: string) => Promise<string | null>) | null) => ui?.setSuggestion(fn),
         // Widgets — unified API for all rendered regions
         addWidget: (
