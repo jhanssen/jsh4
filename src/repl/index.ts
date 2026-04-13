@@ -23,6 +23,7 @@ import { startHandshake } from "../mb/handshake.js";
 import type { HandshakeResult } from "../mb/handshake.js";
 import { connectMb } from "../mb/client.js";
 import type { MbApi } from "../mb/client.js";
+import { APPLET_PERMISSIONS, ensureAppletOnDisk, appletLoadDisabled } from "../mb/applet.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
@@ -82,18 +83,34 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
     // land, `mbApi` flips from null to a live MbApi. Startup does not block.
     if (process.stdin.isTTY && process.stdout.isTTY && ui) {
         const theUi = ui;
-        // A credential provider fires a fresh OSC 58300 handshake and resolves
-        // with the applet's response. Used once at boot, and again on every WS
-        // reconnect (the applet consumes the nonce on first hello, so cached
-        // creds can't be replayed).
+        // Ship our own applet so jsh works out of the box under MB. Users who
+        // maintain their own applet can opt out via JSH_MB_NO_APPLET_LOAD=1.
+        const appletPath = appletLoadDisabled() ? null : ensureAppletOnDisk();
+
+        // A credential provider: either loads our bundled applet (first call
+        // after boot, or after WS reconnect when the applet may have unloaded)
+        // or just re-queries an existing applet. Fires a fresh OSC 58300
+        // handshake either way because the applet consumes the nonce on first
+        // hello — cached creds can't be replayed.
         let handshakeInFlight: Promise<HandshakeResult | null> | null = null;
+        let firstHandshake = true;
         const getCreds = (): Promise<HandshakeResult | null> => {
             if (handshakeInFlight) return handshakeInFlight;
+            const loadApplet = firstHandshake && appletPath
+                ? { path: appletPath, permissions: APPLET_PERMISSIONS }
+                : undefined;
+            firstHandshake = false;
             handshakeInFlight = new Promise<HandshakeResult | null>((resolve) => {
-                const listener = startHandshake((result) => {
-                    handshakeInFlight = null;
-                    resolve(result);
-                });
+                const listener = startHandshake(
+                    (result) => {
+                        handshakeInFlight = null;
+                        resolve(result);
+                    },
+                    {
+                        loadApplet,
+                        emit: (bytes) => native.inputWriteRaw(bytes),
+                    },
+                );
                 theUi.setEscResponseHandler((type, payload) => listener.handle(type, payload));
                 theUi.queueRawWrite(listener.queries);
             });

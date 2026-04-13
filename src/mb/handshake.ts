@@ -13,6 +13,22 @@ export interface HandshakeResult {
     nonce: string;
 }
 
+export interface HandshakeOptions {
+    /**
+     * If set, emit an OSC 58237 to load this applet file before firing the
+     * XTGETTCAP / OSC 58300 handshake. The shell proceeds to the handshake
+     * only after an ack with `status=loaded` arrives. Ack with denied/error,
+     * or no ack within the timeout, resolves null.
+     */
+    loadApplet?: { path: string; permissions: string };
+    /**
+     * Called when the handshake needs to emit follow-up bytes mid-stream
+     * (e.g. after the OSC 58237 load ack, the XTGETTCAP + OSC 58300 queries).
+     * Must write to stdout in raw mode — kernel echo must be off.
+     */
+    emit?: (bytes: string) => void;
+}
+
 export interface HandshakeListener {
     /** Feed a DCS or OSC payload from the native parser. */
     handle(type: "DCS" | "OSC", payload: string): void;
@@ -27,7 +43,8 @@ export interface HandshakeListener {
 }
 
 const XTGETTCAP_CAP = "mb-query-applet";
-const HANDSHAKE_TIMEOUT_MS = 5000;
+const APPLET_LOAD_OSC = 58237;
+const HANDSHAKE_TIMEOUT_MS = 30000; // user may be at a permission prompt
 
 function hexEncode(s: string): string {
     let out = "";
@@ -61,53 +78,83 @@ function parseAnnouncePayload(payload: string): { port: number; token: string } 
  */
 export function startHandshake(
     onResult: (result: HandshakeResult | null) => void,
+    options: HandshakeOptions = {},
     timeoutMs: number = HANDSHAKE_TIMEOUT_MS,
 ): HandshakeListener {
     const nonce = randomBytes(16).toString("hex");
     let resolved = false;
+    let stage: "load" | "handshake" = options.loadApplet ? "load" : "handshake";
 
-    const resolve = (r: HandshakeResult | null): void => {
+    const resolveOnce = (r: HandshakeResult | null): void => {
         if (resolved) return;
         resolved = true;
         clearTimeout(timer);
         onResult(r);
     };
 
-    const timer = setTimeout(() => resolve(null), timeoutMs);
+    const timer = setTimeout(() => resolveOnce(null), timeoutMs);
 
-    // Queries are emitted by the caller once raw mode is active. Writing them
-    // in cooked mode would let the kernel echo terminal responses back to the
-    // user as visible escape-sequence junk.
+    // XTGETTCAP + OSC 58300 queries — fire atomically once we know the applet
+    // is loaded (or immediately if no load step is requested).
     const probeQuery = `\x1bP+q${hexEncode(XTGETTCAP_CAP)}\x1b\\`;
     const announceQuery = `\x1b]${HANDSHAKE_OSC};query;nonce=${nonce}\x1b\\`;
-    const queries = probeQuery + announceQuery;
+    const handshakeQueries = probeQuery + announceQuery;
+
+    // Initial queries: either the OSC 58237 load request (and we wait for the
+    // ack before continuing), or the handshake queries directly.
+    const initialQueries = options.loadApplet
+        ? `\x1b]${APPLET_LOAD_OSC};applet;path=${options.loadApplet.path};permissions=${options.loadApplet.permissions}\x1b\\`
+        : handshakeQueries;
 
     return {
-        queries,
+        queries: initialQueries,
         handle(type: "DCS" | "OSC", payload: string): void {
             if (resolved) return;
 
-            if (type === "DCS") {
-                // XTGETTCAP responses: "1+r<hex>[=<hex>]" (supported) or
-                // "0+r<hex>" (unknown). Explicit "0+r" for our cap is a
-                // definitive "not MB" — resolve null early.
-                if (payload.startsWith("0+r")) resolve(null);
-                // "1+r" means MB detected. We don't resolve yet — waiting on
-                // the OSC 58300 reply with port+token from the applet.
+            if (type === "OSC") {
+                // OSC 58237 result ack: "58237;result;status=loaded|denied|error;..."
+                const loadPrefix = `${APPLET_LOAD_OSC};result;`;
+                if (stage === "load" && payload.startsWith(loadPrefix)) {
+                    const body = payload.substring(loadPrefix.length);
+                    const status = /status=([^;]+)/.exec(body)?.[1];
+                    if (status === "loaded") {
+                        stage = "handshake";
+                        options.emit?.(handshakeQueries);
+                        return;
+                    }
+                    if (status === "denied") {
+                        process.stderr.write("jsh: mb applet load denied (see MB allowlist)\n");
+                        resolveOnce(null);
+                        return;
+                    }
+                    if (status === "error") {
+                        const encoded = /error=([^;]*)/.exec(body)?.[1] ?? "";
+                        let msg = encoded;
+                        try { msg = decodeURIComponent(encoded); } catch { /* keep raw */ }
+                        process.stderr.write(`jsh: mb applet load error: ${msg || "(no detail)"}\n`);
+                        resolveOnce(null);
+                    }
+                    return;
+                }
+
+                // OSC 58300 handshake reply: "58300;port=N;token=T"
+                const hsPrefix = `${HANDSHAKE_OSC};`;
+                if (payload.startsWith(hsPrefix)) {
+                    const parsed = parseAnnouncePayload(payload.substring(hsPrefix.length));
+                    if (parsed) resolveOnce({ port: parsed.port, token: parsed.token, nonce });
+                }
                 return;
             }
 
-            if (type === "OSC") {
-                // Native parser strips the ESC ] and terminator; payload looks
-                // like "58300;port=N;token=T".
-                const prefix = `${HANDSHAKE_OSC};`;
-                if (!payload.startsWith(prefix)) return;
-                const parsed = parseAnnouncePayload(payload.substring(prefix.length));
-                if (parsed) resolve({ port: parsed.port, token: parsed.token, nonce });
+            if (type === "DCS") {
+                // XTGETTCAP responses: "1+r<hex>[=<hex>]" (supported) or
+                // "0+r<hex>" (unknown). Explicit "0+r" → definitively not MB.
+                if (payload.startsWith("0+r")) resolveOnce(null);
+                // "1+r" → MB detected; we still wait for the OSC 58300 reply.
             }
         },
         cancel(): void {
-            resolve(null);
+            resolveOnce(null);
         },
     };
 }

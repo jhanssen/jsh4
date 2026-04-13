@@ -258,24 +258,30 @@
 - [ ] **Move remaining builtins to object map** — `read`, `source`, `.`, `eval`, `trap`, `return`, `command`, `break`, `continue`, `fg`, `bg`, `jobs`, `wait`, `select`, `time` are handled as special cases in `executeSimple` instead of the `builtins` map. Causes duplicate builtin name lists (executor `BUILTIN_NAMES` set and completion `BUILTINS_LIST`).
 - [ ] **Arithmetic evaluation via `new Function()`** — Currently uses JS semantics, not POSIX arithmetic. Differences include floating-point instead of integer-only, JS operator precedence edge cases, and no integer overflow behavior. Consider a dedicated integer arithmetic evaluator for correctness.
 
-### MasterBandit bridge (productization)
+### MasterBandit bridge
 
-The bridge exists as a working proof-of-concept (`src/mb/`, `mb-applet/`). To take it from PoC to shipping feature:
+The bridge lives in `src/mb/` and `mb-applet/`. `@last` and `@claude` reference implementations live in user `~/.jshrc.js`.
 
-- [ ] **Native OSC/DCS parser in the input-engine.** Extend the raw-mode ESC handler in `src/native/input-engine.cc` to recognize `ESC P ... ESC\\|BEL` (DCS) and `ESC ] ... ESC\\|BEL` (OSC) responses during edit sessions. Route payloads to a JS callback instead of dropping them. Enables async handshake (no startup block), mid-session reconnect, and any future capability probes.
-- [ ] **Async handshake (fire-and-continue).** Replace the cooked-mode blocking probe in `src/mb/handshake.ts` with an immediate-send, parser-catches-later flow. `jsh.mb` is non-null once the DCS probe confirms MB; methods await WS readiness internally. No keystrokes lost at startup.
-- [ ] **Shell-carries-applet.** Embed the compiled `mb-applet/dist/applet.js` in jsh, write it to `$XDG_CACHE_HOME/jsh/shell-popup.js` at startup, send OSC 58237 to load it, parse the new `\e]58237;result;status=...\e\\` ack. Hash-based allowlist means first run prompts once, subsequent runs are silent. Today the applet must be pre-loaded externally.
-- [ ] **WS reconnect with backoff.** 250ms → 8s exponential. On stale port+token, schedule OSC 58300 re-query for the next edit session. Today WS drops leave `jsh.mb` permanently null until restart.
-- [ ] **Fork gate during reconnect.** Before `fork+exec`, if WS is reconnecting, wait briefly (configurable, sub-10ms default) for either live or final-timeout. Prevents PTY-race where unsolicited applet WS events could land while a non-shell child owns the terminal. Skip for AST nodes containing no externals.
-- [ ] **Per-call `jsh.mb.*` auto-await.** Every method (`createPopup`, `getLastCommand`, future ones) internally awaits WS readiness and rejects with a typed error on timeout. Caller code just uses `try/await`.
+#### Done
+
+- [x] **Native OSC/DCS parser in the input-engine.** `ESC P … ST|BEL` and `ESC ] … ST|BEL` during raw mode are collected in `readEscPayload` and dispatched to `onEscResponse`.
+- [x] **Async handshake (fire-and-continue).** `src/mb/handshake.ts` emits queries after raw mode engages and returns; responses land via the native parser during the first edit session. No startup block, no keystrokes lost.
+- [x] **Shell-carries-applet.** `src/mb/applet.ts` installs the applet tree to `$XDG_CACHE_HOME/jsh/` on startup, emits OSC 58237, awaits the `status=loaded` ack, then proceeds to the OSC 58300 handshake. Opt out with `JSH_MB_NO_APPLET_LOAD=1`. Denied/error acks surface to stderr.
+- [x] **WS reconnect with backoff.** 250ms → 8s exponential. Every reconnect triggers a fresh OSC 58300 handshake (applet consumes the nonce on first hello). Permanent failure sets `givenUp`; `mbApi` reference stays stable so `stateChanged` listeners keep working.
+- [x] **Per-call `jsh.mb.*` auto-await.** `createPopup` and `getLastCommand` internally await ready state with a 10s timeout and reject on timeout or give-up.
+- [x] **`stateChanged` event** on `MbApi` for prompt-widget reactivity.
+- [x] **Token-length validation** in MB's `createServer` (`mb-shell.<token>` must fit lws's 63-char protocol-name buffer).
+
+#### Next
+
+- [ ] **Fork gate during reconnect.** Before `fork+exec`, if a handshake is in flight, wait briefly (500ms default) for either ready or give-up. Narrow race — OSC 58300 response could land on a child's stdin if the user submits an external command between `connect()` and the response arriving. Skip for AST nodes that contain no externals.
 - [ ] **Popup lifecycle.** Fire-and-forget popups accumulate. Auto-close on next prompt / after N seconds / on focus-out; let the user opt out per-popup.
-- [ ] **Status indicator widget.** A built-in header/footer widget users can add that reflects `jsh.mb.connected`. Right now there's no visible signal when the bridge is up.
+- [ ] **Status indicator widget.** A built-in header/footer widget users can add that reflects `jsh.mb.connected`, reacting to `stateChanged`. Snippet exists in `.jshrc` examples; ship a first-class version.
 - [ ] **Types sync.** `mb-applet/types/mb.d.ts` is a manual copy. Publish `@masterbandit/types` from the MB repo (or script a sync), so `npm install` pulls the latest and breakage is caught at build time.
-- [ ] **Permission narrowing.** Applet currently requests the full `shell` group. Drop to the specific bits actually used (`shell.write`, `shell.commands`). Smaller attack surface, clearer audit.
+- [ ] **Permission narrowing.** Applet currently requests `ui,io.inject,shell,net.listen.local`. Drop `shell` → `shell.write,shell.commands`. Audit any future additions.
 - [ ] **Bridge tests.** No coverage today for the handshake, protocol, or WS client. A `node-pty` + spawned-MB integration test would catch regressions; non-trivial to set up but essential for ship.
-- [ ] **Secrets for `@claude`-style features.** macOS Keychain load in `.jshrc` (first-class helper rather than a copy-paste snippet) so users don't end up with plaintext API keys in rc files.
-- [ ] **`@last` ergonomics.** Flags: `@last 3` (last N), `@last err` (failures only), `@last --json`. Currently only bare `@last` is wired in user `.jshrc`.
-- [ ] **`@claude` configurability.** Model, max_tokens, system prompt as jshrc config rather than hardcoded.
+- [ ] **`@last` / `@claude` ergonomics.** Flags (`@last 3`, `@last err`, `@last --json`); `@claude` model/system/max_tokens as jshrc config rather than hardcoded; Keychain helper for secrets (`jsh.env.ANTHROPIC_API_KEY` wiring to `security find-generic-password` on macOS).
+- [ ] **`jsh.export(name, value)` / `jsh.env.X` sugar** — write to both the shell variable store and `process.env` in one call. Most jshrc env-setting is one-shot at startup, but the ergonomics matter.
 
 ### Completion
 

@@ -165,6 +165,29 @@ class MbClient implements MbApi {
         return this.readyPromise;
     }
 
+    /**
+     * Wait until the WS is ready, or fail. Returns immediately if already
+     * connected. Rejects if we've given up, or if `timeoutMs` elapses.
+     */
+    private async awaitReady(timeoutMs: number = 10000): Promise<void> {
+        if (this.ready) return;
+        if (this.givenUp) throw new Error("mb: connection permanently unavailable");
+        await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.stateListeners.delete(listener);
+                reject(new Error("mb: timeout waiting for connection"));
+            }, timeoutMs);
+            const listener: MbStateListener = (connected) => {
+                if (connected) {
+                    clearTimeout(timer);
+                    this.stateListeners.delete(listener);
+                    resolve();
+                }
+            };
+            this.stateListeners.add(listener);
+        });
+    }
+
     private send(msg: ClientMessage): void {
         if (!this.ws) return;
         this.ws.send(JSON.stringify(msg));
@@ -209,7 +232,7 @@ class MbClient implements MbApi {
     }
 
     async createPopup(opts: CreatePopupOptions): Promise<PopupHandle> {
-        if (!this.ready) throw new Error("mb client not ready");
+        await this.awaitReady();
         const reqId = this.nextReqId++;
         const idPromise = new Promise<string>((resolve, reject) => {
             this.pending.set(reqId, {
@@ -225,7 +248,7 @@ class MbClient implements MbApi {
     }
 
     async getLastCommand(): Promise<LastCommand | null> {
-        if (!this.ready) throw new Error("mb client not ready");
+        await this.awaitReady();
         const reqId = this.nextReqId++;
         const p = new Promise<LastCommand | null>((resolve, reject) => {
             this.pending.set(reqId, {
