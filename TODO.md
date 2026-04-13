@@ -258,6 +258,25 @@
 - [ ] **Move remaining builtins to object map** — `read`, `source`, `.`, `eval`, `trap`, `return`, `command`, `break`, `continue`, `fg`, `bg`, `jobs`, `wait`, `select`, `time` are handled as special cases in `executeSimple` instead of the `builtins` map. Causes duplicate builtin name lists (executor `BUILTIN_NAMES` set and completion `BUILTINS_LIST`).
 - [ ] **Arithmetic evaluation via `new Function()`** — Currently uses JS semantics, not POSIX arithmetic. Differences include floating-point instead of integer-only, JS operator precedence edge cases, and no integer overflow behavior. Consider a dedicated integer arithmetic evaluator for correctness.
 
+### MasterBandit bridge (productization)
+
+The bridge exists as a working proof-of-concept (`src/mb/`, `mb-applet/`). To take it from PoC to shipping feature:
+
+- [ ] **Native OSC/DCS parser in the input-engine.** Extend the raw-mode ESC handler in `src/native/input-engine.cc` to recognize `ESC P ... ESC\\|BEL` (DCS) and `ESC ] ... ESC\\|BEL` (OSC) responses during edit sessions. Route payloads to a JS callback instead of dropping them. Enables async handshake (no startup block), mid-session reconnect, and any future capability probes.
+- [ ] **Async handshake (fire-and-continue).** Replace the cooked-mode blocking probe in `src/mb/handshake.ts` with an immediate-send, parser-catches-later flow. `jsh.mb` is non-null once the DCS probe confirms MB; methods await WS readiness internally. No keystrokes lost at startup.
+- [ ] **Shell-carries-applet.** Embed the compiled `mb-applet/dist/applet.js` in jsh, write it to `$XDG_CACHE_HOME/jsh/shell-popup.js` at startup, send OSC 58237 to load it, parse the new `\e]58237;result;status=...\e\\` ack. Hash-based allowlist means first run prompts once, subsequent runs are silent. Today the applet must be pre-loaded externally.
+- [ ] **WS reconnect with backoff.** 250ms → 8s exponential. On stale port+token, schedule OSC 58300 re-query for the next edit session. Today WS drops leave `jsh.mb` permanently null until restart.
+- [ ] **Fork gate during reconnect.** Before `fork+exec`, if WS is reconnecting, wait briefly (configurable, sub-10ms default) for either live or final-timeout. Prevents PTY-race where unsolicited applet WS events could land while a non-shell child owns the terminal. Skip for AST nodes containing no externals.
+- [ ] **Per-call `jsh.mb.*` auto-await.** Every method (`createPopup`, `getLastCommand`, future ones) internally awaits WS readiness and rejects with a typed error on timeout. Caller code just uses `try/await`.
+- [ ] **Popup lifecycle.** Fire-and-forget popups accumulate. Auto-close on next prompt / after N seconds / on focus-out; let the user opt out per-popup.
+- [ ] **Status indicator widget.** A built-in header/footer widget users can add that reflects `jsh.mb.connected`. Right now there's no visible signal when the bridge is up.
+- [ ] **Types sync.** `mb-applet/types/mb.d.ts` is a manual copy. Publish `@masterbandit/types` from the MB repo (or script a sync), so `npm install` pulls the latest and breakage is caught at build time.
+- [ ] **Permission narrowing.** Applet currently requests the full `shell` group. Drop to the specific bits actually used (`shell.write`, `shell.commands`). Smaller attack surface, clearer audit.
+- [ ] **Bridge tests.** No coverage today for the handshake, protocol, or WS client. A `node-pty` + spawned-MB integration test would catch regressions; non-trivial to set up but essential for ship.
+- [ ] **Secrets for `@claude`-style features.** macOS Keychain load in `.jshrc` (first-class helper rather than a copy-paste snippet) so users don't end up with plaintext API keys in rc files.
+- [ ] **`@last` ergonomics.** Flags: `@last 3` (last N), `@last err` (failures only), `@last --json`. Currently only bare `@last` is wired in user `.jshrc`.
+- [ ] **`@claude` configurability.** Model, max_tokens, system prompt as jshrc config rather than hardcoded.
+
 ### Completion
 
 - [ ] **Bash completion compat shim** — Implement `compgen`, `complete`, `compopt` builtins and `COMP_WORDS`/`COMP_CWORD`/`COMP_LINE`/`COMP_POINT`/`COMPREPLY` variables so bash completion scripts (e.g. `git-completion.bash`) can be eval'd directly, similar to zsh's approach. jsh already has arrays, `${var%%pat}`, `${var:offset:len}`, and `declare`. Missing pieces: `compgen -W/-f/-d`, `compopt -o nospace`, `declare -F`, and the `COMP_*` ↔ `jsh.complete()` bridge.

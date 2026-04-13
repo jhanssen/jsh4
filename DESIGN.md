@@ -37,7 +37,7 @@ A POSIX-compatible interactive shell with JavaScript as the extension language.
 │  │             └─────────────────┘       │  │
 │  └───────────────────────────────────────┘  │
 │                                              │
-│  linenoise (non-blocking, uv_poll on stdin)  │
+│  InputEngine (raw termios, uv_poll on stdin) │
 └──────────────────────────────────────────────┘
 ```
 
@@ -113,7 +113,15 @@ Features:
 
 **5. JS Runtime / .jshrc**
 
-`.jshrc` is an ES module loaded at startup via dynamic `import()`. Exported functions are automatically registered as `@` pipeline functions. The `jsh` global object provides the shell API. Custom path via `jsh --jshrc /path/to/file.mjs`.
+The rc file is an ES module loaded at startup via dynamic `import()`. Exported functions are automatically registered as `@` pipeline functions. The `jsh` global object provides the shell API.
+
+Lookup order (first match wins):
+1. `jsh --jshrc /path/to/file` — explicit override
+2. `~/.jshrc.ts` — Node 22.7+ with `--experimental-strip-types`, unflagged on 23.6+/24
+3. `~/.jshrc.js`
+4. `~/.jshrc`
+
+Bare imports from the rc file resolve first via Node's default walk-up from the rc file's directory, then fall back to `$XDG_DATA_HOME/jsh/node_modules/` (default `~/.local/share/jsh/node_modules/`). This lets users install rc dependencies in an XDG data dir without polluting `~/node_modules`.
 
 ```js
 // ~/.jshrc
@@ -263,7 +271,7 @@ Options:
 Main thread (Node event loop):
   - JS execution (.jshrc, @functions, completions, timers)
   - TypeScript executor (AST walking, expansion, builtin dispatch)
-  - linenoise (non-blocking, fed by uv_poll on stdin fd)
+  - Custom InputEngine (native, non-blocking via uv_poll on stdin fd)
   - Promise resolution callbacks from executor thread (via TSFN)
 
 Executor thread (C++):
@@ -434,3 +442,85 @@ JS functions map to exit codes as follows:
 `set -e` (errexit), `set -u` (nounset), `set -x` (xtrace), and `set -o pipefail` are implemented. `pipefail` uses the rightmost non-zero exit code from `$PIPESTATUS`; `errexit` aborts on non-zero exit in list context.
 
 `$PIPESTATUS` is an array holding the exit code of each stage in the most recent pipeline. Access elements with `${PIPESTATUS[n]}` or all with `${PIPESTATUS[@]}`.
+
+---
+
+## MasterBandit Integration
+
+When jsh runs inside [MasterBandit](https://github.com/jhanssen/MasterBandit), the `jsh.mb` API exposes popup creation, captured command records (OSC 133), and other MB-hosted features. Bridging uses a WebSocket to an applet loaded into MB's script engine.
+
+### Architecture
+
+```
+┌─ jsh (TypeScript + native) ─┐         ┌─ MB (C++) ─────────────────┐
+│                              │   OSC   │                             │
+│  XTGETTCAP / OSC 58300 ─────────query──▶  terminal emulator          │
+│                                ─reply──   ↓                          │
+│                              │         │  script engine              │
+│                              │         │   ↓                         │
+│                              │         │  mb-applet.js ─┐            │
+│                              │   WS    │                │            │
+│  jsh.mb.* API  ◀────────────────mb-shell.<token>─ applet WS server   │
+│                              │         │                             │
+└──────────────────────────────┘         └─────────────────────────────┘
+```
+
+Two sides maintained in this repo:
+
+- `src/mb/` — shell-side client: capability probe, WS client, `jsh.mb` surface.
+- `mb-applet/` — the applet loaded into MB. Creates the WS server, serves popup/command-record requests, pushes async events.
+
+MB's scripting types are tracked at `mb-applet/types/mb.d.ts` (copied from the MB repo; sync manually when the API changes).
+
+### Handshake
+
+All PTY escape-sequence traffic is shell-initiated; the applet only writes to the PTY in direct response to an OSC query. This removes every race involving foreground children.
+
+1. **Capability probe** — `DCS + q <hex("mb-query-applet")> ST`. If the terminal replies `1+r...`, we're inside an MB instance that advertises applet support.
+2. **Announce query** — `OSC 58300 ; query ; nonce=<hex> ST`. The applet records `nonce → pane`, replies on the pane's PTY with `OSC 58300 ; port=N ; token=T ST`. Token is shared across shells; the nonce is the per-connection pane proof.
+3. **WS connect** — `ws://127.0.0.1:<port>` with `Sec-WebSocket-Protocol: mb-shell.<token>`. First frame: `{type:"hello", nonce}`. Applet binds connection → pane, replies `{type:"ready"}`.
+
+The probe is non-blocking: jsh fires the DCS and OSC queries at startup and proceeds straight to the prompt. Responses arrive on stdin and are consumed by the native input engine's OSC/DCS parser during the first edit session. When both responses have landed and the WS is open, `jsh.mb` transitions from its initial pending state to live.
+
+### Transport rules
+
+- **Applet → shell, via PTY**: only inside `pane.addEventListener("osc:58300", ...)` handlers. Never elsewhere. Enforced by convention in `mb-applet/src/applet.ts`.
+- **Applet → shell, via WS**: any time the WS is open. `popupClosed`, `commandComplete`, resize events, applet-shutdown notifications, etc.
+- **Shell → applet, via PTY**: only `OSC 58300` queries, emitted while raw mode is active (edit session).
+- **Shell → applet, via WS**: all request/response API calls (`createPopup`, `getLastCommand`, `quiet`, etc.).
+
+The constraint keeps the PTY race-free: escape sequences only flow when jsh is actively reading stdin, never when a foreground child owns the TTY.
+
+### Reconnect
+
+If the WS drops (applet reload, MB restart), jsh attempts reconnect with exponential backoff (250ms → 8s). If the cached port+token is stale, the reconnect fails; jsh schedules a fresh `OSC 58300` query for the next edit session. When the response arrives, WS is re-established with the new credentials.
+
+Two mechanisms interact during reconnect:
+
+1. **Fork gate** — on Enter, if any external command is about to be forked and WS is reconnecting, jsh waits briefly (sub-10ms typical) for either WS live or a timeout verdict before calling `fork+exec`. This is a PTY-race defense only: it ensures unsolicited WS events from the applet don't arrive while a non-shell foreground child owns the TTY. Builtins, shell functions, and `@` functions run in-process — they don't take the foreground, so the gate is skipped for AST nodes that contain no externals.
+2. **Per-call await** — every `jsh.mb.*` method internally awaits WS readiness. `@` functions that call `jsh.mb.getLastCommand()` or `jsh.mb.createPopup()` still block on the live connection; they just don't trigger the fork gate. If the reconnect attempt times out, the method rejects with a typed error, which the caller can catch.
+
+### API shape
+
+```ts
+interface MbApi {
+    readonly connected: boolean;
+    createPopup(opts: {x, y, w, h}): Promise<PopupHandle>;
+    getLastCommand(): Promise<LastCommand | null>;
+    // ...
+}
+
+declare const jsh: {
+    mb: MbApi | null;  // null iff not under MB (probe negative). Stable per session.
+};
+```
+
+- `jsh.mb === null` → not under MB. Final verdict for the session.
+- `jsh.mb` exists → we're under MB. WS may or may not currently be connected; API methods internally await reconnect, reject with a typed error if the current attempt times out.
+- `jsh.mb.connected` → synchronous fast-check for UI (prompt widgets, status indicators).
+
+No separate `ready` promise; failure surfaces through the method calls themselves.
+
+### Non-interactive mode
+
+The MB bridge is an interactive-mode feature. When jsh runs a script (stdin is not a TTY), no probe fires, no applet is queried, and `jsh.mb` is `null`. Scripts pay zero MB overhead.
