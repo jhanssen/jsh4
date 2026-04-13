@@ -6,6 +6,14 @@ import { WebSocket } from "ws";
 import type { ClientMessage, ServerMessage, LastCommand } from "./protocol.js";
 import type { HandshakeResult } from "./handshake.js";
 
+/**
+ * Produces fresh credentials for a new WS connection. Each call fires a fresh
+ * OSC 58300 handshake, returning new port+token+nonce when the applet replies,
+ * or null on timeout / MB gone. A cached nonce cannot be reused — the applet
+ * consumes it on the first `hello`.
+ */
+export type CredentialProvider = () => Promise<HandshakeResult | null>;
+
 export interface CreatePopupOptions {
     x: number;
     y: number;
@@ -35,49 +43,100 @@ interface PendingRequest {
     reject: (err: Error) => void;
 }
 
+const RECONNECT_BASE_MS = 250;
+const RECONNECT_MAX_MS = 8000;
+
 class MbClient implements MbApi {
-    private ws: WebSocket;
+    private ws: WebSocket | null = null;
     private ready = false;
     private nextReqId = 1;
     private pending = new Map<number, PendingRequest>();
     private popups = new Map<string, PopupImpl>();
     private readyPromise: Promise<void>;
+    private readyResolve!: () => void;
+    private readyReject!: (err: Error) => void;
     private stateListeners = new Set<MbStateListener>();
+    private getCreds: CredentialProvider;
+    private shuttingDown = false;
+    private reconnectAttempts = 0;
+    private givenUp = false;
 
-    constructor(handshakeResult: HandshakeResult) {
-        const { port, token, nonce } = handshakeResult;
-        this.ws = new WebSocket(`ws://127.0.0.1:${port}`, [`mb-shell.${token}`]);
-
-        this.readyPromise = new Promise((resolve, reject) => {
-            this.ws.once("open", () => {
-                this.send({ type: "hello", nonce });
-            });
-            this.ws.once("error", (err) => {
-                if (!this.ready) reject(err);
-            });
-            this.ws.on("message", (data) => {
-                const text = typeof data === "string" ? data : data.toString("utf8");
-                let msg: ServerMessage;
-                try {
-                    msg = JSON.parse(text) as ServerMessage;
-                } catch {
-                    return;
-                }
-                if (msg.type === "ready") {
-                    this.setReady(true);
-                    resolve();
-                    return;
-                }
-                this.handleMessage(msg);
-            });
-            this.ws.on("close", () => {
-                this.setReady(false);
-                for (const p of this.pending.values()) p.reject(new Error("ws closed"));
-                this.pending.clear();
-                for (const popup of this.popups.values()) popup._markClosed();
-                this.popups.clear();
-            });
+    constructor(initial: HandshakeResult, getCreds: CredentialProvider) {
+        this.getCreds = getCreds;
+        this.readyPromise = new Promise<void>((resolve, reject) => {
+            this.readyResolve = resolve;
+            this.readyReject = reject;
         });
+        this.connect(initial);
+    }
+
+    private connect(creds: HandshakeResult): void {
+        if (this.shuttingDown) return;
+        const { port, token, nonce } = creds;
+        const ws = new WebSocket(`ws://127.0.0.1:${port}`, [`mb-shell.${token}`]);
+        this.ws = ws;
+
+        ws.once("open", () => this.send({ type: "hello", nonce }));
+
+        ws.once("error", (err) => {
+            // Initial attempt only: propagate to readyPromise if we're not ready
+            // and have never been. After the first successful connect, errors
+            // feed into the reconnect path via the close handler.
+            if (!this.ready && this.reconnectAttempts === 0) this.readyReject(err);
+        });
+
+        ws.on("message", (data) => {
+            const text = typeof data === "string" ? data : data.toString("utf8");
+            let msg: ServerMessage;
+            try {
+                msg = JSON.parse(text) as ServerMessage;
+            } catch {
+                return;
+            }
+            if (msg.type === "ready") {
+                this.reconnectAttempts = 0;
+                this.setReady(true);
+                this.readyResolve();
+                return;
+            }
+            this.handleMessage(msg);
+        });
+
+        ws.on("close", () => {
+            this.setReady(false);
+            // Drop in-flight request promises; callers can retry.
+            for (const p of this.pending.values()) p.reject(new Error("ws closed"));
+            this.pending.clear();
+            // Popups were owned by the previous connection; mark them closed.
+            for (const popup of this.popups.values()) popup._markClosed();
+            this.popups.clear();
+            this.ws = null;
+            if (!this.shuttingDown && !this.givenUp) this.scheduleReconnect();
+        });
+    }
+
+    private async scheduleReconnect(): Promise<void> {
+        if (this.shuttingDown || this.givenUp) return;
+        this.reconnectAttempts++;
+        const delay = Math.min(RECONNECT_BASE_MS * 2 ** (this.reconnectAttempts - 1), RECONNECT_MAX_MS);
+        await new Promise((r) => setTimeout(r, delay));
+        if (this.shuttingDown || this.givenUp) return;
+
+        // Always re-handshake: the applet consumed the previous nonce on its
+        // first `hello`. A stale cached nonce would be rejected.
+        const fresh = await this.getCreds();
+        if (this.shuttingDown) return;
+        if (!fresh) {
+            // Handshake timed out — MB gone. Stop retrying.
+            this.givenUp = true;
+            return;
+        }
+        this.connect(fresh);
+    }
+
+    close(): void {
+        this.shuttingDown = true;
+        if (this.ws) this.ws.close();
     }
 
     private setReady(value: boolean): void {
@@ -107,6 +166,7 @@ class MbClient implements MbApi {
     }
 
     private send(msg: ClientMessage): void {
+        if (!this.ws) return;
         this.ws.send(JSON.stringify(msg));
     }
 
@@ -224,9 +284,12 @@ class PopupImpl implements PopupHandle {
     }
 }
 
-export async function connectMb(handshakeResult: HandshakeResult): Promise<MbApi | null> {
+export async function connectMb(
+    initial: HandshakeResult,
+    getCreds: CredentialProvider,
+): Promise<MbApi | null> {
     try {
-        const client = new MbClient(handshakeResult);
+        const client = new MbClient(initial, getCreds);
         await client.waitReady();
         return client;
     } catch (e) {

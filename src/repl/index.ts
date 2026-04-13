@@ -20,6 +20,7 @@ import type { WidgetHandle, WidgetZone, WidgetOptions } from "../terminal/index.
 import { colors, makeFgColor, makeBgColor, makeUlColor, style } from "../terminal/colors.js";
 import type { JsPipelineFunction } from "../jsfunctions/index.js";
 import { startHandshake } from "../mb/handshake.js";
+import type { HandshakeResult } from "../mb/handshake.js";
 import { connectMb } from "../mb/client.js";
 import type { MbApi } from "../mb/client.js";
 
@@ -80,15 +81,31 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
     // first (or later) edit session and hands them to the listener. When both
     // land, `mbApi` flips from null to a live MbApi. Startup does not block.
     if (process.stdin.isTTY && process.stdout.isTTY && ui) {
-        const listener = startHandshake((result) => {
-            if (!result) return; // not under MB, or timeout — mbApi stays null
-            connectMb(result).then((client) => {
+        const theUi = ui;
+        // A credential provider fires a fresh OSC 58300 handshake and resolves
+        // with the applet's response. Used once at boot, and again on every WS
+        // reconnect (the applet consumes the nonce on first hello, so cached
+        // creds can't be replayed).
+        let handshakeInFlight: Promise<HandshakeResult | null> | null = null;
+        const getCreds = (): Promise<HandshakeResult | null> => {
+            if (handshakeInFlight) return handshakeInFlight;
+            handshakeInFlight = new Promise<HandshakeResult | null>((resolve) => {
+                const listener = startHandshake((result) => {
+                    handshakeInFlight = null;
+                    resolve(result);
+                });
+                theUi.setEscResponseHandler((type, payload) => listener.handle(type, payload));
+                theUi.queueRawWrite(listener.queries);
+            });
+            return handshakeInFlight;
+        };
+        // Kick off initial detection in the background.
+        getCreds().then((initial) => {
+            if (!initial) return;
+            connectMb(initial, getCreds).then((client) => {
                 if (client) mbApi = client;
             });
         });
-        ui.setEscResponseHandler((type, payload) => listener.handle(type, payload));
-        // Emit queries on the first edit session (after raw mode engages).
-        ui.queueRawWrite(listener.queries);
     }
 
     // Register ESM loader hook so jshrc files can `import ... from 'jsh/...'`.
