@@ -52,6 +52,50 @@ export function expandHistory(input: string): string | null {
             continue;
         }
 
+        // Skip double-quoted regions (history expansion in double quotes is
+        // allowed by some shells but jsh doesn't need it and it breaks JS
+        // string literals inside @{ } blocks).
+        if (input[i] === '"') {
+            let j = i + 1;
+            while (j < input.length) {
+                if (input[j] === "\\" && j + 1 < input.length) { j += 2; continue; }
+                if (input[j] === '"') { j++; break; }
+                j++;
+            }
+            result += input.slice(i, j);
+            i = j;
+            continue;
+        }
+
+        // Skip @{ ... } and @!{ ... } JS inline blocks — JavaScript, not shell.
+        if (input[i] === "@" && i + 1 < input.length &&
+            (input[i + 1] === "{" ||
+             (input[i + 1] === "!" && i + 2 < input.length && input[i + 2] === "{"))) {
+            const openLen = input[i + 1] === "!" ? 3 : 2;
+            let j = i + openLen;
+            let depth = 1;
+            while (j < input.length && depth > 0) {
+                const ch = input[j]!;
+                if (ch === "\\" && j + 1 < input.length) { j += 2; continue; }
+                if (ch === "'" || ch === '"' || ch === "`") {
+                    const q = ch;
+                    j++;
+                    while (j < input.length) {
+                        if (input[j] === "\\" && j + 1 < input.length) { j += 2; continue; }
+                        if (input[j] === q) { j++; break; }
+                        j++;
+                    }
+                    continue;
+                }
+                if (ch === "{") depth++;
+                else if (ch === "}") depth--;
+                j++;
+            }
+            result += input.slice(i, j);
+            i = j;
+            continue;
+        }
+
         // Skip escaped !
         if (input[i] === "\\" && i + 1 < input.length && input[i + 1] === "!") {
             result += "!";

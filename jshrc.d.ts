@@ -134,9 +134,26 @@ interface MbPopupHandle {
     onClose(fn: () => void): void;
 }
 
+interface MbLastCommand {
+    id: number;
+    command: string;
+    output: string;
+    cwd: string;
+    exitCode: number | null;
+    startMs: number;
+    endMs: number;
+}
+
 interface MbApi {
     /** Create a popup on the shell's pane. Resolves once MB confirms creation. */
     createPopup(opts: { x: number; y: number; w: number; h: number }): Promise<MbPopupHandle>;
+    /**
+     * Fetch the most recently completed command on this pane (as recorded by
+     * MB via OSC 133 markers). Resolves with `null` if there isn't one yet.
+     * Requires the mb-applet to have been loaded with the `shell.commands`
+     * permission.
+     */
+    getLastCommand(): Promise<MbLastCommand | null>;
     /** True while the WS connection to the applet is live. */
     readonly connected: boolean;
 }

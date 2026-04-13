@@ -1,7 +1,7 @@
 import { createRequire, register } from "node:module";
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { parse, IncompleteInputError } from "../parser/index.js";
 import { execute, executeString, setCommandText, reapJobs, hasShellFunction } from "../executor/index.js";
 import { $ } from "../variables/index.js";
@@ -12,6 +12,7 @@ import {
 import { getCompletions } from "../completion/index.js";
 import { colorize, getCurrentTheme, registerCommandExists, getResolvedColor } from "../colorize/index.js";
 import { commandExists } from "../completion/index.js";
+import { lookupJsFunction } from "../jsfunctions/index.js";
 import { runTrap } from "../trap/index.js";
 import { addHistoryEntry, expandHistory } from "../history/index.js";
 import { TerminalUI } from "../terminal/index.js";
@@ -59,6 +60,11 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         if (commandExists(name)) return true;
         if (getAlias(name) !== undefined) return true;
         if (hasShellFunction(name)) return true;
+        // @name / @!name pipeline functions — strip the sigil(s) before lookup.
+        if (name.startsWith("@")) {
+            const bare = name.startsWith("@!") ? name.slice(2) : name.slice(1);
+            if (bare && lookupJsFunction(bare) !== undefined) return true;
+        }
         return false;
     });
 
@@ -135,9 +141,16 @@ let userSetPrompt = false;
 let continuationBuffer = ""; // accumulated buffer from previous lines for colorizer context
 
 async function loadRc(customPath: string | undefined, mb: MbApi | null): Promise<void> {
-    const rcPath = customPath
-        ? resolve(customPath)
-        : join(String($["HOME"] ?? homedir()), ".jshrc");
+    let rcPath: string | undefined;
+    if (customPath) {
+        rcPath = resolve(customPath);
+    } else {
+        const home = String($["HOME"] ?? homedir());
+        for (const name of [".jshrc.ts", ".jshrc.js", ".jshrc"]) {
+            const candidate = join(home, name);
+            if (existsSync(candidate)) { rcPath = candidate; break; }
+        }
+    }
 
     const jshApi = {
         $, setColorize, setTheme,
@@ -170,6 +183,8 @@ async function loadRc(customPath: string | undefined, mb: MbApi | null): Promise
     };
     (globalThis as Record<string, unknown>)["jsh"] = jshApi;
 
+    if (!rcPath) return;
+
     try {
         const rc = await import(rcPath);
         for (const [name, value] of Object.entries(rc)) {
@@ -179,17 +194,10 @@ async function loadRc(customPath: string | undefined, mb: MbApi | null): Promise
             }
         }
     } catch (e: unknown) {
-        const code = (e as NodeJS.ErrnoException)?.code;
-        // Only silence ERR_MODULE_NOT_FOUND when it's the jshrc file itself that's missing,
-        // not when a module imported *by* the jshrc can't be found.
-        if (code === "ERR_MODULE_NOT_FOUND") {
-            const msg = (e as Error).message ?? "";
-            if (!msg.includes(rcPath)) {
-                process.stderr.write(`jsh: .jshrc: ${msg}\n`);
-            }
-        } else {
-            process.stderr.write(`jsh: .jshrc: ${e instanceof Error ? e.message : e}\n`);
-        }
+        // rcPath was confirmed to exist (or provided explicitly by --jshrc), so
+        // any ERR_MODULE_NOT_FOUND here is a *dependency* the rc file imports.
+        // Always surface.
+        process.stderr.write(`jsh: .jshrc: ${e instanceof Error ? e.message : e}\n`);
     }
 }
 

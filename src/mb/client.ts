@@ -3,7 +3,7 @@
 // successful handshake().
 
 import { WebSocket } from "ws";
-import type { ClientMessage, ServerMessage } from "./protocol.js";
+import type { ClientMessage, ServerMessage, LastCommand } from "./protocol.js";
 import type { HandshakeResult } from "./handshake.js";
 
 export interface CreatePopupOptions {
@@ -22,11 +22,12 @@ export interface PopupHandle {
 
 export interface MbApi {
     createPopup(opts: CreatePopupOptions): Promise<PopupHandle>;
+    getLastCommand(): Promise<LastCommand | null>;
     readonly connected: boolean;
 }
 
 interface PendingRequest {
-    resolve: (id: string) => void;
+    resolve: (value: unknown) => void;
     reject: (err: Error) => void;
 }
 
@@ -95,6 +96,14 @@ class MbClient implements MbApi {
             }
             return;
         }
+        if (msg.type === "lastCommandResult") {
+            const p = this.pending.get(msg.reqId);
+            if (p) {
+                this.pending.delete(msg.reqId);
+                p.resolve(msg.command);
+            }
+            return;
+        }
         if (msg.type === "popupClosed") {
             const popup = this.popups.get(msg.id);
             if (popup) {
@@ -120,13 +129,29 @@ class MbClient implements MbApi {
         if (!this.ready) throw new Error("mb client not ready");
         const reqId = this.nextReqId++;
         const idPromise = new Promise<string>((resolve, reject) => {
-            this.pending.set(reqId, { resolve, reject });
+            this.pending.set(reqId, {
+                resolve: (v) => resolve(v as string),
+                reject,
+            });
         });
         this.send({ type: "createPopup", reqId, ...opts });
         const id = await idPromise;
         const popup = new PopupImpl(this, id);
         this.popups.set(id, popup);
         return popup;
+    }
+
+    async getLastCommand(): Promise<LastCommand | null> {
+        if (!this.ready) throw new Error("mb client not ready");
+        const reqId = this.nextReqId++;
+        const p = new Promise<LastCommand | null>((resolve, reject) => {
+            this.pending.set(reqId, {
+                resolve: (v) => resolve(v as LastCommand | null),
+                reject,
+            });
+        });
+        this.send({ type: "getLastCommand", reqId });
+        return p;
     }
 
     _writePopup(id: string, data: string): void {

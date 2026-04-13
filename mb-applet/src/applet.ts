@@ -113,6 +113,27 @@ function handleMessage(conn: MbWsConnection, state: ConnState, raw: string | Arr
             if (popup) popup.close();
             break;
         }
+        case "getLastCommand": {
+            const cmd = state.pane.lastCommand;
+            if (!cmd) {
+                send(conn, { type: "lastCommandResult", reqId: msg.reqId, command: null });
+                break;
+            }
+            send(conn, {
+                type: "lastCommandResult",
+                reqId: msg.reqId,
+                command: {
+                    id: cmd.id,
+                    command: cmd.command,
+                    output: cmd.output,
+                    cwd: cmd.cwd,
+                    exitCode: cmd.exitCode,
+                    startMs: cmd.startMs,
+                    endMs: cmd.endMs,
+                },
+            });
+            break;
+        }
     }
 }
 
