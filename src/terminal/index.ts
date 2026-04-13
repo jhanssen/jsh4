@@ -32,6 +32,7 @@ interface NativeInputEngine {
         onRender: (state: InputState) => void;
         onLine: (line: string | null, errno?: number) => void;
         onCompletion?: (input: string) => string[] | Promise<string[]> | unknown;
+        onEscResponse?: (type: "DCS" | "OSC", payload: string) => void;
     }) => void;
     inputStop: () => void;
     inputGetCols: () => number;
@@ -65,6 +66,8 @@ export class TerminalUI {
     private lastRenderedInputLines: string[] = []; // cached from last renderFrame for onLine reuse
     private editing = false; // true while an editing session is active
     private suggestionColor = "\x1b[2m"; // default: dim
+    private escResponseFn: ((type: "DCS" | "OSC", payload: string) => void) | null = null;
+    private pendingRawWrite: string | null = null;
 
     constructor(native: NativeInputEngine) {
         this.native = native;
@@ -126,7 +129,36 @@ export class TerminalUI {
                     return texts;
                 }
                 : undefined,
+            onEscResponse: this.escResponseFn
+                ? (type: "DCS" | "OSC", payload: string) => this.escResponseFn!(type, payload)
+                : undefined,
         });
+
+        // Flush any pending raw writes (e.g. MB handshake queries) now that
+        // raw mode is active and kernel echo is off.
+        if (this.pendingRawWrite) {
+            this.native.inputWriteRaw(this.pendingRawWrite);
+            this.pendingRawWrite = null;
+        }
+    }
+
+    /**
+     * Register a handler for DCS and OSC responses arriving on stdin during
+     * raw-mode edit sessions. Takes effect on the next `start()`. Pass null
+     * to clear. Used by the MB bridge for XTGETTCAP + handshake responses.
+     */
+    setEscResponseHandler(fn: ((type: "DCS" | "OSC", payload: string) => void) | null): void {
+        this.escResponseFn = fn;
+    }
+
+    /**
+     * Queue bytes to write to the terminal on the next edit session *after*
+     * raw mode is enabled. Used to emit queries whose responses should not be
+     * kernel-echoed back to the user (e.g. XTGETTCAP, OSC handshake).
+     * Cleared after a single flush.
+     */
+    queueRawWrite(bytes: string): void {
+        this.pendingRawWrite = (this.pendingRawWrite ?? "") + bytes;
     }
 
     stop(): void {

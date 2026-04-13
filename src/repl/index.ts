@@ -19,7 +19,7 @@ import { TerminalUI } from "../terminal/index.js";
 import type { WidgetHandle, WidgetZone, WidgetOptions } from "../terminal/index.js";
 import { colors, makeFgColor, makeBgColor, makeUlColor, style } from "../terminal/colors.js";
 import type { JsPipelineFunction } from "../jsfunctions/index.js";
-import { handshake } from "../mb/handshake.js";
+import { startHandshake } from "../mb/handshake.js";
 import { connectMb } from "../mb/client.js";
 import type { MbApi } from "../mb/client.js";
 
@@ -30,6 +30,7 @@ const native = require("../../build/Release/jsh_native.node") as {
         onRender: (state: { buf: string; pos: number; len: number; cols: number }) => void;
         onLine: (line: string | null, errno?: number) => void;
         onCompletion?: (input: string) => string[] | Promise<string[]> | unknown;
+        onEscResponse?: (type: "DCS" | "OSC", payload: string) => void;
     }) => void;
     inputStop: () => void;
     inputGetCols: () => number;
@@ -47,6 +48,7 @@ const native = require("../../build/Release/jsh_native.node") as {
 };
 
 let ui: TerminalUI | null = null;
+let mbApi: MbApi | null = null;
 
 export interface ReplOptions {
     jshrc?: string;
@@ -73,18 +75,26 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         ui = new TerminalUI(native);
     }
 
-    // MasterBandit handshake (cooked mode, before the line editor takes over).
-    // Runs only on TTYs. Silent on non-MB terminals.
-    let mbApi: MbApi | null = null;
-    if (process.stdin.isTTY && process.stdout.isTTY) {
-        const hs = await handshake();
-        if (hs) mbApi = await connectMb(hs);
+    // MasterBandit async handshake. Fires XTGETTCAP + OSC 58300 queries now;
+    // the native input-engine's OSC/DCS parser catches responses during the
+    // first (or later) edit session and hands them to the listener. When both
+    // land, `mbApi` flips from null to a live MbApi. Startup does not block.
+    if (process.stdin.isTTY && process.stdout.isTTY && ui) {
+        const listener = startHandshake((result) => {
+            if (!result) return; // not under MB, or timeout — mbApi stays null
+            connectMb(result).then((client) => {
+                if (client) mbApi = client;
+            });
+        });
+        ui.setEscResponseHandler((type, payload) => listener.handle(type, payload));
+        // Emit queries on the first edit session (after raw mode engages).
+        ui.queueRawWrite(listener.queries);
     }
 
     // Register ESM loader hook so jshrc files can `import ... from 'jsh/...'`.
     register('../loader-hooks.js', import.meta.url);
 
-    await loadRc(opts?.jshrc, mbApi);
+    await loadRc(opts?.jshrc);
 
     if (process.stdin.isTTY) {
         const historyFile = join(String($["HOME"] ?? homedir()), ".jsh_history");
@@ -140,7 +150,7 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
 let userSetPrompt = false;
 let continuationBuffer = ""; // accumulated buffer from previous lines for colorizer context
 
-async function loadRc(customPath: string | undefined, mb: MbApi | null): Promise<void> {
+async function loadRc(customPath: string | undefined): Promise<void> {
     let rcPath: string | undefined;
     if (customPath) {
         rcPath = resolve(customPath);
@@ -156,7 +166,9 @@ async function loadRc(customPath: string | undefined, mb: MbApi | null): Promise
         $, setColorize, setTheme,
         alias, unalias, registerJsFunction, exec,
         complete: registerCompletion,
-        mb,
+        // `mb` is a getter so jsh.mb reflects the current handshake state —
+        // null until the async handshake completes (or never, if not under MB).
+        get mb() { return mbApi; },
         setSuggestion: (fn: ((input: string) => Promise<string | null>) | null) => ui?.setSuggestion(fn),
         // Widgets — unified API for all rendered regions
         addWidget: (

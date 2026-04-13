@@ -1,13 +1,8 @@
-// Startup-time handshake with MasterBandit. Runs in cooked mode, before the
-// line editor takes over stdin. Any keystrokes typed during this window are
-// discarded — the window is sub-second, and terminals don't usually deliver
-// input before the shell is ready.
-//
-// Sequence:
-//   1. XTGETTCAP probe for `mb-query-applet` → confirms we're under MB.
-//   2. OSC 58300 "query;nonce=<hex>" → applet replies with port+token.
-//
-// Returns null if either step fails (not under MB, or applet not present).
+// Async MasterBandit handshake. Fires XTGETTCAP and OSC 58300 announce queries
+// immediately at startup and returns a listener that consumes DCS/OSC responses
+// fed to it by the native input-engine parser during raw-mode edit sessions.
+// `onResult` fires exactly once with either a HandshakeResult (we're under MB
+// and the applet replied) or null (not MB / applet absent / timeout).
 
 import { randomBytes } from "node:crypto";
 import { HANDSHAKE_OSC } from "./protocol.js";
@@ -18,9 +13,21 @@ export interface HandshakeResult {
     nonce: string;
 }
 
+export interface HandshakeListener {
+    /** Feed a DCS or OSC payload from the native parser. */
+    handle(type: "DCS" | "OSC", payload: string): void;
+    /** Cancel (stop waiting for responses). */
+    cancel(): void;
+    /**
+     * Bytes the caller must emit to stdout *after* raw mode is active, so the
+     * terminal's response doesn't get kernel-echoed to the user. Write once at
+     * the start of the first edit session.
+     */
+    readonly queries: string;
+}
+
 const XTGETTCAP_CAP = "mb-query-applet";
-const PROBE_TIMEOUT_MS = 300;
-const ANNOUNCE_TIMEOUT_MS = 500;
+const HANDSHAKE_TIMEOUT_MS = 5000;
 
 function hexEncode(s: string): string {
     let out = "";
@@ -28,91 +35,6 @@ function hexEncode(s: string): string {
         out += s.charCodeAt(i).toString(16).padStart(2, "0").toUpperCase();
     }
     return out;
-}
-
-/**
- * Raw-mode read from stdin until `matcher` returns a payload or `timeoutMs`
- * elapses. Writes `query` after raw mode is engaged. Returns the matched
- * payload or null on timeout.
- *
- * Leaves stdin in the same rawMode state it found it.
- */
-function queryEscapeSeq(
-    query: string,
-    matcher: (buf: string) => string | null,
-    timeoutMs: number,
-): Promise<string | null> {
-    return new Promise((resolve) => {
-        if (!process.stdin.isTTY || !process.stdout.isTTY) {
-            resolve(null);
-            return;
-        }
-
-        const wasRaw = process.stdin.isRaw;
-        let buf = "";
-        let finished = false;
-
-        const cleanup = (result: string | null) => {
-            if (finished) return;
-            finished = true;
-            clearTimeout(timer);
-            process.stdin.off("data", onData);
-            process.stdin.pause();
-            if (!wasRaw) process.stdin.setRawMode(false);
-            resolve(result);
-        };
-
-        const onData = (chunk: Buffer): void => {
-            buf += chunk.toString("binary");
-            const payload = matcher(buf);
-            if (payload !== null) cleanup(payload);
-        };
-
-        const timer = setTimeout(() => cleanup(null), timeoutMs);
-
-        process.stdin.setRawMode(true);
-        process.stdin.resume();
-        process.stdin.on("data", onData);
-        process.stdout.write(query);
-    });
-}
-
-/**
- * Match a DCS response for the mb-query-applet cap.
- * Success reply: `ESC P 1 + r <hex-name>=<hex-value> ESC \`
- * Invalid reply: `ESC P 0 + r <hex-name> ESC \`
- */
-function matchDcsResponse(buf: string): string | null {
-    const start = buf.indexOf("\x1bP");
-    if (start < 0) return null;
-    // Look for terminator (ESC \) or BEL.
-    const afterStart = buf.substring(start + 2);
-    let endIdx = afterStart.indexOf("\x1b\\");
-    if (endIdx < 0) endIdx = afterStart.indexOf("\x07");
-    if (endIdx < 0) return null;
-    const body = afterStart.substring(0, endIdx);
-    // body is e.g. "1+r<hex>=<hex>" or "0+r<hex>"
-    if (body.startsWith("1+r")) return body.substring(3);
-    return ""; // empty string → explicit "not supported", distinct from null (still waiting)
-}
-
-/**
- * Match OSC 58300 announce reply: `ESC ] 58300 ; port=N;token=T ESC \`
- */
-function matchAnnounceResponse(buf: string): string | null {
-    const prefix = `\x1b]${HANDSHAKE_OSC};`;
-    const start = buf.indexOf(prefix);
-    if (start < 0) return null;
-    const afterStart = buf.substring(start + prefix.length);
-    let endIdx = afterStart.indexOf("\x1b\\");
-    let termLen = 2;
-    if (endIdx < 0) {
-        endIdx = afterStart.indexOf("\x07");
-        termLen = 1;
-    }
-    if (endIdx < 0) return null;
-    void termLen;
-    return afterStart.substring(0, endIdx);
 }
 
 function parseAnnouncePayload(payload: string): { port: number; token: string } | null {
@@ -129,22 +51,63 @@ function parseAnnouncePayload(payload: string): { port: number; token: string } 
     return { port, token };
 }
 
-export async function handshake(): Promise<HandshakeResult | null> {
-    if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
-
-    // Step 1: XTGETTCAP probe.
-    const probeQuery = `\x1bP+q${hexEncode(XTGETTCAP_CAP)}\x1b\\`;
-    const probeResult = await queryEscapeSeq(probeQuery, matchDcsResponse, PROBE_TIMEOUT_MS);
-    if (!probeResult) return null; // not MB, or terminal didn't respond
-
-    // Step 2: OSC announce query.
+/**
+ * Start a handshake. Emits both queries to stdout immediately. The caller is
+ * responsible for wiring `handle()` to the input-engine's onEscResponse.
+ *
+ * `onResult` fires once:
+ *   - HandshakeResult → we're under MB, applet replied with port+token.
+ *   - null            → explicit "not supported" from DCS, or timeout.
+ */
+export function startHandshake(
+    onResult: (result: HandshakeResult | null) => void,
+    timeoutMs: number = HANDSHAKE_TIMEOUT_MS,
+): HandshakeListener {
     const nonce = randomBytes(16).toString("hex");
+    let resolved = false;
+
+    const resolve = (r: HandshakeResult | null): void => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        onResult(r);
+    };
+
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+
+    // Queries are emitted by the caller once raw mode is active. Writing them
+    // in cooked mode would let the kernel echo terminal responses back to the
+    // user as visible escape-sequence junk.
+    const probeQuery = `\x1bP+q${hexEncode(XTGETTCAP_CAP)}\x1b\\`;
     const announceQuery = `\x1b]${HANDSHAKE_OSC};query;nonce=${nonce}\x1b\\`;
-    const announcePayload = await queryEscapeSeq(announceQuery, matchAnnounceResponse, ANNOUNCE_TIMEOUT_MS);
-    if (!announcePayload) return null; // applet not loaded
+    const queries = probeQuery + announceQuery;
 
-    const parsed = parseAnnouncePayload(announcePayload);
-    if (!parsed) return null;
+    return {
+        queries,
+        handle(type: "DCS" | "OSC", payload: string): void {
+            if (resolved) return;
 
-    return { port: parsed.port, token: parsed.token, nonce };
+            if (type === "DCS") {
+                // XTGETTCAP responses: "1+r<hex>[=<hex>]" (supported) or
+                // "0+r<hex>" (unknown). Explicit "0+r" for our cap is a
+                // definitive "not MB" — resolve null early.
+                if (payload.startsWith("0+r")) resolve(null);
+                // "1+r" means MB detected. We don't resolve yet — waiting on
+                // the OSC 58300 reply with port+token from the applet.
+                return;
+            }
+
+            if (type === "OSC") {
+                // Native parser strips the ESC ] and terminator; payload looks
+                // like "58300;port=N;token=T".
+                const prefix = `${HANDSHAKE_OSC};`;
+                if (!payload.startsWith(prefix)) return;
+                const parsed = parseAnnouncePayload(payload.substring(prefix.length));
+                if (parsed) resolve({ port: parsed.port, token: parsed.token, nonce });
+            }
+        },
+        cancel(): void {
+            resolve(null);
+        },
+    };
 }

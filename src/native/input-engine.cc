@@ -2,6 +2,7 @@
 #include <uv.h>
 #include <cerrno>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 #include <fcntl.h>
@@ -587,6 +588,7 @@ struct EngineCtx {
     Napi::FunctionReference onLine;
     Napi::FunctionReference onRender;
     Napi::FunctionReference onCompletion;
+    Napi::FunctionReference onEscResponse;
 };
 
 static EngineCtx *g_ctx = nullptr;
@@ -601,6 +603,50 @@ static int getColumns() {
 static void bufferChanged() {
     g_state.suggestion.clear();
     g_state.suggestion_id++;
+}
+
+// Collect an escape-sequence payload (DCS: ESC P ... ST; OSC: ESC ] ... ST|BEL).
+// Reads byte-by-byte from ifd; terminals send these atomically so short blocks
+// (VMIN=1, VTIME=0) are effectively bounded by terminal response latency.
+// Returns the payload (without introducer or terminator) on success, or
+// std::nullopt on malformed / oversized input. Caller has already consumed
+// ESC and the introducer byte ('P' or ']').
+static std::optional<std::string> readEscPayload(int fd, char introducer) {
+    std::string payload;
+    const size_t MAX = 8192;
+    while (payload.size() < MAX) {
+        char c;
+        ssize_t n = read(fd, &c, 1);
+        if (n != 1) return std::nullopt;
+
+        // OSC accepts BEL as terminator.
+        if (introducer == ']' && c == 0x07) return payload;
+
+        // ST is ESC \ for both DCS and OSC.
+        if (c == 0x1b) {
+            char c2;
+            if (read(fd, &c2, 1) != 1) return std::nullopt;
+            if (c2 == '\\') return payload;
+            // Stray ESC inside payload — include both bytes and continue.
+            payload.push_back(c);
+            payload.push_back(c2);
+            continue;
+        }
+
+        payload.push_back(c);
+    }
+    return std::nullopt; // exceeded MAX
+}
+
+static void deliverEscResponse(char introducer, const std::string& payload) {
+    if (!g_ctx || g_ctx->onEscResponse.IsEmpty()) return;
+    Napi::Env env = g_ctx->onEscResponse.Env();
+    Napi::HandleScope scope(env);
+    const char* typeStr = (introducer == 'P') ? "DCS" : "OSC";
+    g_ctx->onEscResponse.Call({
+        Napi::String::New(env, typeStr),
+        Napi::String::New(env, payload),
+    });
 }
 
 static void notifyRender() {
@@ -967,6 +1013,19 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
     case ESC: {
         char seq[3];
         if (read(s->ifd, seq, 1) == -1) break;
+
+        // DCS (ESC P ... ST) and OSC (ESC ] ... ST|BEL) responses — collect
+        // payload and dispatch to JS instead of treating as keystrokes. Enables
+        // async XTGETTCAP / handshake replies to be received during raw-mode
+        // edit sessions.
+        if (seq[0] == 'P' || seq[0] == ']') {
+            auto payload = readEscPayload(s->ifd, seq[0]);
+            if (payload.has_value()) {
+                deliverEscResponse(seq[0], *payload);
+            }
+            break;
+        }
+
         if (read(s->ifd, seq+1, 1) == -1) break;
 
         if (seq[0] == '[') {
@@ -1093,6 +1152,9 @@ static Napi::Value InputStart(const Napi::CallbackInfo &info) {
     g_ctx->onRender = Napi::Persistent(cbs.Get("onRender").As<Napi::Function>());
     if (cbs.Has("onCompletion") && cbs.Get("onCompletion").IsFunction()) {
         g_ctx->onCompletion = Napi::Persistent(cbs.Get("onCompletion").As<Napi::Function>());
+    }
+    if (cbs.Has("onEscResponse") && cbs.Get("onEscResponse").IsFunction()) {
+        g_ctx->onEscResponse = Napi::Persistent(cbs.Get("onEscResponse").As<Napi::Function>());
     }
 
     // Init state

@@ -20,10 +20,14 @@ export interface PopupHandle {
     onClose(fn: () => void): void;
 }
 
+export type MbStateListener = (connected: boolean) => void;
+
 export interface MbApi {
     createPopup(opts: CreatePopupOptions): Promise<PopupHandle>;
     getLastCommand(): Promise<LastCommand | null>;
     readonly connected: boolean;
+    addEventListener(event: "stateChanged", fn: MbStateListener): void;
+    removeEventListener(event: "stateChanged", fn: MbStateListener): void;
 }
 
 interface PendingRequest {
@@ -38,6 +42,7 @@ class MbClient implements MbApi {
     private pending = new Map<number, PendingRequest>();
     private popups = new Map<string, PopupImpl>();
     private readyPromise: Promise<void>;
+    private stateListeners = new Set<MbStateListener>();
 
     constructor(handshakeResult: HandshakeResult) {
         const { port, token, nonce } = handshakeResult;
@@ -59,14 +64,14 @@ class MbClient implements MbApi {
                     return;
                 }
                 if (msg.type === "ready") {
-                    this.ready = true;
+                    this.setReady(true);
                     resolve();
                     return;
                 }
                 this.handleMessage(msg);
             });
             this.ws.on("close", () => {
-                this.ready = false;
+                this.setReady(false);
                 for (const p of this.pending.values()) p.reject(new Error("ws closed"));
                 this.pending.clear();
                 for (const popup of this.popups.values()) popup._markClosed();
@@ -75,8 +80,26 @@ class MbClient implements MbApi {
         });
     }
 
+    private setReady(value: boolean): void {
+        if (this.ready === value) return;
+        this.ready = value;
+        for (const fn of this.stateListeners) {
+            try { fn(value); } catch { /* ignore listener errors */ }
+        }
+    }
+
     get connected(): boolean {
         return this.ready;
+    }
+
+    addEventListener(event: "stateChanged", fn: MbStateListener): void {
+        if (event !== "stateChanged") return;
+        this.stateListeners.add(fn);
+    }
+
+    removeEventListener(event: "stateChanged", fn: MbStateListener): void {
+        if (event !== "stateChanged") return;
+        this.stateListeners.delete(fn);
     }
 
     waitReady(): Promise<void> {

@@ -156,6 +156,13 @@ interface MbApi {
     getLastCommand(): Promise<MbLastCommand | null>;
     /** True while the WS connection to the applet is live. */
     readonly connected: boolean;
+    /**
+     * Subscribe to connection state changes. Fires whenever `connected` flips,
+     * with the new value. Use this to refresh prompt/status widgets on drop or
+     * reconnect without polling.
+     */
+    addEventListener(event: "stateChanged", fn: (connected: boolean) => void): void;
+    removeEventListener(event: "stateChanged", fn: (connected: boolean) => void): void;
 }
 
 // ---- Color constants --------------------------------------------------------
