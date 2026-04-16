@@ -994,11 +994,12 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         notifyRender();
         break;
 
-    case CTRL_L:
+    case CTRL_L: {
         // Clear screen: write escape sequence, then render
-        write(s->ofd, "\x1b[H\x1b[2J", 7);
+        [[maybe_unused]] auto _w = write(s->ofd, "\x1b[H\x1b[2J", 7);
         notifyRender();
         break;
+    }
 
     case CTRL_R:
         enterSearchMode(s);
@@ -1232,10 +1233,10 @@ static Napi::Value InputWriteRaw(const Napi::CallbackInfo &info) {
     if (info.Length() < 1) return info.Env().Undefined();
     if (info[0].IsString()) {
         std::string data = info[0].As<Napi::String>().Utf8Value();
-        write(g_state.ofd, data.c_str(), data.size());
+        [[maybe_unused]] auto _w1 = write(g_state.ofd, data.c_str(), data.size());
     } else if (info[0].IsBuffer()) {
         Napi::Buffer<char> buf = info[0].As<Napi::Buffer<char>>();
-        write(g_state.ofd, buf.Data(), buf.Length());
+        [[maybe_unused]] auto _w2 = write(g_state.ofd, buf.Data(), buf.Length());
     }
     return info.Env().Undefined();
 }
@@ -1479,7 +1480,7 @@ static Napi::Value WriteFdUtil(const Napi::CallbackInfo& info) {
     }
     int fd = info[0].As<Napi::Number>().Int32Value();
     std::string data = info[1].As<Napi::String>().Utf8Value();
-    write(fd, data.c_str(), data.size());
+    [[maybe_unused]] auto _w = write(fd, data.c_str(), data.size());
     return info.Env().Undefined();
 }
 

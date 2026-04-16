@@ -125,7 +125,7 @@ struct PipelineRequest {
 // Keep these to async-signal-safe or provably safe-after-fork calls only.
 
 static void writeErr(const char* s) {
-    write(STDERR_FILENO, s, strlen(s));
+    [[maybe_unused]] auto _w = write(STDERR_FILENO, s, strlen(s));
 }
 
 // Apply a list of redirections in the child after pipe fds are set up.
