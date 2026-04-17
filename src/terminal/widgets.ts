@@ -41,6 +41,7 @@ export class WidgetManager {
     private widgets = new Map<string, WidgetDef>();
     private cache = new Map<string, string[]>(); // per-widget cached render result
     private repaintFn: (() => void) | null = null;
+    private editingFn: (() => boolean) | null = null;
 
     // Per-zone assembled line cache.
     private zoneCache = new Map<WidgetZone, string[]>();
@@ -48,6 +49,10 @@ export class WidgetManager {
 
     setRepaintFn(fn: () => void): void {
         this.repaintFn = fn;
+    }
+
+    setEditingFn(fn: () => boolean): void {
+        this.editingFn = fn;
     }
 
     add(widget: WidgetDef): WidgetHandle {
@@ -230,8 +235,13 @@ export class WidgetManager {
         return false;
     }
 
-    /** Re-evaluate a widget and repaint if changed. */
+    /** Re-evaluate a widget and repaint if changed.
+     *  No-op while the REPL isn't actively editing — render side effects
+     *  (e.g. `jsh.exec` in user widgets) would otherwise pile up behind a
+     *  running foreground process on the serialized executor thread. The
+     *  next `start()` refreshes every widget anyway, so nothing is lost. */
     updateWidget(id: string): void {
+        if (this.editingFn && !this.editingFn()) return;
         const widget = this.widgets.get(id);
         if (!widget) return;
         try {

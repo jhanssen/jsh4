@@ -57,7 +57,7 @@ export class TerminalUI {
 
     private colorizeFn: ((input: string, context?: string) => string) | null = null;
     private completionFn: ((input: string) => CompletionEntry[] | Promise<CompletionEntry[]>) | null = null;
-    private suggestionFn: ((input: string) => Promise<string | null>) | null = null;
+    private suggestionFn: ((input: string) => string | null | Promise<string | null>) | null = null;
     private lastState: InputState | null = null;
     private lineCallback: ((line: string | null, errno?: number) => void) | null = null;
     private EAGAIN: number;
@@ -75,6 +75,7 @@ export class TerminalUI {
         this.renderer = new Renderer((data: string) => native.inputWriteRaw(data));
         this.widgets = new WidgetManager();
         this.widgets.setRepaintFn(() => this.repaint());
+        this.widgets.setEditingFn(() => this.editing);
         this.EAGAIN = native.inputEAGAIN();
     }
 
@@ -184,7 +185,7 @@ export class TerminalUI {
         this.completionFn = fn;
     }
 
-    setSuggestion(fn: ((input: string) => Promise<string | null>) | null): void {
+    setSuggestion(fn: ((input: string) => string | null | Promise<string | null>) | null): void {
         this.suggestionFn = fn;
     }
 
@@ -279,11 +280,16 @@ export class TerminalUI {
             state.suggestionId !== this.lastSuggestionId && state.buf.length > 0) {
             this.lastSuggestionId = state.suggestionId;
             const id = state.suggestionId;
-            this.suggestionFn(state.buf).then(result => {
-                if (result) {
+            try {
+                const result = this.suggestionFn(state.buf);
+                if (result && typeof (result as Promise<string | null>).then === "function") {
+                    (result as Promise<string | null>).then(r => {
+                        if (r) this.native.inputSetSuggestion(id, r);
+                    }).catch(() => {});
+                } else if (typeof result === "string" && result) {
                     this.native.inputSetSuggestion(id, result);
                 }
-            }).catch(() => {});
+            } catch {}
         }
     }
 

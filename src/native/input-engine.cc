@@ -1123,6 +1123,16 @@ static void pollCallback(uv_poll_t *handle, int status, int events) {
     g_state.active = false;
     disableRawMode(g_state.ifd);
 
+    // Pop the temp editing slot that was added at inputStart. Prior to this
+    // point the last history entry mirrors the user's in-progress buffer,
+    // which pollutes `getLastEntry()`-style reads. Dropping it leaves the
+    // array containing only finalized commands; the REPL will re-add the
+    // actual finalInput (possibly after !! expansion) via inputHistoryAdd.
+    if (history_len > 0) {
+        free(history[history_len - 1]);
+        history_len--;
+    }
+
     Napi::Env env = g_ctx->onLine.Env();
     Napi::HandleScope scope(env);
     if (result == 1 && line) {
@@ -1351,6 +1361,53 @@ static Napi::Value HistoryLoad(const Napi::CallbackInfo &info) {
     return Napi::Number::New(info.Env(), -1);
 }
 
+// ---- History read-side N-API getters --------------------------------------
+// The last entry is the live editing "temp slot" only when g_state.active is
+// true (and up until pollCallback pops it on Enter). Expose helpers that
+// exclude the temp slot, so JS consumers see only finalized commands.
+
+static inline int finalizedCount() {
+    if (history_len == 0) return 0;
+    return g_state.active ? history_len - 1 : history_len;
+}
+
+static Napi::Value HistoryCount(const Napi::CallbackInfo &info) {
+    return Napi::Number::New(info.Env(), finalizedCount());
+}
+
+static Napi::Value HistoryGet(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) return env.Null();
+    int idx = info[0].As<Napi::Number>().Int32Value();
+    int n = finalizedCount();
+    if (idx < 0 || idx >= n) return env.Null();
+    return Napi::String::New(env, history[idx]);
+}
+
+static Napi::Value HistoryAll(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    int n = finalizedCount();
+    Napi::Array arr = Napi::Array::New(env, n);
+    for (int i = 0; i < n; i++) {
+        arr.Set(static_cast<uint32_t>(i), Napi::String::New(env, history[i]));
+    }
+    return arr;
+}
+
+static Napi::Value HistorySearchPrefix(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString()) return env.Null();
+    std::string prefix = info[0].As<Napi::String>().Utf8Value();
+    int n = finalizedCount();
+    for (int i = n - 1; i >= 0; i--) {
+        const char* e = history[i];
+        if (strncmp(e, prefix.c_str(), prefix.size()) == 0) {
+            return Napi::String::New(env, e);
+        }
+    }
+    return env.Null();
+}
+
 static Napi::Value SetSuggestion(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsString()) {
@@ -1496,6 +1553,10 @@ Napi::Object InitInputEngine(Napi::Env env, Napi::Object exports) {
     exports.Set("inputHistorySetMaxLen", Napi::Function::New(env, HistorySetMaxLen));
     exports.Set("inputHistorySave",   Napi::Function::New(env, HistorySave));
     exports.Set("inputHistoryLoad",   Napi::Function::New(env, HistoryLoad));
+    exports.Set("inputHistoryCount",  Napi::Function::New(env, HistoryCount));
+    exports.Set("inputHistoryGet",    Napi::Function::New(env, HistoryGet));
+    exports.Set("inputHistoryAll",    Napi::Function::New(env, HistoryAll));
+    exports.Set("inputHistorySearchPrefix", Napi::Function::New(env, HistorySearchPrefix));
     exports.Set("inputSetSuggestion", Napi::Function::New(env, SetSuggestion));
     exports.Set("inputSetInput",       Napi::Function::New(env, SetInput));
     exports.Set("inputInsertAtCursor", Napi::Function::New(env, InsertAtCursor));

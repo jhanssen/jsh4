@@ -1,34 +1,49 @@
-// History expansion (!!, !$, !n, !-n, !string).
-// Maintains a parallel history list for expansion lookups.
+// History — thin wrapper over the native input-engine store. The C++ side
+// is the single source of truth; this module exists to keep call sites
+// (history expansion, jsh.history(), etc.) decoupled from N-API details.
 
-const entries: string[] = [];
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const native = require("../../build/Release/jsh_native.node") as {
+    inputHistoryAdd: (line: string) => void;
+    inputHistoryCount: () => number;
+    inputHistoryGet: (idx: number) => string | null;
+    inputHistoryAll: () => string[];
+    inputHistorySearchPrefix: (prefix: string) => string | null;
+};
 
 export function addHistoryEntry(line: string): void {
-    entries.push(line);
+    native.inputHistoryAdd(line);
 }
 
 export function getHistoryEntry(n: number): string | undefined {
-    if (n > 0) return entries[n - 1]; // !n is 1-based
-    return undefined;
+    // !n is 1-based across the full (finalized) history.
+    if (n <= 0) return undefined;
+    return native.inputHistoryGet(n - 1) ?? undefined;
 }
 
 export function getLastEntry(): string | undefined {
-    return entries[entries.length - 1];
+    const n = native.inputHistoryCount();
+    if (n === 0) return undefined;
+    return native.inputHistoryGet(n - 1) ?? undefined;
 }
 
 export function getEntryFromEnd(n: number): string | undefined {
-    return entries[entries.length - n];
+    const len = native.inputHistoryCount();
+    if (n <= 0 || n > len) return undefined;
+    return native.inputHistoryGet(len - n) ?? undefined;
 }
 
 export function searchHistory(prefix: string): string | undefined {
-    for (let i = entries.length - 1; i >= 0; i--) {
-        if (entries[i]!.startsWith(prefix)) return entries[i];
-    }
-    return undefined;
+    return native.inputHistorySearchPrefix(prefix) ?? undefined;
 }
 
 export function getHistoryLength(): number {
-    return entries.length;
+    return native.inputHistoryCount();
+}
+
+export function getAllEntries(): string[] {
+    return native.inputHistoryAll();
 }
 
 // Expand history references in an input line.

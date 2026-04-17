@@ -14,7 +14,7 @@ import { colorize, getCurrentTheme, registerCommandExists, getResolvedColor, onT
 import { commandExists } from "../completion/index.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { runTrap } from "../trap/index.js";
-import { addHistoryEntry, expandHistory } from "../history/index.js";
+import { expandHistory, getAllEntries } from "../history/index.js";
 import { TerminalUI } from "../terminal/index.js";
 import type { WidgetHandle, WidgetZone, WidgetOptions } from "../terminal/index.js";
 import { colors, makeFgColor, makeBgColor, makeUlColor, style } from "../terminal/colors.js";
@@ -216,7 +216,7 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         // `mb` is a getter so jsh.mb reflects the current handshake state —
         // null until the async handshake completes (or never, if not under MB).
         get mb() { return mbApi; },
-        setSuggestion: (fn: ((input: string) => Promise<string | null>) | null) => ui?.setSuggestion(fn),
+        setSuggestion: (fn: ((input: string) => string | null | Promise<string | null>) | null) => ui?.setSuggestion(fn),
         // Widgets — unified API for all rendered regions
         addWidget: (
             id: string,
@@ -228,6 +228,8 @@ async function loadRc(customPath: string | undefined): Promise<void> {
             return ui?.addWidget(id, zone, render, opts);
         },
         removeWidget: (id: string) => ui?.removeWidget(id),
+        // History
+        history: () => getAllEntries(),
         // Terminal info
         get columns() { return native.inputGetCols(); },
         // Input buffer manipulation
@@ -334,7 +336,6 @@ async function promptLoop(buffer: string): Promise<void> {
                 // Successful parse — clear frame before executing.
                 ui!.clearFrame();
                 ui!.historyAdd(finalInput);
-                addHistoryEntry(finalInput);
                 setCommandText(finalInput);
                 if (finalInput !== trimmed) {
                     process.stdout.write(finalInput + "\n");

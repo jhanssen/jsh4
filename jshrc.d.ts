@@ -289,22 +289,29 @@ declare const jsh: {
     // ---- Suggestions ----
 
     /**
-     * Set a fish-style suggestion function. Called asynchronously when the user
-     * types. The function receives the current input buffer and should return
-     * the full suggested command (or null for no suggestion). Ghost text appears
-     * dimmed after the cursor. Right arrow at end-of-line accepts.
+     * Set a fish-style suggestion function. Called when the user types. The
+     * function receives the current input buffer and returns the full suggested
+     * command (or null for no suggestion). May return sync or Promise. Ghost
+     * text appears dimmed after the cursor. Right arrow at end-of-line accepts.
      *
      * Stale suggestions are automatically discarded if the user types more
      * before the promise resolves.
      *
      * @example
-     * jsh.setSuggestion(async (input) => {
-     *     // Search history, call an API, etc.
-     *     const result = await jsh.exec(`grep -m1 "^${input}" ~/.jsh_history`);
-     *     return result.ok ? result.stdout : null;
+     * jsh.setSuggestion((input) => {
+     *     const hist = jsh.history();
+     *     for (let i = hist.length - 1; i >= 0; i--) {
+     *         if (hist[i].startsWith(input) && hist[i] !== input) return hist[i];
+     *     }
+     *     return null;
      * });
      */
-    setSuggestion(fn: ((input: string) => Promise<string | null>) | null): void;
+    setSuggestion(fn: ((input: string) => string | null | Promise<string | null>) | null): void;
+
+    // ---- History ----
+
+    /** Return a snapshot of the in-memory command history (oldest first). */
+    history(): string[];
 
     // ---- Syntax highlighting ----
 
