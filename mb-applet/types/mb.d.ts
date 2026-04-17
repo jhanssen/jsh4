@@ -60,17 +60,34 @@ interface MbMouseEvent {
 // ============================================================================
 
 /**
+ * A position within the terminal document.
+ *
+ * `rowId` is a stable monotonic identifier that survives scrolling into
+ * history. `absRow` is volatile (shifts as rows scroll) and is provided
+ * for convenience; prefer `rowId` for durable references.
+ */
+interface MbPosition {
+    /** Stable row ID — use with `pane.getTextFromRows()`. */
+    readonly rowId: number;
+    /** Volatile absolute row index at query time (archive + history + screen). */
+    readonly absRow: number;
+    /** Column index (0-based). */
+    readonly col: number;
+}
+
+/**
  * A single command executed in this pane, populated from OSC 133 markers.
- * Coordinates are absolute row indices (archive + tier-1 history + screen) at
- * the moment each marker fired; treat them as best-effort references since
- * rows can be evicted from the archive.
+ *
+ * Text fields (`command`, `output`) are extracted lazily from the document at
+ * query time rather than captured eagerly — they reflect the live cell content
+ * and are not subject to a size cap.
  */
 interface MbCommand {
     /** Monotonic per-pane id. */
     readonly id: number;
-    /** Command text as it was echoed between `B` and `C`. Whitespace-trimmed. */
+    /** Command text echoed between `B` and `C`, whitespace-trimmed. Extracted lazily. */
     readonly command: string;
-    /** Rendered plain-text output between `C` and `D`, truncated to 64 KB. */
+    /** Plain-text output between `C` and `D`. Extracted lazily, no size cap. */
     readonly output: string;
     /** `OSC 7` CWD value at the moment `A` fired. */
     readonly cwd: string;
@@ -80,14 +97,14 @@ interface MbCommand {
     readonly startMs: number;
     /** Monotonic milliseconds when `D` fired (command finished). */
     readonly endMs: number;
-    readonly promptStartAbsRow: number;
-    readonly promptStartCol: number;
-    readonly commandStartAbsRow: number;
-    readonly commandStartCol: number;
-    readonly outputStartAbsRow: number;
-    readonly outputStartCol: number;
-    readonly outputEndAbsRow: number;
-    readonly outputEndCol: number;
+    /** Position of the prompt marker (OSC 133;A). */
+    readonly promptStart: MbPosition;
+    /** Position where the command text begins (OSC 133;B). */
+    readonly commandStart: MbPosition;
+    /** Position where command output begins (OSC 133;C). */
+    readonly outputStart: MbPosition;
+    /** Position where command output ends (OSC 133;D). */
+    readonly outputEnd: MbPosition;
 }
 
 interface MbPane {
@@ -106,6 +123,18 @@ interface MbPane {
     readonly foregroundProcess: string;
     /** Active popups on this pane. */
     readonly popups: MbPopupInfo[];
+    /** Current text selection, or `null` if nothing is selected. */
+    readonly selection: {
+        readonly startRowId: number;
+        readonly startCol: number;
+        readonly endRowId: number;
+        readonly endCol: number;
+    } | null;
+    /** Current cursor position. */
+    readonly cursor: {
+        readonly rowId: number;
+        readonly col: number;
+    };
     /**
      * Most recently completed command seen on this pane, or null. Requires
      * `shell.commands` permission (command records can contain secrets).
@@ -116,6 +145,19 @@ interface MbPane {
      * last). Requires `shell.commands` permission.
      */
     readonly commands: readonly MbCommand[];
+
+    /**
+     * Extract plain UTF-8 text from a stable row-id range (inclusive on both
+     * ends). Row IDs come from `MbCommand` fields or from `rowIdAt()`. Returns
+     * an empty string if the start row has been evicted from the archive.
+     * `startCol`/`endCol` bound the columns on the first/last row.
+     */
+    getTextFromRows(startRowId: number, startCol: number, endRowId: number, endCol: number): string;
+    /**
+     * Return the stable row ID for a screen row (0 = top of visible screen).
+     * Returns `null` if `screenRow` is out of range (≥ terminal height).
+     */
+    rowIdAt(screenRow: number): number | null;
 
     /** Emit data into the terminal emulator (as if the PTY wrote it). Requires `io.inject`. */
     inject(data: string): void;
@@ -144,11 +186,19 @@ interface MbPane {
     addEventListener(event: `osc:${number}`, fn: (payload: string) => void): void;
     /**
      * Fires once per completed shell command (OSC 133;D arrival). The callback
-     * receives the full `MbCommand` record including command text, rendered
-     * output, exit code, timing, and cwd. Useful for AI integrations and
-     * triggers on failing commands. Requires `shell.commands` permission.
+     * receives an `MbCommand` record with exit code, timing, cwd, row IDs, and
+     * lazily-extracted `command`/`output` text. Requires `shell.commands` permission.
      */
     addEventListener(event: "commandComplete", fn: (cmd: MbCommand) => void): void;
+
+    removeEventListener(event: "input",  fn: (data: string) => string | void): void;
+    removeEventListener(event: "output", fn: (data: string) => string | void): void;
+    removeEventListener(event: "mouse",  fn: (ev: MbMouseEvent) => void): void;
+    removeEventListener(event: "resized", fn: (cols: number, rows: number) => void): void;
+    removeEventListener(event: "destroyed", fn: () => void): void;
+    removeEventListener(event: "foregroundProcessChanged", fn: (processName: string) => void): void;
+    removeEventListener(event: `osc:${number}`, fn: (payload: string) => void): void;
+    removeEventListener(event: "commandComplete", fn: (cmd: MbCommand) => void): void;
 }
 
 interface MbPopupInfo {
@@ -186,6 +236,10 @@ interface MbPopup {
     addEventListener(event: "mouse", fn: (ev: MbMouseEvent) => void): void;
     /** Fired once when the popup is closed. */
     addEventListener(event: "destroyed", fn: () => void): void;
+
+    removeEventListener(event: "input", fn: (data: string) => void): void;
+    removeEventListener(event: "mouse", fn: (ev: MbMouseEvent) => void): void;
+    removeEventListener(event: "destroyed", fn: () => void): void;
 }
 
 // ============================================================================
@@ -208,6 +262,10 @@ interface MbTab {
     addEventListener(event: "destroyed", fn: () => void): void;
     addEventListener(event: "overlayCreated", fn: (overlay: MbOverlay) => void): void;
     addEventListener(event: "overlayDestroyed", fn: () => void): void;
+
+    removeEventListener(event: "destroyed", fn: () => void): void;
+    removeEventListener(event: "overlayCreated", fn: (overlay: MbOverlay) => void): void;
+    removeEventListener(event: "overlayDestroyed", fn: () => void): void;
 }
 
 // ============================================================================
@@ -226,10 +284,19 @@ interface MbOverlay {
     /** Close this overlay. */
     close(): void;
 
+    /** Extract plain text from a stable row-id range (inclusive). */
+    getTextFromRows(startRowId: number, startCol: number, endRowId: number, endCol: number): string;
+    /** Stable row ID for a screen row (0 = top). Returns null if out of range. */
+    rowIdAt(screenRow: number): number | null;
+
     /** Keyboard events when the overlay is focused. Requires `io.filter.input`. */
     addEventListener(event: "input", fn: (data: string) => void): void;
     addEventListener(event: "mouse", fn: (ev: MbMouseEvent) => void): void;
     addEventListener(event: "destroyed", fn: () => void): void;
+
+    removeEventListener(event: "input", fn: (data: string) => void): void;
+    removeEventListener(event: "mouse", fn: (ev: MbMouseEvent) => void): void;
+    removeEventListener(event: "destroyed", fn: () => void): void;
 }
 
 // ============================================================================
@@ -318,6 +385,12 @@ interface MbGlobal {
      */
     createSecureToken(length?: number): string;
 
+    // --- Custom terminal capabilities ---
+    /** Register a custom XTGETTCAP capability. */
+    registerTcap(name: string, value: string): void;
+    /** Remove a custom XTGETTCAP capability. */
+    unregisterTcap(name: string): void;
+
     // --- Lifecycle events ---
     /** Fires once per new pane. Fires on every loaded instance. */
     addEventListener(event: "paneCreated", fn: (pane: MbPane) => void): void;
@@ -335,6 +408,15 @@ interface MbGlobal {
      * matching entry. Built-in scripts only. Respond via `mb.approveScript`.
      */
     addEventListener(
+        event: "scriptPermissionRequired",
+        fn: (path: string, permissions: string, hash: string) => void
+    ): void;
+
+    removeEventListener(event: "paneCreated", fn: (pane: MbPane) => void): void;
+    removeEventListener(event: "tabCreated", fn: (tab: MbTab) => void): void;
+    removeEventListener(event: "action", fn: (actionName: string) => void): void;
+    removeEventListener(event: "action", actionName: string, fn: (...args: string[]) => void): void;
+    removeEventListener(
         event: "scriptPermissionRequired",
         fn: (path: string, permissions: string, hash: string) => void
     ): void;

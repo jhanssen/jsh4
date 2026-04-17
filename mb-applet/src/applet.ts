@@ -134,6 +134,16 @@ function handleMessage(conn: MbWsConnection, state: ConnState, raw: string | Arr
             });
             break;
         }
+        case "getSelection": {
+            const sel = state.pane.selection;
+            if (!sel) {
+                send(conn, { type: "selectionResult", reqId: msg.reqId, text: null });
+                break;
+            }
+            const text = state.pane.getTextFromRows(sel.startRowId, sel.startCol, sel.endRowId, sel.endCol);
+            send(conn, { type: "selectionResult", reqId: msg.reqId, text });
+            break;
+        }
     }
 }
 

@@ -150,9 +150,16 @@ export class WidgetManager {
         const centerW = this._displayWidth(center);
         const rightW = this._displayWidth(right);
 
+        // Reserve the last column when right-aligned content is present. On
+        // terminals with `xenl` (auto-wrap), writing to the final column enters
+        // a pending-wrap state — any subsequent write can clobber or wrap the
+        // glyph. zsh's RPROMPT follows the same convention (always leaves one
+        // column empty on the right).
+        const rightEdge = right ? cols - 1 : cols;
+
         if (!center) {
             // Left + right: pad between them.
-            const pad = Math.max(0, cols - leftW - rightW);
+            const pad = Math.max(0, rightEdge - leftW - rightW);
             return left + " ".repeat(pad) + right;
         }
         if (!left && !right) {
@@ -160,9 +167,9 @@ export class WidgetManager {
             const pad = Math.max(0, Math.floor((cols - centerW) / 2));
             return " ".repeat(pad) + center;
         }
-        // All three: left, center in middle, right at edge.
+        // All three: left, center in middle, right at edge (minus reserved col).
         const centerPos = Math.max(leftW, Math.floor((cols - centerW) / 2));
-        const rightPos = Math.max(centerPos + centerW, cols - rightW);
+        const rightPos = Math.max(centerPos + centerW, rightEdge - rightW);
         const padLeft = Math.max(0, centerPos - leftW);
         const padRight = Math.max(0, rightPos - centerPos - centerW);
         return left + " ".repeat(padLeft) + center + " ".repeat(padRight) + right;

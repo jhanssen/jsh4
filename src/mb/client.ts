@@ -33,6 +33,7 @@ export type MbStateListener = (connected: boolean) => void;
 export interface MbApi {
     createPopup(opts: CreatePopupOptions): Promise<PopupHandle>;
     getLastCommand(): Promise<LastCommand | null>;
+    getSelection(): Promise<string | null>;
     readonly connected: boolean;
     addEventListener(event: "stateChanged", fn: MbStateListener): void;
     removeEventListener(event: "stateChanged", fn: MbStateListener): void;
@@ -210,6 +211,14 @@ class MbClient implements MbApi {
             }
             return;
         }
+        if (msg.type === "selectionResult") {
+            const p = this.pending.get(msg.reqId);
+            if (p) {
+                this.pending.delete(msg.reqId);
+                p.resolve(msg.text);
+            }
+            return;
+        }
         if (msg.type === "popupClosed") {
             const popup = this.popups.get(msg.id);
             if (popup) {
@@ -257,6 +266,19 @@ class MbClient implements MbApi {
             });
         });
         this.send({ type: "getLastCommand", reqId });
+        return p;
+    }
+
+    async getSelection(): Promise<string | null> {
+        await this.awaitReady();
+        const reqId = this.nextReqId++;
+        const p = new Promise<string | null>((resolve, reject) => {
+            this.pending.set(reqId, {
+                resolve: (v) => resolve(v as string | null),
+                reject,
+            });
+        });
+        this.send({ type: "getSelection", reqId });
         return p;
     }
 

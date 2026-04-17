@@ -80,6 +80,7 @@ function resolveColor(c: Color | undefined): string | null {
         let seq = "";
         for (const part of parts) {
             if (part === "bold") seq += "\x1b[1m";
+            else if (part === "dim" || part === "faint") seq += "\x1b[2m";
             else if (part === "italic") seq += "\x1b[3m";
             else if (part === "underline") seq += "\x1b[4m";
             else if (NAMED_COLORS[part] !== undefined) seq += `\x1b[${NAMED_COLORS[part]}m`;
@@ -108,9 +109,18 @@ function buildResolved(t: Theme): ResolvedTheme {
 
 let resolved: ResolvedTheme = buildResolved(currentTheme);
 
+type ThemeChangeListener = () => void;
+const themeChangeListeners = new Set<ThemeChangeListener>();
+
+export function onThemeChange(fn: ThemeChangeListener): () => void {
+    themeChangeListeners.add(fn);
+    return () => themeChangeListeners.delete(fn);
+}
+
 export function setTheme(theme: Partial<Theme>): void {
     currentTheme = { ...DEFAULT_THEME, ...theme };
     resolved = buildResolved(currentTheme);
+    for (const fn of themeChangeListeners) fn();
 }
 
 export function getCurrentTheme(): Theme {

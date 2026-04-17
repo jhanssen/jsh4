@@ -17,6 +17,10 @@ const native = require("../../build/Release/jsh_native.node") as {
     dup2Fd: (oldFd: number, newFd: number) => number;
     forkExec: (cmd: string, args: string[], stdinFd?: number, stdoutFd?: number, stderrFd?: number, pgid?: number) => number;
     waitForPids: (pids: number[], pgid?: number) => Promise<{ exitCode: number; pipeStatus: number[] }>;
+    captureOutput: (
+        stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
+        pipeOps: string[]
+    ) => Promise<{ exitCode: number; output: string }>;
 };
 
 export interface ExecResult {
@@ -138,6 +142,35 @@ export class ExecHandle implements PromiseLike<ExecResult> {
             // Compound command (&&, ||, ;, etc.) — execute via the main
             // executor with stdout redirected into a capture pipe.
             return this._runCompound(ast, options);
+        }
+        // The fast path below doesn't apply parsed redirections (e.g.
+        // `2>/dev/null`, `>file`). For those, use native.captureOutput which
+        // applies redirs in the forked child and captures stdout into a pipe
+        // without touching the shell's own fds — so widgets calling
+        // jsh.exec concurrently can't trample each other.
+        //
+        // Limitation: captureOutput can't feed options.stdin or capture
+        // stderr into a string. If those are requested alongside redirs,
+        // fall through to the fast path (which will ignore the redirs, like
+        // before). Callers mixing both should compose manually.
+        if (
+            stages.some(s => s.redirs.length > 0) &&
+            options.stdin === undefined &&
+            options.stderr !== "pipe"
+        ) {
+            const pipeOps = ast.type === "Pipeline" ? (ast as Pipeline).pipeOps : [];
+            const result = await native.captureOutput(stages, pipeOps);
+            // Feed the captured output into the line queue so async iterators see it.
+            for (const line of result.output.split("\n")) {
+                if (line.length > 0) this._pushLine(line);
+            }
+            this._finish();
+            return {
+                stdout:   result.output.replace(/\n+$/, ""),
+                stderr:   "",
+                exitCode: result.exitCode,
+                ok:       result.exitCode === 0,
+            };
         }
 
         // stdout capture pipe

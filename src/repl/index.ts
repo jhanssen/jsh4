@@ -10,7 +10,7 @@ import {
     alias, unalias, registerJsFunction, exec, registerCompletion,
 } from "../api/index.js";
 import { getCompletions } from "../completion/index.js";
-import { colorize, getCurrentTheme, registerCommandExists, getResolvedColor } from "../colorize/index.js";
+import { colorize, getCurrentTheme, registerCommandExists, getResolvedColor, onThemeChange } from "../colorize/index.js";
 import { commandExists } from "../completion/index.js";
 import { lookupJsFunction } from "../jsfunctions/index.js";
 import { runTrap } from "../trap/index.js";
@@ -156,8 +156,13 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         // Set up tab completion.
         ui!.setCompletion((input: string) => getCompletions(input));
 
-        // Set suggestion ghost text color from theme.
-        ui!.setSuggestionColor(getResolvedColor("suggestion") ?? "\x1b[2m");
+        // Set suggestion ghost text color from theme — and refresh whenever
+        // setTheme() runs (which may happen after the rc loads).
+        const applySuggestionColor = () => {
+            ui!.setSuggestionColor(getResolvedColor("suggestion") ?? "\x1b[2m");
+        };
+        applySuggestionColor();
+        onThemeChange(applySuggestionColor);
 
         // Register default prompt if user didn't set one.
         if (!userSetPrompt) {
@@ -190,8 +195,10 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         rcPath = resolve(customPath);
     } else {
         const home = String($["HOME"] ?? homedir());
-        for (const name of [".jshrc.ts", ".jshrc.js", ".jshrc"]) {
-            const candidate = join(home, name);
+        const xdgConfig = String($["XDG_CONFIG_HOME"] ?? join(home, ".config"));
+        const configDir = join(xdgConfig, "jsh");
+        for (const ext of ["ts", "mts", "mjs", "js"]) {
+            const candidate = join(configDir, `jshrc.${ext}`);
             if (existsSync(candidate)) { rcPath = candidate; break; }
         }
     }

@@ -6,6 +6,7 @@ import type { WidgetDef, WidgetHandle, WidgetZone, WidgetOptions } from "./widge
 import type { Frame } from "./renderer.js";
 import type { CompletionEntry } from "../completion/index.js";
 import { normalizeEntries } from "../completion/index.js";
+import { displayWidth, truncateToWidth } from "./ansi.js";
 
 export type { WidgetDef, WidgetHandle, WidgetZone, WidgetOptions } from "./widgets.js";
 
@@ -395,15 +396,36 @@ export class TerminalUI {
         this.lastRenderedInputLines = [...inputLines];
 
         // Append ghost text to display (not cached — so it doesn't appear in frozen lines).
+        // Truncate so the rendered line + suggestion fits in (cols - 1) cells —
+        // reserving the last column avoids the xenl pending-wrap glitch that
+        // would otherwise wrap the prompt.
         if (state.suggestion && state.pos === state.len && inputLines.length > 0) {
             const lastIdx = inputLines.length - 1;
-            inputLines[lastIdx] = inputLines[lastIdx]! + this.suggestionColor + state.suggestion + "\x1b[0m";
+            const used = displayWidth(inputLines[lastIdx]!);
+            const budget = Math.max(0, state.cols - 1 - used);
+            if (budget > 0) {
+                const ghost = truncateToWidth(state.suggestion, budget);
+                if (ghost.length > 0) {
+                    // Reset before the suggestion color — many terminals ignore
+                    // \x1b[2m (faint) when a truecolor fg is already set by the
+                    // colorizer, so the ghost would render at full intensity.
+                    inputLines[lastIdx] = inputLines[lastIdx]! + "\x1b[0m" + this.suggestionColor + ghost + "\x1b[0m";
+                }
+            }
         }
 
         // Append completion description (dimmed, after cursor on the input line).
+        // Same width budget as the ghost-text path above.
         if (state.completionDesc && inputLines.length > 0) {
             const lastIdx = inputLines.length - 1;
-            inputLines[lastIdx] += "\x1b[2m " + state.completionDesc + "\x1b[0m";
+            const used = displayWidth(inputLines[lastIdx]!);
+            const budget = Math.max(0, state.cols - 1 - used - 1); // -1 for leading space
+            if (budget > 0) {
+                const desc = truncateToWidth(state.completionDesc, budget);
+                if (desc.length > 0) {
+                    inputLines[lastIdx] += "\x1b[0m\x1b[2m " + desc + "\x1b[0m";
+                }
+            }
         }
 
         // Get header/footer from widgets.
