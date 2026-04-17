@@ -140,6 +140,15 @@ const KEYWORDS = new Set([
     "function", "select", "time",
 ]);
 
+// Keywords whose following word is a *name* or *value list*, not a command
+// invocation. `for i in 1 2 3; do ...` — `i` is a loop variable name, `1 2 3`
+// are list values, not commands. Without this, they'd be flagged as
+// "command not found". The rest of the keywords (if/then/while/do/etc.)
+// introduce a fresh command context.
+const NON_COMMAND_INTRO_KEYWORDS = new Set([
+    "for", "select", "function", "case", "in",
+]);
+
 // ---- Command resolution (cached for current line) ---------------------------
 
 function isValidCommand(name: string): boolean {
@@ -192,7 +201,7 @@ export function colorize(input: string, theme?: Theme, context?: string): string
             case TokenType.Word: {
                 if (KEYWORDS.has(tok.value)) {
                     color = t.keyword;
-                    commandPosition = true;
+                    commandPosition = !NON_COMMAND_INTRO_KEYWORDS.has(tok.value);
                 } else if (commandPosition) {
                     const name = tok.value;
                     if (isValidCommand(name)) {
