@@ -331,7 +331,12 @@ export class TerminalUI {
     private renderFrame(state: InputState): void {
         const prompt = this.getPrompt();
         const rprompt = this.getRightPrompt();
-        const ps2 = this.widgets.getZoneContent("ps2").join("") || "> ";
+        // Only fall back to "> " when no ps2 widget is registered at all. A
+        // registered widget returning "" is treated as an intentional blank
+        // continuation prompt (zsh-style).
+        const ps2 = this.widgets.hasZone("ps2")
+            ? this.widgets.getZoneContent("ps2").join("")
+            : "> ";
 
         // In search mode, show the search prompt instead of the normal prompt.
         let displayPrompt = prompt;
