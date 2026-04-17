@@ -1092,6 +1092,13 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
         }
         return 0;
     } catch (e: unknown) {
+        // Suppress EPIPE / stream-destroyed — normal when a downstream stage
+        // closes early (`seq 100 | @filter | head -3`). Report as 141 to
+        // match the SIGPIPE convention used elsewhere (builtins/compounds).
+        const code = (e as NodeJS.ErrnoException)?.code;
+        if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
+            return 141;
+        }
         if (e !== null && e !== undefined) {
             writeStderr(`jsh: @${node.name || "{"}: ${e instanceof Error ? e.message : e}\n`);
         }
