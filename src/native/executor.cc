@@ -3,11 +3,9 @@
 #include <csignal>
 #include <cstring>
 #include <atomic>
-#include <condition_variable>
-#include <mutex>
-#include <queue>
 #include <string>
-#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <array>
 #include <fcntl.h>
@@ -21,89 +19,68 @@ extern "C" char **environ;
 
 namespace jsh {
 
-struct SpawnCtx {
-    Napi::Promise::Deferred deferred;
-    int exitCode = -1;
-    bool captureOutput = false;
-    std::string capturedOutput;
-    std::vector<int> pipeStatus;  // per-stage exit codes
-    bool stopped = false;         // true if job was stopped (SIGTSTP)
-    int stoppedSignal = 0;
-    pid_t pgid = -1;
-    std::vector<pid_t> pids;     // for background/stopped jobs
+// ---- Forward decls --------------------------------------------------------
+struct SpawnCtx;
+static void maybeFinalize(SpawnCtx* ctx);
+static void resolveCtxPromise(SpawnCtx* ctx);
+
+// ---- Global state ---------------------------------------------------------
+static napi_env g_env = nullptr;
+static bool g_interactive = false;
+static uv_signal_t g_sigchld;
+
+struct PendingChild {
+    SpawnCtx* ctx;        // nullptr when this pid belongs to a background job
+    size_t    stageIdx;   // which ctx->pipeStatus slot to fill
 };
 
-// ---- Global async handle for signaling main thread -------------------------
-static napi_env g_env = nullptr;
-static uv_async_t g_async;
-static std::mutex g_done_mutex;
-static std::queue<SpawnCtx*> g_done_queue;
-static std::atomic<int> g_pending{0};  // ref-count: >0 keeps event loop alive
+// All pids the shell is tracking. Background pids use ctx==nullptr.
+static std::unordered_map<pid_t, PendingChild> g_pending;
 
-static void refAsync() {
-    if (g_pending.fetch_add(1, std::memory_order_relaxed) == 0) {
-        uv_ref(reinterpret_cast<uv_handle_t*>(&g_async));
-    }
-}
+// Pids returned by forkExec that haven't been handed to waitForPids yet.
+// SIGCHLD parks the raw wait status here, so a wait call arriving after the
+// process already exited still sees the result.
+struct OrphanStatus {
+    int  status = 0;
+    bool reaped = false;
+};
+static std::unordered_map<pid_t, OrphanStatus> g_orphans;
 
-static void signalDone(SpawnCtx* ctx) {
-    {
-        std::lock_guard<std::mutex> lock(g_done_mutex);
-        g_done_queue.push(ctx);
-    }
-    uv_async_send(&g_async);
-}
+struct BgExit {
+    pid_t pid;
+    int   exitCode;
+    bool  stopped;
+    int   stoppedSignal;
+};
+// Completion buffer for background jobs — drained by reapChildren() from JS.
+static std::vector<BgExit> g_bg_completions;
 
-static void OnAsyncDone(uv_async_t*) {
-    std::queue<SpawnCtx*> local;
-    {
-        std::lock_guard<std::mutex> lock(g_done_mutex);
-        std::swap(local, g_done_queue);
-    }
-    Napi::Env env(g_env);
-    Napi::HandleScope scope(env);
-    int count = static_cast<int>(local.size());
-    while (!local.empty()) {
-        SpawnCtx* ctx = local.front();
-        local.pop();
-        if (ctx->captureOutput) {
-            Napi::Object result = Napi::Object::New(env);
-            result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
-            result.Set("output",   Napi::String::New(env, ctx->capturedOutput));
-            ctx->deferred.Resolve(result);
-        } else {
-            Napi::Object result = Napi::Object::New(env);
-            result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
-            Napi::Array ps = Napi::Array::New(env, ctx->pipeStatus.size());
-            for (size_t i = 0; i < ctx->pipeStatus.size(); i++) {
-                ps.Set(static_cast<uint32_t>(i), Napi::Number::New(env, ctx->pipeStatus[i]));
-            }
-            result.Set("pipeStatus", ps);
-            result.Set("stopped", Napi::Boolean::New(env, ctx->stopped));
-            result.Set("stoppedSignal", Napi::Number::New(env, ctx->stoppedSignal));
-            result.Set("pgid", Napi::Number::New(env, ctx->pgid));
-            if (!ctx->pids.empty()) {
-                Napi::Array pidsArr = Napi::Array::New(env, ctx->pids.size());
-                for (size_t i = 0; i < ctx->pids.size(); i++) {
-                    pidsArr.Set(static_cast<uint32_t>(i), Napi::Number::New(env, static_cast<int>(ctx->pids[i])));
-                }
-                result.Set("pids", pidsArr);
-            }
-            ctx->deferred.Resolve(result);
-        }
-        delete ctx;
-    }
-    if (g_pending.fetch_sub(count, std::memory_order_relaxed) == count) {
-        uv_unref(reinterpret_cast<uv_handle_t*>(&g_async));
-    }
-}
+struct SpawnCtx {
+    Napi::Promise::Deferred deferred;
+    int  exitCode = -1;
+    bool captureOutput = false;
+    std::string capturedOutput;
+    std::vector<int> pipeStatus;
+    bool stopped = false;
+    int  stoppedSignal = 0;
+    pid_t pgid = -1;
+    std::vector<pid_t> pids;
 
-// ---- Redirection and stage specs ----------------------------------------
+    // Lifecycle tracking.
+    int  pendingPids = 0;            // siblings still unreaped
+    bool foreground  = false;        // true iff tcsetpgrp'd to pgid
+    uv_poll_t* captureWatch = nullptr;
+    int  captureFd   = -1;
+    bool captureEof  = false;
+    bool resolved    = false;
+};
+
+// ---- Redirection and stage specs -----------------------------------------
 
 struct RedirSpec {
     std::string op;
-    int fd = -1;        // explicit fd prefix (-1 = use default)
-    std::string target; // filename, fd number as string, or here-doc body
+    int fd = -1;
+    std::string target;
     bool isHereDoc = false;
 };
 
@@ -113,30 +90,17 @@ struct StageSpec {
     std::vector<RedirSpec> redirs;
 };
 
-struct PipelineRequest {
-    std::vector<StageSpec> stages;
-    std::vector<std::string> pipeOps;
-    SpawnCtx* ctx;
-    bool captureOutput = false;
-    bool background = false;
-};
-
-// ---- Helpers used in the child (post-fork, pre-exec) --------------------
-// Keep these to async-signal-safe or provably safe-after-fork calls only.
+// ---- Helpers used in the child (post-fork, pre-exec) ---------------------
+// Keep these async-signal-safe or provably safe-after-fork.
 
 static void writeErr(const char* s) {
     [[maybe_unused]] auto _w = write(STDERR_FILENO, s, strlen(s));
 }
 
-// Apply a list of redirections in the child after pipe fds are set up.
-// Returns false and writes to stderr if a file cannot be opened.
 // Write here-doc body to a pipe and return the read end; caller must close it.
-// Returns -1 on failure.
 static int makeHereDocPipe(const std::string& body) {
     int fds[2];
     if (pipe(fds) != 0) return -1;
-    // Write body to write end — if body is larger than PIPE_BUF this could
-    // block, but here-docs in practice are small.
     const char* p = body.c_str();
     size_t left = body.size();
     while (left > 0) {
@@ -172,7 +136,6 @@ static bool applyRedirections(const std::vector<RedirSpec>& redirs) {
             close(newfd);
 
         } else if (op == "<<" || op == "<<-") {
-            // Here-doc: body is in target, create a pipe.
             int readFd = makeHereDocPipe(r.target);
             if (readFd < 0) {
                 writeErr("jsh: here-doc pipe failed\n");
@@ -183,7 +146,6 @@ static bool applyRedirections(const std::vector<RedirSpec>& redirs) {
             close(readFd);
 
         } else if (op == "<<<") {
-            // Here-string: body is in target + newline.
             std::string body = r.target + "\n";
             int readFd = makeHereDocPipe(body);
             if (readFd < 0) {
@@ -209,7 +171,6 @@ static bool applyRedirections(const std::vector<RedirSpec>& redirs) {
             close(newfd);
 
         } else if (op == ">&") {
-            // e.g. 2>&1: dup2(target_fd, src_fd)
             int src = (r.fd >= 0) ? r.fd : STDOUT_FILENO;
             int dst = atoi(r.target.c_str());
             dup2(dst, src);
@@ -223,8 +184,6 @@ static bool applyRedirections(const std::vector<RedirSpec>& redirs) {
     return true;
 }
 
-// Clear O_CLOEXEC on stdin/stdout/stderr — Node sets it, which would close
-// them in the child on exec.
 static void clearCloexecStdio() {
     for (int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
         int flags = fcntl(fd, F_GETFD);
@@ -234,365 +193,405 @@ static void clearCloexecStdio() {
     }
 }
 
-static bool g_interactive = false;
-
-// ---- Wait request (used by mixed-pipeline path) ---------------------------
-
-struct WaitRequest {
-    std::vector<pid_t> pids;
-    int pgid;
-    SpawnCtx* ctx;
-};
-
-static void processWait(WaitRequest* req) {
-    int lastCode = 0;
-    bool foreground = req->pgid > 0;
-    int waitFlags = foreground ? WUNTRACED : 0;
-    req->ctx->pipeStatus.resize(req->pids.size(), 0);
-    req->ctx->pgid = req->pgid;
-    for (size_t i = 0; i < req->pids.size(); i++) {
-        int status = 0;
-        pid_t w;
-        do {
-            w = waitpid(req->pids[i], &status, waitFlags);
-        } while (w == -1 && errno == EINTR);
-        if (w == -1) {
-            // Process already reaped or doesn't exist — skip.
-            req->ctx->pipeStatus[i] = 127;
-            continue;
+static bool stagesCanPosixSpawn(const std::vector<StageSpec>& stages) {
+    for (const auto& stage : stages) {
+        for (const auto& r : stage.redirs) {
+            if (r.op == "<<" || r.op == "<<-" || r.op == "<<<")
+                return false;
         }
-        if (WIFSTOPPED(status)) {
-            req->ctx->stopped = true;
-            req->ctx->stoppedSignal = WSTOPSIG(status);
-            req->ctx->exitCode = 128 + WSTOPSIG(status);
-            req->ctx->pids = req->pids;
-            if (g_interactive && req->pgid > 0)
-                tcsetpgrp(STDIN_FILENO, getpgrp());
-            signalDone(req->ctx);
-            delete req;
-            return;
-        }
-        int code = WIFEXITED(status)   ? WEXITSTATUS(status) :
-                   WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
-        req->ctx->pipeStatus[i] = code;
-        if (i == req->pids.size() - 1) lastCode = code;
     }
-    if (g_interactive && req->pgid > 0)
-        tcsetpgrp(STDIN_FILENO, getpgrp());
-    req->ctx->exitCode = lastCode;
-    signalDone(req->ctx);
-    delete req;
+    return true;
 }
 
-// ---- Executor state ------------------------------------------------------
+// ---- Pid tracking ---------------------------------------------------------
 
-struct ExecutorState {
-    std::thread thread;
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::queue<PipelineRequest*> queue;
-    std::queue<WaitRequest*> waitQueue;
-    bool running = true;
+static void registerPid(pid_t pid, SpawnCtx* ctx, size_t stageIdx) {
+    g_pending[pid] = PendingChild { ctx, stageIdx };
+    if (ctx) ctx->pendingPids++;
+}
 
-    void start() {
-        thread = std::thread(&ExecutorState::run, this);
-        thread.detach();
+// Called from the SIGCHLD handler when a foreground pid reports stopped.
+// Stops apply to the whole process group — collect remaining ctx pids for
+// the job table and drop them from g_pending (they'll be re-registered via
+// waitForPids when fg/bg resumes the job).
+static void handleStopped(SpawnCtx* ctx, int status) {
+    if (!ctx) return;  // background job — shouldn't normally stop via WUNTRACED
+    ctx->stopped = true;
+    ctx->stoppedSignal = WSTOPSIG(status);
+    ctx->exitCode = 128 + WSTOPSIG(status);
+
+    // Gather remaining pids for this ctx (so JS can track them in the job
+    // table) and remove them from our pending map.
+    std::vector<pid_t> remaining;
+    for (auto it = g_pending.begin(); it != g_pending.end(); ) {
+        if (it->second.ctx == ctx) {
+            remaining.push_back(it->first);
+            it = g_pending.erase(it);
+        } else {
+            ++it;
+        }
     }
+    // Also include pids that already exited cleanly before the stop fired.
+    // ctx->pids may already be populated from earlier siblings — merge.
+    for (pid_t p : remaining) ctx->pids.push_back(p);
+    ctx->pendingPids = 0;
 
-    void enqueue(PipelineRequest* req) {
-        std::lock_guard<std::mutex> lock(mutex);
-        queue.push(req);
-        cv.notify_one();
+    if (g_interactive && ctx->foreground && ctx->pgid > 0) {
+        tcsetpgrp(STDIN_FILENO, getpgrp());
     }
+    maybeFinalize(ctx);
+}
 
-    void enqueueWait(WaitRequest* req) {
-        std::lock_guard<std::mutex> lock(mutex);
-        waitQueue.push(req);
-        cv.notify_one();
+// ---- Capture pipe drain (uv_poll_t on the read end) ----------------------
+
+static void onPollClose(uv_handle_t* h) {
+    delete reinterpret_cast<uv_poll_t*>(h);
+}
+
+static void onCaptureReadable(uv_poll_t* h, int /*status*/, int /*events*/) {
+    SpawnCtx* ctx = static_cast<SpawnCtx*>(h->data);
+    char buf[4096];
+    for (;;) {
+        ssize_t n = read(ctx->captureFd, buf, sizeof(buf));
+        if (n > 0) {
+            ctx->capturedOutput.append(buf, static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Pipe drained for now; wait for next readable event.
+            return;
+        }
+        // EOF (n == 0) or a real error — tear down.
+        uv_poll_stop(h);
+        uv_close(reinterpret_cast<uv_handle_t*>(h), onPollClose);
+        close(ctx->captureFd);
+        ctx->captureFd = -1;
+        ctx->captureWatch = nullptr;
+        ctx->captureEof = true;
+        maybeFinalize(ctx);
+        return;
     }
+}
 
-    void run() {
-        while (true) {
-            PipelineRequest* req = nullptr;
-            WaitRequest* wreq = nullptr;
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [this] {
-                    return !queue.empty() || !waitQueue.empty() || !running;
-                });
-                if (!running && queue.empty() && waitQueue.empty()) break;
-                if (!queue.empty()) {
-                    req = queue.front(); queue.pop();
-                } else if (!waitQueue.empty()) {
-                    wreq = waitQueue.front(); waitQueue.pop();
-                }
+// ---- Resolution -----------------------------------------------------------
+
+static void resolveCtxPromise(SpawnCtx* ctx) {
+    if (ctx->resolved) return;
+    ctx->resolved = true;
+
+    Napi::Env env(g_env);
+    Napi::HandleScope scope(env);
+
+    if (ctx->captureOutput) {
+        Napi::Object result = Napi::Object::New(env);
+        result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
+        result.Set("output",   Napi::String::New(env, ctx->capturedOutput));
+        ctx->deferred.Resolve(result);
+    } else {
+        Napi::Object result = Napi::Object::New(env);
+        result.Set("exitCode", Napi::Number::New(env, ctx->exitCode));
+        Napi::Array ps = Napi::Array::New(env, ctx->pipeStatus.size());
+        for (size_t i = 0; i < ctx->pipeStatus.size(); i++) {
+            ps.Set(static_cast<uint32_t>(i), Napi::Number::New(env, ctx->pipeStatus[i]));
+        }
+        result.Set("pipeStatus", ps);
+        result.Set("stopped", Napi::Boolean::New(env, ctx->stopped));
+        result.Set("stoppedSignal", Napi::Number::New(env, ctx->stoppedSignal));
+        result.Set("pgid", Napi::Number::New(env, ctx->pgid));
+        if (!ctx->pids.empty()) {
+            Napi::Array pidsArr = Napi::Array::New(env, ctx->pids.size());
+            for (size_t i = 0; i < ctx->pids.size(); i++) {
+                pidsArr.Set(static_cast<uint32_t>(i),
+                            Napi::Number::New(env, static_cast<int>(ctx->pids[i])));
             }
-            if (req) processPipeline(req);
-            if (wreq) processWait(wreq);
+            result.Set("pids", pidsArr);
+        }
+        ctx->deferred.Resolve(result);
+    }
+}
+
+static void maybeFinalize(SpawnCtx* ctx) {
+    if (ctx->pendingPids > 0) return;                   // children still running
+    if (ctx->captureWatch && !ctx->captureEof) return;  // capture still draining
+    resolveCtxPromise(ctx);
+    delete ctx;
+}
+
+// ---- SIGCHLD handler ------------------------------------------------------
+
+static void onSigChld(uv_signal_t*, int /*signum*/) {
+    pid_t pid;
+    int status;
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        auto it = g_pending.find(pid);
+        if (it == g_pending.end()) {
+            // Not in pending — might be a forkExec'd orphan waiting for its
+            // waitForPids call. Park the status so waitForPids can retrieve
+            // it; otherwise the exit goes unnoticed and the Promise hangs.
+            auto oit = g_orphans.find(pid);
+            if (oit != g_orphans.end()) {
+                oit->second.status = status;
+                oit->second.reaped = true;
+            }
+            continue;
+        }
+
+        SpawnCtx* ctx = it->second.ctx;
+        size_t idx = it->second.stageIdx;
+        g_pending.erase(it);
+
+        if (!ctx) {
+            // Background job — record for reapChildren drain.
+            BgExit ex { pid, 0, false, 0 };
+            if (WIFEXITED(status))       ex.exitCode = WEXITSTATUS(status);
+            else if (WIFSIGNALED(status)) ex.exitCode = 128 + WTERMSIG(status);
+            else if (WIFSTOPPED(status)) {
+                ex.stopped = true;
+                ex.stoppedSignal = WSTOPSIG(status);
+                ex.exitCode = 128 + WSTOPSIG(status);
+            }
+            g_bg_completions.push_back(ex);
+            continue;
+        }
+
+        if (WIFSTOPPED(status)) {
+            // Save already-completed sibling pids before handleStopped clears.
+            // pipeStatus slots already filled stay; other slots remain 0.
+            handleStopped(ctx, status);
+            continue;
+        }
+
+        int code = WIFEXITED(status)   ? WEXITSTATUS(status)
+                 : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+
+        if (idx < ctx->pipeStatus.size()) ctx->pipeStatus[idx] = code;
+        if (idx + 1 == ctx->pipeStatus.size()) ctx->exitCode = code;
+        ctx->pendingPids--;
+
+        if (ctx->pendingPids == 0) {
+            // Last sibling of a foreground pipeline — return the terminal.
+            // Capture and background pipelines never took it.
+            if (g_interactive && ctx->foreground && ctx->pgid > 0) {
+                tcsetpgrp(STDIN_FILENO, getpgrp());
+            }
+            maybeFinalize(ctx);
+        }
+    }
+}
+
+// ---- Pipeline spawn (runs inline on the main/V8 thread) -------------------
+
+struct PipelineReq {
+    std::vector<StageSpec>   stages;
+    std::vector<std::string> pipeOps;
+    bool captureOutput = false;
+    bool background    = false;
+};
+
+// Spawn all stages and register their pids. Returns false on unrecoverable
+// failure, having already resolved ctx with an error exitCode.
+static bool spawnPipelineInline(PipelineReq& req, SpawnCtx* ctx) {
+    const auto& stages = req.stages;
+    const auto& pipeOps = req.pipeOps;
+    int n = static_cast<int>(stages.size());
+
+    std::vector<std::vector<const char*>> argvs(n);
+    for (int i = 0; i < n; i++) {
+        argvs[i].push_back(stages[i].cmd.c_str());
+        for (const auto& a : stages[i].args) argvs[i].push_back(a.c_str());
+        argvs[i].push_back(nullptr);
+    }
+
+    std::vector<std::array<int, 2>> pipes(n - 1);
+    for (int i = 0; i < n - 1; i++) {
+        if (pipe(pipes[i].data()) != 0) {
+            for (int j = 0; j < i; j++) { close(pipes[j][0]); close(pipes[j][1]); }
+            ctx->exitCode = 1;
+            resolveCtxPromise(ctx);
+            delete ctx;
+            return false;
         }
     }
 
-    // Returns true when all stages use only simple redirections that
-    // posix_spawn_file_actions can express.  Here-docs/here-strings need
-    // a pre-fork pipe+write, so they fall back to the fork path.
-    static bool stagesCanPosixSpawn(const std::vector<StageSpec>& stages) {
-        for (const auto& stage : stages) {
-            for (const auto& r : stage.redirs) {
-                if (r.op == "<<" || r.op == "<<-" || r.op == "<<<")
-                    return false;
-            }
+    int capturePipe[2] = {-1, -1};
+    if (req.captureOutput) {
+        if (pipe(capturePipe) != 0) {
+            for (auto& p : pipes) { close(p[0]); close(p[1]); }
+            ctx->exitCode = 1;
+            resolveCtxPromise(ctx);
+            delete ctx;
+            return false;
         }
-        return true;
     }
 
-    void processPipeline(PipelineRequest* req) {
-        const auto& stages = req->stages;
-        const auto& pipeOps = req->pipeOps;
-        int n = static_cast<int>(stages.size());
+    pid_t pgid = -1;
+    std::vector<pid_t> pids;
+    ctx->pipeStatus.resize(n, 0);
 
-        // Build all argvs before any fork — malloc is unsafe post-fork in a
-        // multithreaded process.
-        std::vector<std::vector<const char*>> argvs(n);
+    if (stagesCanPosixSpawn(stages)) {
         for (int i = 0; i < n; i++) {
-            argvs[i].push_back(stages[i].cmd.c_str());
-            for (const auto& a : stages[i].args) argvs[i].push_back(a.c_str());
-            argvs[i].push_back(nullptr);
-        }
+            posix_spawnattr_t attr;
+            posix_spawn_file_actions_t actions;
+            posix_spawnattr_init(&attr);
+            posix_spawn_file_actions_init(&actions);
 
-        // Create N-1 pipes: pipes[i] connects stage i stdout → stage i+1 stdin.
-        std::vector<std::array<int, 2>> pipes(n - 1);
-        for (int i = 0; i < n - 1; i++) {
-            if (pipe(pipes[i].data()) != 0) {
-                for (int j = 0; j < i; j++) {
-                    close(pipes[j][0]);
-                    close(pipes[j][1]);
-                }
-                req->ctx->exitCode = 1;
-                signalDone(req->ctx);
-                delete req;
-                return;
+            short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
+            posix_spawnattr_setflags(&attr, flags);
+            posix_spawnattr_setpgroup(&attr, pgid == -1 ? 0 : pgid);
+
+            sigset_t emptyMask; sigemptyset(&emptyMask);
+            posix_spawnattr_setsigmask(&attr, &emptyMask);
+
+            sigset_t defSigs; sigemptyset(&defSigs);
+            sigaddset(&defSigs, SIGINT);
+            sigaddset(&defSigs, SIGTTOU);
+            sigaddset(&defSigs, SIGTTIN);
+            sigaddset(&defSigs, SIGPIPE);
+            posix_spawnattr_setsigdefault(&attr, &defSigs);
+
+            bool stdinSet = false, stdoutSet = false, stderrSet = false;
+
+            if (i > 0) {
+                posix_spawn_file_actions_adddup2(&actions, pipes[i - 1][0], STDIN_FILENO);
+                stdinSet = true;
             }
-        }
-
-        // Capture pipe: capturePipe[0]=read, capturePipe[1]=write.
-        // The last stage's stdout is redirected to capturePipe[1].
-        int capturePipe[2] = {-1, -1};
-        if (req->captureOutput) {
-            if (pipe(capturePipe) != 0) {
-                for (auto& p : pipes) { close(p[0]); close(p[1]); }
-                req->ctx->exitCode = 1;
-                signalDone(req->ctx);
-                delete req;
-                return;
-            }
-        }
-
-        pid_t pgid = -1;
-        std::vector<pid_t> pids;
-
-        // ---- posix_spawn fast path ------------------------------------
-        if (stagesCanPosixSpawn(stages)) {
-            bool spawnOk = true;
-            for (int i = 0; i < n && spawnOk; i++) {
-                posix_spawnattr_t attr;
-                posix_spawn_file_actions_t actions;
-                posix_spawnattr_init(&attr);
-                posix_spawn_file_actions_init(&actions);
-
-                // Process group.
-                short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
-                posix_spawnattr_setflags(&attr, flags);
-                posix_spawnattr_setpgroup(&attr, pgid == -1 ? 0 : pgid);
-
-                // Empty signal mask.
-                sigset_t emptyMask;
-                sigemptyset(&emptyMask);
-                posix_spawnattr_setsigmask(&attr, &emptyMask);
-
-                // Reset SIGINT, SIGTTOU, SIGTTIN, SIGPIPE to default.
-                sigset_t defSigs;
-                sigemptyset(&defSigs);
-                sigaddset(&defSigs, SIGINT);
-                sigaddset(&defSigs, SIGTTOU);
-                sigaddset(&defSigs, SIGTTIN);
-                sigaddset(&defSigs, SIGPIPE);
-                posix_spawnattr_setsigdefault(&attr, &defSigs);
-
-                // Track which stdio fds have been explicitly dup2'd.
-                bool stdinSet = false, stdoutSet = false, stderrSet = false;
-
-                // Pipe wiring.
-                if (i > 0) {
-                    posix_spawn_file_actions_adddup2(&actions, pipes[i - 1][0], STDIN_FILENO);
-                    stdinSet = true;
+            if (i < n - 1) {
+                posix_spawn_file_actions_adddup2(&actions, pipes[i][1], STDOUT_FILENO);
+                stdoutSet = true;
+                if (i < static_cast<int>(pipeOps.size()) && pipeOps[i] == "|&") {
+                    posix_spawn_file_actions_adddup2(&actions, pipes[i][1], STDERR_FILENO);
+                    stderrSet = true;
                 }
-                if (i < n - 1) {
-                    posix_spawn_file_actions_adddup2(&actions, pipes[i][1], STDOUT_FILENO);
-                    stdoutSet = true;
-                    if (i < static_cast<int>(pipeOps.size()) && pipeOps[i] == "|&") {
-                        posix_spawn_file_actions_adddup2(&actions, pipes[i][1], STDERR_FILENO);
+            } else if (capturePipe[1] != -1) {
+                posix_spawn_file_actions_adddup2(&actions, capturePipe[1], STDOUT_FILENO);
+                stdoutSet = true;
+            }
+
+            for (int j = 0; j < n - 1; j++) {
+                posix_spawn_file_actions_addclose(&actions, pipes[j][0]);
+                posix_spawn_file_actions_addclose(&actions, pipes[j][1]);
+            }
+            if (capturePipe[0] != -1) posix_spawn_file_actions_addclose(&actions, capturePipe[0]);
+            if (capturePipe[1] != -1) posix_spawn_file_actions_addclose(&actions, capturePipe[1]);
+
+            for (const auto& r : stages[i].redirs) {
+                if (r.op == ">" || r.op == ">>" || r.op == "&>" || r.op == "&>>") {
+                    int oflags = O_WRONLY | O_CREAT;
+                    oflags |= (r.op == ">>" || r.op == "&>>") ? O_APPEND : O_TRUNC;
+                    int dst = (r.fd >= 0) ? r.fd : STDOUT_FILENO;
+                    posix_spawn_file_actions_addopen(&actions, dst, r.target.c_str(), oflags, 0666);
+                    if (dst == STDIN_FILENO) stdinSet = true;
+                    if (dst == STDOUT_FILENO) stdoutSet = true;
+                    if (dst == STDERR_FILENO) stderrSet = true;
+                    if (r.op == "&>" || r.op == "&>>") {
+                        posix_spawn_file_actions_adddup2(&actions, dst, STDERR_FILENO);
                         stderrSet = true;
                     }
-                } else if (capturePipe[1] != -1) {
-                    posix_spawn_file_actions_adddup2(&actions, capturePipe[1], STDOUT_FILENO);
-                    stdoutSet = true;
+                } else if (r.op == "<") {
+                    int dst = (r.fd >= 0) ? r.fd : STDIN_FILENO;
+                    posix_spawn_file_actions_addopen(&actions, dst, r.target.c_str(), O_RDONLY, 0);
+                    if (dst == STDIN_FILENO) stdinSet = true;
+                    if (dst == STDOUT_FILENO) stdoutSet = true;
+                    if (dst == STDERR_FILENO) stderrSet = true;
+                } else if (r.op == ">&") {
+                    int src = (r.fd >= 0) ? r.fd : STDOUT_FILENO;
+                    int dst = atoi(r.target.c_str());
+                    posix_spawn_file_actions_adddup2(&actions, dst, src);
+                    if (src == STDIN_FILENO) stdinSet = true;
+                    if (src == STDOUT_FILENO) stdoutSet = true;
+                    if (src == STDERR_FILENO) stderrSet = true;
+                } else if (r.op == "<&") {
+                    int src = (r.fd >= 0) ? r.fd : STDIN_FILENO;
+                    int dst = atoi(r.target.c_str());
+                    posix_spawn_file_actions_adddup2(&actions, dst, src);
+                    if (src == STDIN_FILENO) stdinSet = true;
+                    if (src == STDOUT_FILENO) stdoutSet = true;
+                    if (src == STDERR_FILENO) stderrSet = true;
                 }
+            }
 
-                // Close all pipe fds and capture pipe fds in the child.
-                for (int j = 0; j < n - 1; j++) {
-                    posix_spawn_file_actions_addclose(&actions, pipes[j][0]);
-                    posix_spawn_file_actions_addclose(&actions, pipes[j][1]);
-                }
-                if (capturePipe[0] != -1) posix_spawn_file_actions_addclose(&actions, capturePipe[0]);
-                if (capturePipe[1] != -1) posix_spawn_file_actions_addclose(&actions, capturePipe[1]);
-
-                // Apply redirections.
-                for (const auto& r : stages[i].redirs) {
-                    if (r.op == ">" || r.op == ">>" || r.op == "&>" || r.op == "&>>") {
-                        int oflags = O_WRONLY | O_CREAT;
-                        oflags |= (r.op == ">>" || r.op == "&>>") ? O_APPEND : O_TRUNC;
-                        int dst = (r.fd >= 0) ? r.fd : STDOUT_FILENO;
-                        posix_spawn_file_actions_addopen(&actions, dst, r.target.c_str(), oflags, 0666);
-                        if (dst == STDIN_FILENO) stdinSet = true;
-                        if (dst == STDOUT_FILENO) stdoutSet = true;
-                        if (dst == STDERR_FILENO) stderrSet = true;
-                        if (r.op == "&>" || r.op == "&>>") {
-                            posix_spawn_file_actions_adddup2(&actions, dst, STDERR_FILENO);
-                            stderrSet = true;
-                        }
-                    } else if (r.op == "<") {
-                        int dst = (r.fd >= 0) ? r.fd : STDIN_FILENO;
-                        posix_spawn_file_actions_addopen(&actions, dst, r.target.c_str(), O_RDONLY, 0);
-                        if (dst == STDIN_FILENO) stdinSet = true;
-                        if (dst == STDOUT_FILENO) stdoutSet = true;
-                        if (dst == STDERR_FILENO) stderrSet = true;
-                    } else if (r.op == ">&") {
-                        int src = (r.fd >= 0) ? r.fd : STDOUT_FILENO;
-                        int dst = atoi(r.target.c_str());
-                        posix_spawn_file_actions_adddup2(&actions, dst, src);
-                        if (src == STDIN_FILENO) stdinSet = true;
-                        if (src == STDOUT_FILENO) stdoutSet = true;
-                        if (src == STDERR_FILENO) stderrSet = true;
-                    } else if (r.op == "<&") {
-                        int src = (r.fd >= 0) ? r.fd : STDIN_FILENO;
-                        int dst = atoi(r.target.c_str());
-                        posix_spawn_file_actions_adddup2(&actions, dst, src);
-                        if (src == STDIN_FILENO) stdinSet = true;
-                        if (src == STDOUT_FILENO) stdoutSet = true;
-                        if (src == STDERR_FILENO) stderrSet = true;
-                    }
-                }
-
-                // Clear CLOEXEC on stdio fds so the child inherits them.
-                // On Linux, glibc's posix_spawn handles dup2(fd,fd) specially
-                // to clear CLOEXEC. On macOS, dup2(fd,fd) is a no-op, so we
-                // use the macOS-specific addinherit_np instead.
 #ifdef __APPLE__
-                if (!stdinSet)  posix_spawn_file_actions_addinherit_np(&actions, STDIN_FILENO);
-                if (!stdoutSet) posix_spawn_file_actions_addinherit_np(&actions, STDOUT_FILENO);
-                if (!stderrSet) posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO);
+            if (!stdinSet)  posix_spawn_file_actions_addinherit_np(&actions, STDIN_FILENO);
+            if (!stdoutSet) posix_spawn_file_actions_addinherit_np(&actions, STDOUT_FILENO);
+            if (!stderrSet) posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO);
 #else
-                if (!stdinSet)  posix_spawn_file_actions_adddup2(&actions, STDIN_FILENO,  STDIN_FILENO);
-                if (!stdoutSet) posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDOUT_FILENO);
-                if (!stderrSet) posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDERR_FILENO);
+            if (!stdinSet)  posix_spawn_file_actions_adddup2(&actions, STDIN_FILENO,  STDIN_FILENO);
+            if (!stdoutSet) posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDOUT_FILENO);
+            if (!stderrSet) posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDERR_FILENO);
 #endif
 
-                pid_t pid;
-                int err = posix_spawnp(&pid, stages[i].cmd.c_str(), &actions, &attr,
-                                       const_cast<char* const*>(argvs[i].data()), environ);
+            pid_t pid;
+            int err = posix_spawnp(&pid, stages[i].cmd.c_str(), &actions, &attr,
+                                   const_cast<char* const*>(argvs[i].data()), environ);
 
-                posix_spawnattr_destroy(&attr);
-                posix_spawn_file_actions_destroy(&actions);
+            posix_spawnattr_destroy(&attr);
+            posix_spawn_file_actions_destroy(&actions);
 
-                if (err != 0) {
-                    writeErr("jsh: ");
-                    writeErr(stages[i].cmd.c_str());
-                    writeErr(": ");
-                    writeErr(strerror(err));
-                    writeErr("\n");
-                    // Clean up remaining pipes.
-                    for (int j = i; j < n - 1; j++) {
-                        close(pipes[j][0]);
-                        close(pipes[j][1]);
-                    }
-                    // Wait for already-spawned children.
-                    for (pid_t p : pids) {
-                        int st = 0;
-                        pid_t w;
-                        do { w = waitpid(p, &st, 0); } while (w == -1 && errno == EINTR);
-                    }
-                    for (int j = 0; j < i && j < n - 1; j++) {
-                        close(pipes[j][0]);
-                        close(pipes[j][1]);
-                    }
-                    req->ctx->exitCode = 127;
-                    signalDone(req->ctx);
-                    delete req;
-                    return;
+            if (err != 0) {
+                writeErr("jsh: ");
+                writeErr(stages[i].cmd.c_str());
+                writeErr(": ");
+                writeErr(strerror(err));
+                writeErr("\n");
+                // Close all remaining pipe fds.
+                for (auto& p : pipes) { close(p[0]); close(p[1]); }
+                if (capturePipe[0] != -1) close(capturePipe[0]);
+                if (capturePipe[1] != -1) close(capturePipe[1]);
+                // Reap any already-spawned children synchronously.
+                for (pid_t p : pids) {
+                    int st = 0; pid_t w;
+                    do { w = waitpid(p, &st, 0); } while (w == -1 && errno == EINTR);
+                    // Drop from g_pending (they won't re-report).
+                    g_pending.erase(p);
                 }
-
-                if (pgid == -1) pgid = pid;
-                setpgid(pid, pgid);
-                pids.push_back(pid);
+                ctx->exitCode = 127;
+                resolveCtxPromise(ctx);
+                delete ctx;
+                return false;
             }
-        } else {
-        // ---- fork path (here-docs/here-strings) -----------------------
+
+            if (pgid == -1) pgid = pid;
+            setpgid(pid, pgid);
+            pids.push_back(pid);
+        }
+    } else {
+        // Fork fallback for here-docs / here-strings.
         for (int i = 0; i < n; i++) {
             pid_t pid = fork();
-
             if (pid == 0) {
-                // ---- Child -----------------------------------------------
-
-                // Join / form process group.
                 if (pgid == -1) pgid = getpid();
                 setpgid(0, pgid);
 
-                // Reset signal mask and handlers.
-                sigset_t empty;
-                sigemptyset(&empty);
+                sigset_t empty; sigemptyset(&empty);
                 sigprocmask(SIG_SETMASK, &empty, nullptr);
                 struct sigaction sa = {};
-                sa.sa_handler = SIG_DFL;
-                sigemptyset(&sa.sa_mask);
+                sa.sa_handler = SIG_DFL; sigemptyset(&sa.sa_mask);
                 sigaction(SIGINT,  &sa, nullptr);
                 sigaction(SIGTTOU, &sa, nullptr);
                 sigaction(SIGTTIN, &sa, nullptr);
                 sigaction(SIGPIPE, &sa, nullptr);
 
-                // Wire up pipe fds.
-                if (i > 0) {
-                    dup2(pipes[i - 1][0], STDIN_FILENO);
-                }
+                if (i > 0) dup2(pipes[i - 1][0], STDIN_FILENO);
                 if (i < n - 1) {
                     dup2(pipes[i][1], STDOUT_FILENO);
                     if (i < static_cast<int>(pipeOps.size()) && pipeOps[i] == "|&") {
                         dup2(pipes[i][1], STDERR_FILENO);
                     }
                 } else if (capturePipe[1] != -1) {
-                    // Last stage: redirect stdout to capture pipe.
                     dup2(capturePipe[1], STDOUT_FILENO);
                 }
 
-                // Close all pipe fds — child only needs the two it dup2'd.
                 for (int j = 0; j < n - 1; j++) {
-                    close(pipes[j][0]);
-                    close(pipes[j][1]);
+                    close(pipes[j][0]); close(pipes[j][1]);
                 }
                 if (capturePipe[0] != -1) close(capturePipe[0]);
                 if (capturePipe[1] != -1) close(capturePipe[1]);
 
-                // Apply redirections (after pipe setup so 2>&1 sees pipe stdout).
-                if (!applyRedirections(stages[i].redirs)) {
-                    _exit(1);
-                }
-
-                // Clear CLOEXEC on stdio so the execd process inherits them.
+                if (!applyRedirections(stages[i].redirs)) _exit(1);
                 clearCloexecStdio();
-
                 execvp(stages[i].cmd.c_str(),
                        const_cast<char* const*>(argvs[i].data()));
 
-                // exec failed
                 writeErr("jsh: ");
                 writeErr(stages[i].cmd.c_str());
                 writeErr(": ");
@@ -601,125 +600,83 @@ struct ExecutorState {
                 _exit(127);
 
             } else if (pid > 0) {
-                // ---- Parent (executor thread) ----------------------------
-
                 if (pgid == -1) pgid = pid;
-                setpgid(pid, pgid); // race-free double call with child
-
+                setpgid(pid, pgid);
                 pids.push_back(pid);
-
             } else {
-                // fork failed — close remaining pipes and bail out
-                for (int j = i; j < n - 1; j++) {
-                    close(pipes[j][0]);
-                    close(pipes[j][1]);
-                }
                 writeErr("jsh: fork: ");
                 writeErr(strerror(errno));
                 writeErr("\n");
-                // Remaining pids will get SIGPIPE / EOF and exit naturally;
-                // wait for any we already forked.
+                for (auto& p : pipes) { close(p[0]); close(p[1]); }
+                if (capturePipe[0] != -1) close(capturePipe[0]);
+                if (capturePipe[1] != -1) close(capturePipe[1]);
                 for (pid_t p : pids) {
-                    int st = 0;
-                    pid_t w;
+                    int st = 0; pid_t w;
                     do { w = waitpid(p, &st, 0); } while (w == -1 && errno == EINTR);
+                    g_pending.erase(p);
                 }
-                // close already-opened pipe fds
-                for (int j = 0; j < i && j < n - 1; j++) {
-                    close(pipes[j][0]);
-                    close(pipes[j][1]);
-                }
-                req->ctx->exitCode = 1;
-                signalDone(req->ctx);
-                delete req;
-                return;
+                ctx->exitCode = 1;
+                resolveCtxPromise(ctx);
+                delete ctx;
+                return false;
             }
         }
-        } // end fork path
-
-        // Parent: close all pipe fds so children see EOF.
-        for (auto& p : pipes) {
-            close(p[0]);
-            close(p[1]);
-        }
-
-        // Store pgid for job control.
-        req->ctx->pgid = pgid;
-
-        // Background mode: don't give terminal, don't wait.
-        if (req->background) {
-            req->ctx->exitCode = 0;
-            req->ctx->pids = pids;
-            signalDone(req->ctx);
-            delete req;
-            return;
-        }
-
-        if (!req->captureOutput && g_interactive && pgid > 0) {
-            tcsetpgrp(STDIN_FILENO, pgid);
-        }
-
-        // For capture mode: close write end, drain read end before waitpid.
-        // Draining first avoids deadlock when the pipe buffer fills.
-        if (req->captureOutput && capturePipe[1] != -1) {
-            close(capturePipe[1]);
-            char buf[4096];
-            ssize_t nread;
-            while ((nread = read(capturePipe[0], buf, sizeof(buf))) > 0) {
-                req->ctx->capturedOutput.append(buf, static_cast<size_t>(nread));
-            }
-            close(capturePipe[0]);
-        }
-
-        // Wait for all children; collect per-stage exit codes.
-        // Use WUNTRACED for foreground jobs so we detect Ctrl-Z (SIGTSTP).
-        int lastExitCode = 0;
-        int waitFlags = req->captureOutput ? 0 : WUNTRACED;
-        req->ctx->pipeStatus.resize(pids.size(), 0);
-        for (size_t i = 0; i < pids.size(); i++) {
-            int status = 0;
-            pid_t w;
-            do { w = waitpid(pids[i], &status, waitFlags); } while (w == -1 && errno == EINTR);
-            if (w == -1) { req->ctx->pipeStatus[i] = 127; continue; }
-            if (WIFSTOPPED(status)) {
-                // Job was stopped (Ctrl-Z). All processes in the group
-                // received SIGTSTP — break immediately.
-                req->ctx->stopped = true;
-                req->ctx->stoppedSignal = WSTOPSIG(status);
-                req->ctx->exitCode = 128 + WSTOPSIG(status);
-                req->ctx->pids = pids;
-                // Return terminal to shell.
-                if (g_interactive && pgid > 0) {
-                    tcsetpgrp(STDIN_FILENO, getpgrp());
-                }
-                signalDone(req->ctx);
-                delete req;
-                return;
-            }
-            int code = WIFEXITED(status)  ? WEXITSTATUS(status) :
-                       WIFSIGNALED(status)? 128 + WTERMSIG(status) : 1;
-            req->ctx->pipeStatus[i] = code;
-            if (i == pids.size() - 1) {
-                lastExitCode = code;
-            }
-        }
-
-        if (!req->captureOutput && g_interactive && pgid > 0) {
-            tcsetpgrp(STDIN_FILENO, getpgrp());
-        }
-
-        req->ctx->exitCode = lastExitCode;
-        signalDone(req->ctx);
-        delete req;
     }
-};
 
-static ExecutorState* g_executor = nullptr;
+    // Parent closes all inter-stage pipe fds.
+    for (auto& p : pipes) { close(p[0]); close(p[1]); }
+    // Parent also closes the capture write end; the read end stays for drain.
+    if (capturePipe[1] != -1) close(capturePipe[1]);
+
+    ctx->pgid = pgid;
+    ctx->pids = pids;
+
+    // Register pids with the pending map.
+    for (size_t i = 0; i < pids.size(); i++) {
+        if (req.background) {
+            g_pending[pids[i]] = PendingChild { nullptr, 0 };
+        } else {
+            registerPid(pids[i], ctx, i);
+        }
+    }
+
+    // Background pipeline: resolve immediately with {exitCode:0, pids, pgid}.
+    if (req.background) {
+        ctx->exitCode = 0;
+        resolveCtxPromise(ctx);
+        delete ctx;
+        return true;
+    }
+
+    // Foreground external pipeline takes the terminal; capture mode does not.
+    if (!req.captureOutput && g_interactive && pgid > 0) {
+        ctx->foreground = true;
+        tcsetpgrp(STDIN_FILENO, pgid);
+    }
+
+    // Set up capture drain if needed. The read fd must be non-blocking so
+    // the uv_poll callback can loop read() until EAGAIN.
+    if (req.captureOutput) {
+        int fl = fcntl(capturePipe[0], F_GETFL);
+        if (fl != -1) fcntl(capturePipe[0], F_SETFL, fl | O_NONBLOCK);
+        ctx->captureFd = capturePipe[0];
+        ctx->captureWatch = new uv_poll_t;
+        ctx->captureWatch->data = ctx;
+        uv_loop_t* loop;
+        napi_get_uv_event_loop(g_env, &loop);
+        uv_poll_init(loop, ctx->captureWatch, capturePipe[0]);
+        uv_poll_start(ctx->captureWatch, UV_READABLE, onCaptureReadable);
+    }
+
+    return true;
+}
 
 // ---- N-API bindings -------------------------------------------------------
 
 static Napi::Value InitExecutor_(const Napi::CallbackInfo& info) {
-    if (g_executor) return info.Env().Undefined();
+    static bool initialized = false;
+    if (initialized) return info.Env().Undefined();
+    initialized = true;
 
     // Ignore SIGTTOU/SIGTTIN — standard for interactive shells.
     struct sigaction sa = {};
@@ -728,10 +685,11 @@ static Napi::Value InitExecutor_(const Napi::CallbackInfo& info) {
     sigaction(SIGTTOU, &sa, nullptr);
     sigaction(SIGTTIN, &sa, nullptr);
 
-    // Block SIGCHLD and SIGINT on the main thread.
+    // Block SIGINT on the main thread — the foreground pgrp (the child)
+    // receives it via tcsetpgrp, not the shell itself. SIGCHLD is NOT
+    // blocked; libuv's uv_signal_t manages delivery to onSigChld.
     sigset_t mask;
     sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
     sigaddset(&mask, SIGINT);
     sigprocmask(SIG_BLOCK, &mask, nullptr);
 
@@ -746,17 +704,16 @@ static Napi::Value InitExecutor_(const Napi::CallbackInfo& info) {
     g_env = info.Env();
     uv_loop_t* loop;
     napi_get_uv_event_loop(g_env, &loop);
-    uv_async_init(loop, &g_async, OnAsyncDone);
-    uv_unref(reinterpret_cast<uv_handle_t*>(&g_async));
 
-    g_executor = new ExecutorState();
-    g_executor->start();
+    uv_signal_init(loop, &g_sigchld);
+    uv_signal_start(&g_sigchld, onSigChld, SIGCHLD);
+    // Don't keep the loop alive just for the SIGCHLD watcher.
+    uv_unref(reinterpret_cast<uv_handle_t*>(&g_sigchld));
 
     return info.Env().Undefined();
 }
 
-// Parse JS stages/pipeOps arrays — shared by SpawnPipeline and CaptureOutput.
-static bool parseStages(Napi::Env env, Napi::Array jsStages, Napi::Array jsPipeOps,
+static bool parseStages(Napi::Env /*env*/, Napi::Array jsStages, Napi::Array jsPipeOps,
                         std::vector<StageSpec>& stages, std::vector<std::string>& pipeOps) {
     for (uint32_t i = 0; i < jsStages.Length(); i++) {
         Napi::Object jsStage = jsStages.Get(i).As<Napi::Object>();
@@ -790,55 +747,48 @@ static SpawnCtx* makeCtx(Napi::Env env, bool capture) {
     auto deferred = Napi::Promise::Deferred::New(env);
     auto* ctx = new SpawnCtx { deferred };
     ctx->captureOutput = capture;
-    refAsync();  // ref the handle so event loop stays alive until resolved
     return ctx;
 }
 
 static Napi::Value SpawnPipeline(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (!g_executor) {
-        Napi::Error::New(env, "Executor not initialized").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
     if (info.Length() < 2 || !info[0].IsArray() || !info[1].IsArray()) {
         Napi::TypeError::New(env, "spawnPipeline(stages, pipeOps)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    std::vector<StageSpec> stages;
-    std::vector<std::string> pipeOps;
-    parseStages(env, info[0].As<Napi::Array>(), info[1].As<Napi::Array>(), stages, pipeOps);
-    bool background = info.Length() > 2 && info[2].IsBoolean() && info[2].As<Napi::Boolean>().Value();
+    PipelineReq req;
+    parseStages(env, info[0].As<Napi::Array>(), info[1].As<Napi::Array>(), req.stages, req.pipeOps);
+    req.background = info.Length() > 2 && info[2].IsBoolean() && info[2].As<Napi::Boolean>().Value();
+    req.captureOutput = false;
+
     auto* ctx = makeCtx(env, false);
-    g_executor->enqueue(new PipelineRequest { std::move(stages), std::move(pipeOps), ctx, false, background });
-    return ctx->deferred.Promise();
+    auto promise = ctx->deferred.Promise();
+    spawnPipelineInline(req, ctx);
+    return promise;
 }
 
 static Napi::Value CaptureOutput(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (!g_executor) {
-        Napi::Error::New(env, "Executor not initialized").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
     if (info.Length() < 2 || !info[0].IsArray() || !info[1].IsArray()) {
         Napi::TypeError::New(env, "captureOutput(stages, pipeOps)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    std::vector<StageSpec> stages;
-    std::vector<std::string> pipeOps;
-    parseStages(env, info[0].As<Napi::Array>(), info[1].As<Napi::Array>(), stages, pipeOps);
+    PipelineReq req;
+    parseStages(env, info[0].As<Napi::Array>(), info[1].As<Napi::Array>(), req.stages, req.pipeOps);
+    req.captureOutput = true;
+
     auto* ctx = makeCtx(env, true);
-    g_executor->enqueue(new PipelineRequest { std::move(stages), std::move(pipeOps), ctx, true });
-    return ctx->deferred.Promise();
+    auto promise = ctx->deferred.Promise();
+    spawnPipelineInline(req, ctx);
+    return promise;
 }
 
 static Napi::Value GetEAGAIN(const Napi::CallbackInfo& info) {
     return Napi::Number::New(info.Env(), EAGAIN);
 }
 
-// ---- Mixed-pipeline helpers (JS function stages) ----------------------------
+// ---- Mixed-pipeline helpers ----------------------------------------------
 
-// Create a pipe with FD_CLOEXEC on both ends so it doesn't leak to unintended
-// child processes.  The TS side selectively clears CLOEXEC before forking.
 static Napi::Value CreateCloexecPipe(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     int fds[2];
@@ -854,7 +804,6 @@ static Napi::Value CreateCloexecPipe(const Napi::CallbackInfo& info) {
     return arr;
 }
 
-// Clear FD_CLOEXEC on a specific fd so it survives exec in the next fork.
 static Napi::Value ClearCloexec(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsNumber()) {
@@ -867,9 +816,8 @@ static Napi::Value ClearCloexec(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-// Fork+exec a single command with the given stdio fds, returning the pid
-// immediately without waiting.  Runs on the calling thread (safe since exec
-// replaces the image before any V8 locking issues can arise in the child).
+// Fork+exec a single command, return pid immediately. Caller tracks the pid
+// and uses waitForPids to wait asynchronously.
 static Napi::Value ForkExec(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
@@ -889,7 +837,6 @@ static Napi::Value ForkExec(const Napi::CallbackInfo& info) {
     int stderrFd = info.Length() > 4 && info[4].IsNumber() ? info[4].As<Napi::Number>().Int32Value() : -1;
     int pgid     = info.Length() > 5 && info[5].IsNumber() ? info[5].As<Napi::Number>().Int32Value() : 0;
 
-    // Build argv before fork.
     std::vector<const char*> argv;
     argv.push_back(cmd.c_str());
     for (const auto& a : args) argv.push_back(a.c_str());
@@ -912,7 +859,6 @@ static Napi::Value ForkExec(const Napi::CallbackInfo& info) {
         if (stdoutFd != -1 && stdoutFd != STDOUT_FILENO) dup2(stdoutFd, STDOUT_FILENO);
         if (stderrFd != -1 && stderrFd != STDERR_FILENO) dup2(stderrFd, STDERR_FILENO);
 
-        // Clear CLOEXEC on stdio so exec'd command inherits them.
         for (int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
             int flags = fcntl(fd, F_GETFD);
             if (flags != -1 && (flags & FD_CLOEXEC))
@@ -929,17 +875,19 @@ static Napi::Value ForkExec(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
-    // Parent: race-free pgid setup.
     setpgid(pid, pgid == 0 ? pid : pgid);
+    // Track this pid so SIGCHLD doesn't discard its exit status if it dies
+    // before waitForPids is called. waitForPids consumes the entry.
+    g_orphans[pid] = OrphanStatus { 0, false };
     return Napi::Number::New(env, pid);
 }
 
+// waitForPids registers the pids under a fresh ctx and returns a Promise
+// that resolves when all of them have reported (via SIGCHLD). Used by
+// mixed-pipeline orchestration in TS and by the fg builtin (which first
+// sends SIGCONT to resume a stopped pgrp).
 static Napi::Value WaitForPids(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (!g_executor) {
-        Napi::Error::New(env, "Executor not initialized").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
     if (info.Length() < 1 || !info[0].IsArray()) {
         Napi::TypeError::New(env, "waitForPids(pids: number[], pgid?: number)")
             .ThrowAsJavaScriptException();
@@ -955,11 +903,50 @@ static Napi::Value WaitForPids(const Napi::CallbackInfo& info) {
                    ? info[1].As<Napi::Number>().Int32Value() : -1;
 
     auto* ctx = makeCtx(env, false);
-    g_executor->enqueueWait(new WaitRequest { pids, pgid, ctx });
-    return ctx->deferred.Promise();
+    ctx->pgid = pgid;
+    ctx->pipeStatus.resize(pids.size(), 0);
+    // Callers (TS fg builtin, executeMixedPipeline) own tcsetpgrp themselves.
+    // Leave ctx->foreground false so SIGCHLD doesn't try to restore it here.
+    ctx->foreground = false;
+
+    auto promise = ctx->deferred.Promise();
+
+    for (size_t i = 0; i < pids.size(); i++) {
+        pid_t p = pids[i];
+        auto oit = g_orphans.find(p);
+        if (oit != g_orphans.end() && oit->second.reaped) {
+            // Process already exited between forkExec and this call — pull
+            // the parked status.
+            int s = oit->second.status;
+            g_orphans.erase(oit);
+            if (WIFSTOPPED(s)) {
+                ctx->stopped = true;
+                ctx->stoppedSignal = WSTOPSIG(s);
+                int code = 128 + WSTOPSIG(s);
+                ctx->pipeStatus[i] = code;
+                if (i + 1 == pids.size()) ctx->exitCode = code;
+            } else {
+                int code = WIFEXITED(s)   ? WEXITSTATUS(s)
+                         : WIFSIGNALED(s) ? 128 + WTERMSIG(s) : 1;
+                ctx->pipeStatus[i] = code;
+                if (i + 1 == pids.size()) ctx->exitCode = code;
+            }
+        } else {
+            // Still alive (or never forkExec'd). Drop stale orphan entry
+            // and any stale pending entry, then register under this ctx.
+            g_orphans.erase(p);
+            g_pending.erase(p);
+            registerPid(p, ctx, i);
+        }
+    }
+
+    // If every pid was already reaped, pendingPids stayed 0 — resolve now.
+    if (ctx->pendingPids == 0) {
+        maybeFinalize(ctx);
+    }
+    return promise;
 }
 
-// dup / dup2 wrappers for fd-level stdout redirection in captureAst.
 static Napi::Value DupFd(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsNumber()) {
@@ -991,8 +978,6 @@ static Napi::Value Dup2Fd(const Napi::CallbackInfo& info) {
     return Napi::Number::New(env, result);
 }
 
-// exec builtin: replace the current process with the given command.
-// Resets signals, then calls execvp.  Only returns on error.
 static Napi::Value Execvp(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
@@ -1010,7 +995,6 @@ static Napi::Value Execvp(const Napi::CallbackInfo& info) {
     for (const auto& a : args) argv.push_back(a.c_str());
     argv.push_back(nullptr);
 
-    // Reset all signals to default before exec.
     sigset_t empty; sigemptyset(&empty);
     sigprocmask(SIG_SETMASK, &empty, nullptr);
     struct sigaction sa = {};
@@ -1020,7 +1004,6 @@ static Napi::Value Execvp(const Napi::CallbackInfo& info) {
     sigaction(SIGTTIN, &sa, nullptr);
     sigaction(SIGPIPE, &sa, nullptr);
 
-    // Ensure stdio fds survive exec (clear CLOEXEC).
     for (int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
         int flags = fcntl(fd, F_GETFD);
         if (flags != -1 && (flags & FD_CLOEXEC))
@@ -1028,14 +1011,13 @@ static Napi::Value Execvp(const Napi::CallbackInfo& info) {
     }
 
     execvp(cmd.c_str(), const_cast<char* const*>(argv.data()));
-    // Only reached on error
     int err = errno;
     Napi::Error::New(env, std::string("exec: ") + cmd + ": " + strerror(err))
         .ThrowAsJavaScriptException();
     return Napi::Number::New(env, err == ENOENT ? 127 : 126);
 }
 
-// ---- Job control helpers --------------------------------------------------
+// ---- Job control ----------------------------------------------------------
 
 static Napi::Value SendSignal(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -1049,27 +1031,21 @@ static Napi::Value SendSignal(const Napi::CallbackInfo& info) {
     return Napi::Number::New(env, rc);
 }
 
+// reapChildren drains the background-completion buffer accumulated by the
+// SIGCHLD handler. No longer calls waitpid — all reaping has already
+// happened on the main thread via onSigChld.
 static Napi::Value ReapChildren(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    Napi::Array results = Napi::Array::New(env);
-    uint32_t idx = 0;
-    int status;
-    pid_t pid;
-    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+    Napi::Array results = Napi::Array::New(env, g_bg_completions.size());
+    for (size_t i = 0; i < g_bg_completions.size(); i++) {
+        const BgExit& ex = g_bg_completions[i];
         Napi::Object obj = Napi::Object::New(env);
-        obj.Set("pid", Napi::Number::New(env, static_cast<int>(pid)));
-        if (WIFEXITED(status)) {
-            obj.Set("exitCode", Napi::Number::New(env, WEXITSTATUS(status)));
-            obj.Set("stopped", Napi::Boolean::New(env, false));
-        } else if (WIFSIGNALED(status)) {
-            obj.Set("exitCode", Napi::Number::New(env, 128 + WTERMSIG(status)));
-            obj.Set("stopped", Napi::Boolean::New(env, false));
-        } else if (WIFSTOPPED(status)) {
-            obj.Set("exitCode", Napi::Number::New(env, 128 + WSTOPSIG(status)));
-            obj.Set("stopped", Napi::Boolean::New(env, true));
-        }
-        results.Set(idx++, obj);
+        obj.Set("pid", Napi::Number::New(env, static_cast<int>(ex.pid)));
+        obj.Set("exitCode", Napi::Number::New(env, ex.exitCode));
+        obj.Set("stopped", Napi::Boolean::New(env, ex.stopped));
+        results.Set(static_cast<uint32_t>(i), obj);
     }
+    g_bg_completions.clear();
     return results;
 }
 
