@@ -3,7 +3,7 @@
 // successful handshake().
 
 import { WebSocket } from "ws";
-import type { ClientMessage, ServerMessage, LastCommand } from "./protocol.js";
+import type { ClientMessage, ServerMessage, LastCommand, ClipboardSource } from "./protocol.js";
 import type { HandshakeResult } from "./handshake.js";
 
 /**
@@ -34,6 +34,8 @@ export interface MbApi {
     createPopup(opts: CreatePopupOptions): Promise<PopupHandle>;
     getLastCommand(): Promise<LastCommand | null>;
     getSelection(): Promise<string | null>;
+    getClipboard(source?: ClipboardSource): Promise<string>;
+    setClipboard(text: string, source?: ClipboardSource): Promise<void>;
     readonly connected: boolean;
     addEventListener(event: "stateChanged", fn: MbStateListener): void;
     removeEventListener(event: "stateChanged", fn: MbStateListener): void;
@@ -219,6 +221,22 @@ class MbClient implements MbApi {
             }
             return;
         }
+        if (msg.type === "clipboardResult") {
+            const p = this.pending.get(msg.reqId);
+            if (p) {
+                this.pending.delete(msg.reqId);
+                p.resolve(msg.text);
+            }
+            return;
+        }
+        if (msg.type === "setClipboardResult") {
+            const p = this.pending.get(msg.reqId);
+            if (p) {
+                this.pending.delete(msg.reqId);
+                p.resolve(undefined);
+            }
+            return;
+        }
         if (msg.type === "popupClosed") {
             const popup = this.popups.get(msg.id);
             if (popup) {
@@ -279,6 +297,32 @@ class MbClient implements MbApi {
             });
         });
         this.send({ type: "getSelection", reqId });
+        return p;
+    }
+
+    async getClipboard(source?: ClipboardSource): Promise<string> {
+        await this.awaitReady();
+        const reqId = this.nextReqId++;
+        const p = new Promise<string>((resolve, reject) => {
+            this.pending.set(reqId, {
+                resolve: (v) => resolve(v as string),
+                reject,
+            });
+        });
+        this.send({ type: "getClipboard", reqId, source });
+        return p;
+    }
+
+    async setClipboard(text: string, source?: ClipboardSource): Promise<void> {
+        await this.awaitReady();
+        const reqId = this.nextReqId++;
+        const p = new Promise<void>((resolve, reject) => {
+            this.pending.set(reqId, {
+                resolve: () => resolve(),
+                reject,
+            });
+        });
+        this.send({ type: "setClipboard", reqId, text, source });
         return p;
     }
 

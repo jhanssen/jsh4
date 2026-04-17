@@ -13,6 +13,8 @@ export interface LastCommand {
     endMs: number;
 }
 
+export type ClipboardSource = "clipboard" | "primary";
+
 // Shell → Applet
 export type ClientMessage =
     | { type: "hello"; nonce: string }
@@ -20,7 +22,9 @@ export type ClientMessage =
     | { type: "writePopup"; id: string; data: string }
     | { type: "closePopup"; id: string }
     | { type: "getLastCommand"; reqId: number }
-    | { type: "getSelection"; reqId: number };
+    | { type: "getSelection"; reqId: number }
+    | { type: "getClipboard"; reqId: number; source?: ClipboardSource }
+    | { type: "setClipboard"; reqId: number; text: string; source?: ClipboardSource };
 
 // Applet → Shell
 export type ServerMessage =
@@ -29,4 +33,6 @@ export type ServerMessage =
     | { type: "createPopupResult"; reqId: number; id: string }
     | { type: "popupClosed"; id: string }
     | { type: "lastCommandResult"; reqId: number; command: LastCommand | null }
-    | { type: "selectionResult"; reqId: number; text: string | null };
+    | { type: "selectionResult"; reqId: number; text: string | null }
+    | { type: "clipboardResult"; reqId: number; text: string }
+    | { type: "setClipboardResult"; reqId: number };

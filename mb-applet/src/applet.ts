@@ -144,6 +144,26 @@ function handleMessage(conn: MbWsConnection, state: ConnState, raw: string | Arr
             send(conn, { type: "selectionResult", reqId: msg.reqId, text });
             break;
         }
+        case "getClipboard": {
+            try {
+                const text = mb.getClipboard(msg.source);
+                send(conn, { type: "clipboardResult", reqId: msg.reqId, text });
+            } catch (e) {
+                send(conn, { type: "error", reqId: msg.reqId,
+                    message: `getClipboard failed: ${e instanceof Error ? e.message : String(e)}` });
+            }
+            break;
+        }
+        case "setClipboard": {
+            try {
+                mb.setClipboard(msg.text, msg.source);
+                send(conn, { type: "setClipboardResult", reqId: msg.reqId });
+            } catch (e) {
+                send(conn, { type: "error", reqId: msg.reqId,
+                    message: `setClipboard failed: ${e instanceof Error ? e.message : String(e)}` });
+            }
+            break;
+        }
     }
 }
 
