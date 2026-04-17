@@ -180,10 +180,15 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         });
         process.on("exit", () => {
             ui!.historySave(historyFile);
+            popTitle();
         });
 
         // Emit OSC 7 (cwd) at startup.
         emitOsc7();
+        // Push the current icon title and set it to "jsh". Paired with a pop
+        // in the 'exit' handler below, and with pop/push-set around each
+        // command so child processes see their pre-existing title.
+        pushSetTitle();
 
         promptLoop("");
     } else {
@@ -282,6 +287,18 @@ function emitOsc7(): void {
     process.stdout.write(`\x1b]7;file://${host}${cwd}\x07`);
 }
 
+// Window-title (OSC 2) stack management via xterm XTWINOPS.
+// `22;2t` pushes the current window title onto the terminal's stack;
+// `23;2t` pops it. We snapshot before setting "jsh" so that whatever was
+// there before — the parent shell's title, the terminal default — can be
+// restored when a child process takes the foreground.
+function pushSetTitle(): void {
+    process.stdout.write(`\x1b[22;2t\x1b]2;jsh\x07`);
+}
+function popTitle(): void {
+    process.stdout.write(`\x1b[23;2t`);
+}
+
 async function promptLoop(buffer: string): Promise<void> {
     if (!ui) return;
     continuationBuffer = buffer;
@@ -341,7 +358,12 @@ async function promptLoop(buffer: string): Promise<void> {
                     process.stdout.write(finalInput + "\n");
                 }
                 process.stdout.write("\x1b]133;C\x07");
-                await execute(ast);
+                popTitle();
+                try {
+                    await execute(ast);
+                } finally {
+                    pushSetTitle();
+                }
             } else {
                 ui!.clearFrame();
             }
