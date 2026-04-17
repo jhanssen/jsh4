@@ -813,6 +813,21 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
     const n = node.commands.length;
     const stageExitCodes = new Array<number>(n).fill(0);
 
+    // JS stages + compound stages in the same pipeline deadlock: the JS
+    // loop awaits sequentially, so a JS stage blocked on a pipe that a
+    // later-scheduled compound is supposed to write to hangs forever.
+    // Compound-only and compound+external pipelines still work via the
+    // sync dup2 path below. Tracking in TODO.md.
+    const hasJsStage       = node.commands.some(c => c.type === "JsFunction");
+    const hasCompoundStage = node.commands.some(isCompoundCommand);
+    if (hasJsStage && hasCompoundStage) {
+        writeStderr(
+            "jsh: compound commands (subshells, brace groups, control flow) "
+            + "as pipeline stages with @-functions are not supported yet\n"
+        );
+        return 1;
+    }
+
     // Create cloexec pipes between all adjacent stages.
     // pipes[i] = [readFd, writeFd] connecting stage i → stage i+1.
     const pipes: Array<[number, number]> = [];
@@ -900,18 +915,31 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         }
     }
 
-    // Run JS function stages in-process.
+    // Run JS function stages in-process — concurrently, so an upstream JS
+    // stage's output can stream through downstream JS stages without the
+    // 64KB pipe-buffer deadlock. Pipe fds close per-stage inside .then() so
+    // downstream readers see EOF promptly.
+    const jsPromises: Promise<void>[] = [];
     for (let i = 0; i < n; i++) {
         const stageNode = node.commands[i]!;
         if (stageNode.type !== "JsFunction") continue;
         const sin  = stdinFd(i);
         const sout = stdoutFd(i);
-        stageExitCodes[i] = await executeJsStageRaw(stageNode as JsFunction, sin, sout);
-        if (sout !== 1) native.closeFd(sout);
-        if (sin  !== 0) native.closeFd(sin);
+        const idx  = i;
+        jsPromises.push(
+            executeJsStageRaw(stageNode as JsFunction, sin, sout).then(code => {
+                stageExitCodes[idx] = code;
+                if (sout !== 1) native.closeFd(sout);
+                if (sin  !== 0) native.closeFd(sin);
+            })
+        );
     }
+    await Promise.all(jsPromises);
 
-    // Run compound command stages in-process with redirected fds.
+    // Run compound command stages in-process with dup2-based fd redirection.
+    // Only reachable when no JS stages exist (see early-return above); the
+    // dup2 approach is safe because nothing else on the main thread contends
+    // for fd 0/1 during executeNode. Real fix tracked in TODO.md.
     for (let i = 0; i < n; i++) {
         const stageNode = node.commands[i]!;
         if (!isCompoundCommand(stageNode)) continue;
