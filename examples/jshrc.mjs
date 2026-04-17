@@ -120,11 +120,14 @@ export function json(args, stdin) {
     return JSON.stringify(JSON.parse(stdin), null, 2);
 }
 
+// stdin yields plain lines (no trailing "\n"); generators yield raw chunks.
+// Functions that emit line-delimited output must include "\n" themselves.
+
 // Usage: ls -la | @grep pattern
 export async function* grep(args, stdin) {
     const pattern = new RegExp(args[0] ?? '.');
     for await (const line of stdin) {
-        if (pattern.test(line)) yield line;
+        if (pattern.test(line)) yield line + "\n";
     }
 }
 
@@ -134,7 +137,7 @@ export async function* head(args, stdin) {
     let count = 0;
     for await (const line of stdin) {
         if (count++ >= n) break;
-        yield line;
+        yield line + "\n";
     }
 }
 
@@ -143,7 +146,7 @@ export async function* uniq(args, stdin) {
     let prev = null;
     for await (const line of stdin) {
         if (line !== prev) {
-            yield line;
+            yield line + "\n";
             prev = line;
         }
     }
@@ -153,15 +156,15 @@ export async function* uniq(args, stdin) {
 export async function count(args, stdin) {
     let n = 0;
     for await (const _ of stdin) n++;
-    return String(n);
+    return String(n) + "\n";
 }
 
 // Usage: echo "hello world" | @upper
 export async function* upper(args, stdin) {
-    for await (const line of stdin) yield line.toUpperCase();
+    for await (const line of stdin) yield line.toUpperCase() + "\n";
 }
 
 // Usage: echo "HELLO" | @lower
 export async function* lower(args, stdin) {
-    for await (const line of stdin) yield line.toLowerCase();
+    for await (const line of stdin) yield line.toLowerCase() + "\n";
 }

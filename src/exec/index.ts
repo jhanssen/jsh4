@@ -39,6 +39,11 @@ type Stage = { cmd: string; args: string[]; redirs: Array<{ op: string; fd: numb
 
 // ---- Helpers ----------------------------------------------------------------
 
+// Strip a trailing \r so consumers don't have to deal with CRLF vs LF.
+function stripCr(s: string): string {
+    return s.endsWith("\r") ? s.slice(0, -1) : s;
+}
+
 async function* fdLineReader(fd: number): AsyncGenerator<string> {
     const { read: fsReadRaw } = await import("node:fs");
     const fsRead = promisify(fsReadRaw);
@@ -49,13 +54,13 @@ async function* fdLineReader(fd: number): AsyncGenerator<string> {
         const bytesRead = typeof result === "number" ? result
             : (result as { bytesRead: number }).bytesRead;
         if (bytesRead === 0) {
-            if (remainder) yield remainder;
+            if (remainder) yield stripCr(remainder);
             return;
         }
         const text = remainder + buf.slice(0, bytesRead).toString("utf8");
         const lines = text.split("\n");
         remainder = lines.pop()!;
-        for (const line of lines) yield line + "\n";
+        for (const line of lines) yield stripCr(line);
     }
 }
 

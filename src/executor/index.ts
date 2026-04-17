@@ -1087,20 +1087,25 @@ function isGenerator(v: unknown): v is Generator {
 }
 
 // Async line reader from a raw file descriptor — avoids stream lifecycle issues.
+// Yields plain lines: no trailing \n, and any \r immediately before a \n is
+// stripped (CRLF normalized to plain lines). This matches Node readline, Go's
+// bufio.Scanner, Rust's .lines(), etc. Consumers that want byte-exact preservation
+// should consume fds directly.
 async function* fdLineReader(fd: number): AsyncGenerator<string> {
+    const stripCr = (s: string) => s.endsWith("\r") ? s.slice(0, -1) : s;
     const buf = Buffer.alloc(4096);
     let remainder = "";
     while (true) {
         const result = await fsReadAsync(fd, buf, 0, buf.length, null);
         const bytesRead = typeof result === "number" ? result : (result as { bytesRead: number }).bytesRead;
         if (bytesRead === 0) {
-            if (remainder) yield remainder;
+            if (remainder) yield stripCr(remainder);
             return;
         }
         const text = remainder + buf.slice(0, bytesRead).toString("utf8");
         const lines = text.split("\n");
         remainder = lines.pop()!;
-        for (const line of lines) yield line + "\n";
+        for (const line of lines) yield stripCr(line);
     }
 }
 
