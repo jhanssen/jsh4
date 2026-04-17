@@ -1177,6 +1177,11 @@ static Napi::Value InputStart(const Napi::CallbackInfo &info) {
     g_state.in_completion = 0;
     g_state.completion_idx = 0;
     g_state.active = true;
+    // Clear any suggestion left over from the previous editing session.
+    // Otherwise an empty buffer trivially passes the prefix-match check in
+    // notifyRender and the old ghost reappears before the user types.
+    g_state.suggestion.clear();
+    g_state.suggestion_id++;
 
     // Non-TTY: read entire line synchronously
     if (!isatty(g_state.ifd) && !getenv("LINENOISE_ASSUME_TTY")) {
