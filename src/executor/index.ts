@@ -420,10 +420,13 @@ async function captureAst(node: ASTNode): Promise<string> {
     native.closeFd(writeFd);
 
     // Read captured output concurrently while the node executes.
+    // fdLineReader strips trailing \n per line — reattach during accumulation
+    // so the joined string preserves line breaks. Trailing-\n collapse happens
+    // in registerCaptureImpl's caller (POSIX command substitution trim).
     const chunks: string[] = [];
     const reader = (async () => {
         for await (const line of fdLineReader(readFd)) {
-            chunks.push(line);
+            chunks.push(line + "\n");
         }
     })();
 

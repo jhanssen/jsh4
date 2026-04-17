@@ -235,11 +235,14 @@ export class ExecHandle implements PromiseLike<ExecResult> {
         }
 
         // Read stdout — feed lines to queue and accumulate for await path.
+        // fdLineReader strips the trailing \n from each yield; reattach during
+        // accumulation so the buffered stdout preserves line breaks. The final
+        // \n+$/ trim on return handles the over-added one from the last line.
         let stdoutStr = "";
         const readStdout = (async () => {
             for await (const raw of fdLineReader(stdoutR)) {
-                stdoutStr += raw;
-                this._pushLine(raw.endsWith("\n") ? raw.slice(0, -1) : raw);
+                stdoutStr += raw + "\n";
+                this._pushLine(raw);
             }
             native.closeFd(stdoutR);
             this._finish();
@@ -248,7 +251,7 @@ export class ExecHandle implements PromiseLike<ExecResult> {
         // Read stderr if piped.
         let stderrStr = "";
         const readStderr = stderrR !== -1 ? (async () => {
-            for await (const raw of fdLineReader(stderrR)) stderrStr += raw;
+            for await (const raw of fdLineReader(stderrR)) stderrStr += raw + "\n";
             native.closeFd(stderrR);
         })() : Promise.resolve();
 
@@ -293,12 +296,13 @@ export class ExecHandle implements PromiseLike<ExecResult> {
             native.dup2Fd(1, 2);
         }
 
-        // Read stdout in background.
+        // Read stdout in background. Reattach \n during accumulation (see
+        // _run above for rationale).
         let stdoutStr = "";
         const readStdout = (async () => {
             for await (const raw of fdLineReader(stdoutR)) {
-                stdoutStr += raw;
-                this._pushLine(raw.endsWith("\n") ? raw.slice(0, -1) : raw);
+                stdoutStr += raw + "\n";
+                this._pushLine(raw);
             }
             native.closeFd(stdoutR);
             this._finish();
@@ -307,7 +311,7 @@ export class ExecHandle implements PromiseLike<ExecResult> {
         // Read stderr if piped.
         let stderrStr = "";
         const readStderr = stderrR !== -1 ? (async () => {
-            for await (const raw of fdLineReader(stderrR)) stderrStr += raw;
+            for await (const raw of fdLineReader(stderrR)) stderrStr += raw + "\n";
             native.closeFd(stderrR);
         })() : Promise.resolve();
 

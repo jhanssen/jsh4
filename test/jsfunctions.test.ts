@@ -86,12 +86,12 @@ describe("@ syntax — inline execution", () => {
     });
 
     it("should filter with @{ } async generator", () => {
-        const out = run("seq 6 | @{ async function*(args, stdin) { for await (const l of stdin) { if (parseInt(l) % 2 === 0) yield l; } } }");
+        const out = run("seq 6 | @{ async function*(args, stdin) { for await (const l of stdin) { if (parseInt(l) % 2 === 0) yield l + '\\n'; } } }");
         assert.deepStrictEqual(out.split("\n"), ["2", "4", "6"]);
     });
 
     it("should handle @{ } in three-stage pipeline", () => {
-        const out = run("seq 5 | @{ async function*(a, s) { for await (const l of s) yield l; } } | head -3");
+        const out = run("seq 5 | @{ async function*(a, s) { for await (const l of s) yield l + '\\n'; } } | head -3");
         assert.deepStrictEqual(out.split("\n"), ["1", "2", "3"]);
     });
 
