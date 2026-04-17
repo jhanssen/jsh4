@@ -12,8 +12,16 @@ import { homedir } from "node:os";
 
 const require = createRequire(import.meta.url);
 
-/** Permissions the shipped applet requests. Kept narrow. */
-export const APPLET_PERMISSIONS = "ui,io.inject,shell,net.listen.local";
+/** Permissions the shipped applet requests. Kept narrow.
+ *  - ui               — popups + mouse events
+ *  - io.inject        — echo text into the emulator (future reactive features)
+ *  - shell            — pane.lastCommand / commands ring for @last; pane.write for cross-pane send-keys (future)
+ *  - net.listen.local — WS server on 127.0.0.1
+ *  - pane.selection   — pane.selection + pane.cursor (for @selection, future @word)
+ *  - clipboard        — mb.getClipboard() / mb.setClipboard() for @clipboard
+ */
+export const APPLET_PERMISSIONS =
+    "ui,io.inject,shell,net.listen.local,pane.selection,clipboard";
 
 /** Override the shipped applet-load flow via env var. */
 export function appletLoadDisabled(): boolean {

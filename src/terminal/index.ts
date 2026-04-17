@@ -231,6 +231,16 @@ export class TerminalUI {
         if (this.editing && this.lastState) this.renderFrame(this.lastState);
     }
 
+    /** Called on SIGWINCH. Refreshes cols, resets renderer state (so we don't
+     *  rely on stale row counts after the terminal changed size), and forces a
+     *  full redraw of the current frame. */
+    onWindowResize(): void {
+        if (!this.editing || !this.lastState) return;
+        this.lastState.cols = this.native.inputGetCols();
+        this.renderer.reset();
+        this.renderFrame(this.lastState);
+    }
+
     get eagain(): number { return this.EAGAIN; }
 
     // ---- Internal ----
@@ -337,6 +347,19 @@ export class TerminalUI {
             displayRightPrompt = "";
         }
 
+        // Multi-line prompt support: the native renderer treats its prompt arg
+        // as a single visual line, so we split on \n and render the leading
+        // lines as plain inputLines rows above the input. Only the last
+        // prompt line is passed to inputRenderLine (where it participates in
+        // width/cursor math). Same treatment for ps2.
+        const promptPieces = displayPrompt.split("\n");
+        const lastPromptLine = promptPieces.pop()!;
+        const promptHeaderLines = promptPieces;
+
+        const ps2Pieces = ps2.split("\n");
+        const lastPs2Line = ps2Pieces.pop()!;
+        const ps2HeaderLines = ps2Pieces;
+
         // Split buffer on newlines for multi-line input (e.g. from history recall).
         const bufLines = state.buf.split("\n");
 
@@ -373,23 +396,36 @@ export class TerminalUI {
 
         const inputLines: string[] = [];
         let cursorCol = 0;
+        let cursorRowInInput = 0;
+
+        // Prompt header lines (everything above the last prompt line).
+        for (const line of promptHeaderLines) inputLines.push(line);
 
         for (let i = 0; i < bufLines.length; i++) {
             const bufLine = bufLines[i]!;
             const isFirst = i === 0;
             const isLast = i === bufLines.length - 1;
             const isCursorLine = i === cursorLineIdx;
-            const linePrompt = isFirst ? displayPrompt : ps2;
-            const lineRprompt = isLast ? displayRightPrompt : "";
             const colorized = colorizedLines[i] ?? bufLine;
+            const lineRprompt = isLast ? displayRightPrompt : "";
+
+            // For continuation lines, also support multi-line ps2.
+            if (!isFirst) {
+                for (const line of ps2HeaderLines) inputLines.push(line);
+            }
+
+            const linePrompt = isFirst ? lastPromptLine : lastPs2Line;
 
             // Pass per-line raw buffer and cursor position to C++.
             const linePos = isCursorLine ? posInLine : bufLine.length;
             const { line, cursorCol: col } = this.native.inputRenderLine(
                 linePrompt, colorized, lineRprompt, state.cols, bufLine, linePos
             );
+            if (isCursorLine) {
+                cursorRowInInput = inputLines.length;
+                cursorCol = col;
+            }
             inputLines.push(line);
-            if (isCursorLine) cursorCol = col;
         }
 
         // Cache clean lines (without ghost text) for onLine/clearFrame reuse.
@@ -436,6 +472,8 @@ export class TerminalUI {
         const frame: Frame = { headerLines, frozenLines: this.frozenLines, inputLines, cursorCol, footerLines };
 
         // Override cursor row in the renderer: it's not always the last input line.
-        this.renderer.render(frame, cursorLineIdx);
+        // cursorRowInInput accounts for any prompt/ps2 header lines that were
+        // prepended to inputLines.
+        this.renderer.render(frame, cursorRowInInput);
     }
 }

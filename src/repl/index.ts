@@ -75,6 +75,12 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
     if (process.stdin.isTTY) {
         // Create TerminalUI before loading rc so jshrc can register widgets.
         ui = new TerminalUI(native);
+
+        // SIGWINCH: when the terminal is resized, force a full redraw so the
+        // footer/header widgets reflow to the new width and the renderer
+        // forgets stale row counts (which would otherwise leave the prompt
+        // stranded at the bottom of a shrunken window).
+        process.on("SIGWINCH", () => ui?.onWindowResize());
     }
 
     // MasterBandit async handshake. Fires XTGETTCAP + OSC 58300 queries now;
