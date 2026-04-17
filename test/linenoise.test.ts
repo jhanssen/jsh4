@@ -98,6 +98,43 @@ describe("input engine native binding", () => {
         assert.strictEqual(typeof result.cursorCol, "number");
     });
 
+    // Regression: pasting a line containing multi-byte UTF-8 (e.g. the
+    // prompt prefix "╭─❯") used to hang inside the grapheme cluster scanner.
+    // Causes were (a) a TS/C++ unit mismatch that passed rawPos in UTF-16
+    // code units while inputRenderLine expected bytes, and (b) no forward-
+    // progress guard when libgrapheme returned 0 on an out-of-bounds slice.
+    // Both are fixed; these tests keep it that way.
+    describe("inputRenderLine UTF-8 handling", () => {
+        const utf8Buf = "  ╭─❯ @{ () => `foo"; // 19 UTF-16 units, 25 UTF-8 bytes
+
+        it("renders a multi-byte line with cursor at end without hanging", { timeout: 2000 }, () => {
+            const byteLen = Buffer.byteLength(utf8Buf, "utf8");
+            const result = native.inputRenderLine("$ ", utf8Buf, "", 80, utf8Buf, byteLen);
+            assert.strictEqual(typeof result.cursorCol, "number");
+            assert.ok(result.cursorCol > 0);
+        });
+
+        it("handles rawPos past rawLen (clamps instead of spinning)", { timeout: 2000 }, () => {
+            const byteLen = Buffer.byteLength(utf8Buf, "utf8");
+            // Deliberately pass a nonsense position much larger than the buffer.
+            const result = native.inputRenderLine("$ ", utf8Buf, "", 80, utf8Buf, byteLen * 10);
+            assert.strictEqual(typeof result.cursorCol, "number");
+        });
+
+        it("handles rawPos inside a UTF-8 continuation byte without hanging", { timeout: 2000 }, () => {
+            // Byte index 3 is the middle of the first "╭" (bytes 2..4).
+            const result = native.inputRenderLine("$ ", utf8Buf, "", 80, utf8Buf, 3);
+            assert.strictEqual(typeof result.cursorCol, "number");
+        });
+
+        it("handles a narrow column budget without hanging", { timeout: 2000 }, () => {
+            // cols < prompt+content forces the horizontal-scroll loops to iterate.
+            const byteLen = Buffer.byteLength(utf8Buf, "utf8");
+            const result = native.inputRenderLine("$ ", utf8Buf, "", 10, utf8Buf, byteLen);
+            assert.strictEqual(typeof result.cursorCol, "number");
+        });
+    });
+
     it("should return terminal columns", () => {
         const cols = native.inputGetCols();
         assert.ok(cols > 0);

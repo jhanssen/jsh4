@@ -282,12 +282,17 @@ export class TerminalUI {
             const id = state.suggestionId;
             try {
                 const result = this.suggestionFn(state.buf);
+                // Always defer the inputSetSuggestion call. The native side's
+                // SetSuggestion calls notifyRender synchronously, which would
+                // re-enter onRender mid-execution. Run on a microtask so the
+                // current onRender finishes first.
                 if (result && typeof (result as Promise<string | null>).then === "function") {
                     (result as Promise<string | null>).then(r => {
                         if (r) this.native.inputSetSuggestion(id, r);
                     }).catch(() => {});
                 } else if (typeof result === "string" && result) {
-                    this.native.inputSetSuggestion(id, result);
+                    const text = result;
+                    queueMicrotask(() => this.native.inputSetSuggestion(id, text));
                 }
             } catch {}
         }
@@ -374,19 +379,25 @@ export class TerminalUI {
         // Split buffer on newlines for multi-line input (e.g. from history recall).
         const bufLines = state.buf.split("\n");
 
-        // Compute which line the cursor is on and the position within that line.
+        // Per-line UTF-8 byte lengths. `state.pos` from C++ is a byte offset;
+        // TS `.length` is UTF-16 code units — they only match for ASCII. The
+        // scroll/cursor math in inputRenderLine expects byte offsets, so we
+        // track byte positions explicitly.
+        const bufLineByteLens = bufLines.map(l => Buffer.byteLength(l, "utf8"));
+
+        // Compute which line the cursor is on and the byte position within.
         let cursorLineIdx = 0;
-        let posInLine = state.pos;
+        let posInLineBytes = state.pos;
         {
-            let offset = 0;
+            let offsetBytes = 0;
             for (let i = 0; i < bufLines.length; i++) {
-                const lineLen = bufLines[i]!.length;
-                if (state.pos <= offset + lineLen) {
+                const lineBytes = bufLineByteLens[i]!;
+                if (state.pos <= offsetBytes + lineBytes) {
                     cursorLineIdx = i;
-                    posInLine = state.pos - offset;
+                    posInLineBytes = state.pos - offsetBytes;
                     break;
                 }
-                offset += lineLen + 1; // +1 for \n
+                offsetBytes += lineBytes + 1; // +1 for \n
             }
         }
 
@@ -427,8 +438,9 @@ export class TerminalUI {
 
             const linePrompt = isFirst ? lastPromptLine : lastPs2Line;
 
-            // Pass per-line raw buffer and cursor position to C++.
-            const linePos = isCursorLine ? posInLine : bufLine.length;
+            // Pass per-line raw buffer and cursor position to C++. linePos is
+            // a UTF-8 byte offset matching what inputRenderLine expects.
+            const linePos = isCursorLine ? posInLineBytes : bufLineByteLens[i]!;
             const { line, cursorCol: col } = this.native.inputRenderLine(
                 linePrompt, colorized, lineRprompt, state.cols, bufLine, linePos
             );
@@ -451,7 +463,13 @@ export class TerminalUI {
             const used = displayWidth(inputLines[lastIdx]!);
             const budget = Math.max(0, state.cols - 1 - used);
             if (budget > 0) {
-                const ghost = truncateToWidth(state.suggestion, budget);
+                // Ghost text must be single-line — OPOST is off in raw mode,
+                // so a raw \n in the appended ghost moves the cursor down
+                // without CR and corrupts subsequent renders. Show only the
+                // first line of the suggestion; accepting still inserts the
+                // full multi-line command.
+                const firstLine = state.suggestion.split(/\r?\n/, 1)[0]!;
+                const ghost = truncateToWidth(firstLine, budget);
                 if (ghost.length > 0) {
                     // Reset before the suggestion color — many terminals ignore
                     // \x1b[2m (faint) when a truecolor fg is already set by the

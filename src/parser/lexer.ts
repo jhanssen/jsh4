@@ -998,9 +998,21 @@ export class Lexer {
         while (this.pos < this.input.length) {
             const ch = this.input[this.pos]!;
             if (ch === "\\") {
+                // A backslash followed by a line terminator is a JS line
+                // continuation — consume both so the string can span lines.
                 result += ch + (this.input[this.pos + 1] ?? "");
                 this.pos += 2;
                 continue;
+            }
+            if (ch === "\n" || ch === "\r") {
+                // Regular JS string literals ('...', "...") can't contain raw
+                // line terminators; `new Function()` would reject later with
+                // a vague "Invalid or unexpected token". Raise a pointed error
+                // here instead. Triggered by multi-line paste into the REPL.
+                throw new Error(
+                    `@{}: unescaped newline in ${quote}...${quote} string — ` +
+                    `use backticks \`...\` for multi-line strings, or escape as \\n`
+                );
             }
             if (ch === quote) { result += ch; this.pos++; return result; }
             result += ch; this.pos++;

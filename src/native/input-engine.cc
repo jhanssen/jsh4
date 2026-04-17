@@ -104,7 +104,11 @@ static size_t graphemePrevLen(const char *buf, size_t pos, size_t from) {
     size_t cur = from;
     while (cur < pos) {
         prev = cur;
-        cur += grapheme_next_character_break_utf8(buf + cur, pos - cur);
+        size_t step = grapheme_next_character_break_utf8(buf + cur, pos - cur);
+        // Force forward progress: libgrapheme returning 0 inside the buffer
+        // would hang the caller; treat as a single-byte cluster.
+        if (step == 0) step = 1;
+        cur += step;
     }
     return pos - prev;
 }
@@ -135,6 +139,8 @@ static size_t utf8StrWidth(const char *s, size_t len) {
     size_t width = 0, i = 0;
     while (i < len) {
         size_t clen = grapheme_next_character_break_utf8(s + i, len - i);
+        // Force forward progress on malformed input (see graphemePrevLen).
+        if (clen == 0) clen = 1;
         width += graphemeClusterWidth(s + i, clen);
         i += clen;
     }
@@ -1116,22 +1122,15 @@ static void pollCallback(uv_poll_t *handle, int status, int events) {
 
     if (result == 0) return; // Need more input
 
-    // Line complete or error — stop polling, restore terminal
+    // Line complete or error — stop polling, restore terminal.
+    // The temp history slot was already popped inside editFeed's ENTER /
+    // CTRL_C / CTRL_D cases, so history contains only finalized commands
+    // by the time we reach here.
     uv_poll_stop(handle);
     uv_close(reinterpret_cast<uv_handle_t *>(handle), onPollClose);
     g_ctx->poll = nullptr;
     g_state.active = false;
     disableRawMode(g_state.ifd);
-
-    // Pop the temp editing slot that was added at inputStart. Prior to this
-    // point the last history entry mirrors the user's in-progress buffer,
-    // which pollutes `getLastEntry()`-style reads. Dropping it leaves the
-    // array containing only finalized commands; the REPL will re-add the
-    // actual finalInput (possibly after !! expansion) via inputHistoryAdd.
-    if (history_len > 0) {
-        free(history[history_len - 1]);
-        history_len--;
-    }
 
     Napi::Env env = g_ctx->onLine.Env();
     Napi::HandleScope scope(env);
