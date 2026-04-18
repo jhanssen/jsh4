@@ -12,7 +12,7 @@ import {
 import { getCompletions } from "../completion/index.js";
 import { colorize, getCurrentTheme, registerCommandExists, getResolvedColor, onThemeChange } from "../colorize/index.js";
 import { commandExists } from "../completion/index.js";
-import { lookupJsFunction } from "../jsfunctions/index.js";
+import { lookupJsFunction, lookupBareJsFunction } from "../jsfunctions/index.js";
 import { runTrap } from "../trap/index.js";
 import { expandHistory, getAllEntries } from "../history/index.js";
 import { TerminalUI } from "../terminal/index.js";
@@ -64,6 +64,8 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         if (commandExists(name)) return true;
         if (getAlias(name) !== undefined) return true;
         if (hasShellFunction(name)) return true;
+        // Bare-name JS function calls — atOnly functions don't participate.
+        if (lookupBareJsFunction(name) !== undefined) return true;
         // @name / @!name pipeline functions — strip the sigil(s) before lookup.
         if (name.startsWith("@")) {
             const bare = name.startsWith("@!") ? name.slice(2) : name.slice(1);
@@ -217,6 +219,15 @@ async function loadRc(customPath: string | undefined): Promise<void> {
     const jshApi = {
         $, setColorize, setTheme,
         alias, unalias, registerJsFunction, exec,
+        // Mark an exported JS function as callable only via the @-prefixed
+        // form (@name). Bare-name resolution skips it, so a same-named
+        // command on PATH (e.g. the real `claude` CLI) remains accessible.
+        // Usage:
+        //   export const claude = jsh.atOnly(async function* (args, stdin) { ... });
+        atOnly: <T extends JsPipelineFunction>(fn: T): T => {
+            (fn as T & { atOnly?: boolean }).atOnly = true;
+            return fn;
+        },
         complete: registerCompletion,
         // `mb` is a getter so jsh.mb reflects the current handshake state —
         // null until the async handshake completes (or never, if not under MB).
@@ -256,7 +267,8 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         for (const [name, value] of Object.entries(rc)) {
             if (name === "default") continue;
             if (typeof value === "function") {
-                registerJsFunction(name, value as JsPipelineFunction);
+                const fn = value as JsPipelineFunction & { atOnly?: boolean };
+                registerJsFunction(name, fn, { atOnly: fn.atOnly === true });
             }
         }
     } catch (e: unknown) {

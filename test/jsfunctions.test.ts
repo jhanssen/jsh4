@@ -177,3 +177,119 @@ describe("@ syntax — buffered mode", () => {
         assert.strictEqual(out, "4");
     });
 });
+
+// ---- Bare-name JS function calls -------------------------------------------
+//
+// Exported JS functions should be invocable by their bare name (no @ prefix),
+// mirroring bash function semantics. @name remains as an explicit-force form.
+// Functions marked `atOnly = true` (or wrapped in jsh.atOnly) skip bare-name
+// resolution so a same-named alias / builtin / PATH command wins.
+
+function withRc(rcBody: string, input: string): { stdout: string; stderr: string } {
+    const rc = `/tmp/jsh_test_rc_${Date.now()}_${Math.random().toString(36).slice(2)}.mjs`;
+    require("fs").writeFileSync(rc, rcBody);
+    try {
+        const r = spawnSync("node", ["dist/index.js", "--jshrc", rc], {
+            input: input + "\nexit\n",
+            encoding: "utf8",
+            cwd: process.cwd(),
+        });
+        return { stdout: r.stdout.trim(), stderr: r.stderr.trim() };
+    } finally {
+        try { require("fs").unlinkSync(rc); } catch {}
+    }
+}
+
+describe("bare-name JS function calls", () => {
+    it("should call a JS function via bare name", () => {
+        const rcBody = `
+export async function* myupper(args, stdin) {
+    for await (const l of stdin) yield l.toUpperCase() + '\\n';
+}
+`;
+        const { stdout } = withRc(rcBody, "echo hello | myupper");
+        assert.strictEqual(stdout, "HELLO");
+    });
+
+    it("should still accept the @name form", () => {
+        const rcBody = `
+export async function* myupper2(args, stdin) {
+    for await (const l of stdin) yield l.toUpperCase() + '\\n';
+}
+`;
+        const { stdout } = withRc(rcBody, "echo hi | @myupper2");
+        assert.strictEqual(stdout, "HI");
+    });
+
+    it("should work as a standalone command with no pipe", () => {
+        const rcBody = `
+export async function hello_jsh(args, stdin) {
+    return "hello, " + (args[0] ?? "world");
+}
+`;
+        const { stdout } = withRc(rcBody, "hello_jsh there");
+        assert.strictEqual(stdout, "hello, there");
+    });
+
+    it("should participate in longer pipelines", () => {
+        const rcBody = `
+export async function* doubler(args, stdin) {
+    for await (const l of stdin) yield l + l + '\\n';
+}
+`;
+        const { stdout } = withRc(rcBody, "printf 'a\\nb\\n' | doubler | head -1");
+        assert.strictEqual(stdout, "aa");
+    });
+
+    it("should skip bare-name resolution when atOnly is set", () => {
+        // Define a function whose bare name collides with `echo` (a builtin).
+        // Without atOnly, calling `echo` would invoke our JS function.
+        // With atOnly, `echo` falls through to the real echo.
+        const rcBody = `
+export function echo(args, stdin) {
+    return "js-version";
+}
+echo.atOnly = true;
+`;
+        const { stdout } = withRc(rcBody, "echo from-builtin");
+        assert.strictEqual(stdout, "from-builtin");
+    });
+
+    it("should still allow @name for atOnly functions", () => {
+        const rcBody = `
+export function echo(args, stdin) {
+    return "js-version: " + (args[0] ?? "");
+}
+echo.atOnly = true;
+`;
+        const { stdout } = withRc(rcBody, "@echo hello");
+        assert.strictEqual(stdout, "js-version: hello");
+    });
+
+    it("should support jsh.atOnly() helper", () => {
+        const rcBody = `
+export const echo = jsh.atOnly(function (args, stdin) {
+    return "wrapped-js";
+});
+`;
+        const { stdout } = withRc(rcBody, "echo from-builtin");
+        assert.strictEqual(stdout, "from-builtin");
+    });
+
+    it("type should report a bare-name JS function", () => {
+        const rcBody = `
+export function mytool(args, stdin) { return "hi"; }
+`;
+        const { stdout } = withRc(rcBody, "type mytool");
+        assert.match(stdout, /mytool is a JS pipeline function/);
+    });
+
+    it("shell function should take precedence over same-named JS function", () => {
+        // Shell functions are checked first in resolution order.
+        const rcBody = `
+export function greet(args, stdin) { return "js"; }
+`;
+        const { stdout } = withRc(rcBody, "greet() { echo sh; }; greet");
+        assert.strictEqual(stdout, "sh");
+    });
+});

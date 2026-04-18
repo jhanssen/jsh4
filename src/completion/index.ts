@@ -3,7 +3,7 @@ import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { $ } from "../variables/index.js";
 import { getAlias } from "../api/index.js";
-import { listJsFunctions } from "../jsfunctions/index.js";
+import { listJsFunctions, listBareJsFunctions } from "../jsfunctions/index.js";
 
 // ---- Completion entry type --------------------------------------------------
 
@@ -131,6 +131,10 @@ function completeCommand(prefix: string): string[] {
     const candidates = [
         ...BUILTINS_LIST,
         ...getPathCommands(),
+        // Bare-name callable JS functions (atOnly ones are only reachable
+        // through the @-prefixed form, added via the "@" branch below).
+        ...listBareJsFunctions(),
+        // @-prefixed forms of every registered JS function.
         ...listJsFunctions().map(f => "@" + f),
         ...[...handlers.keys()],
     ];

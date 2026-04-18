@@ -241,6 +241,7 @@
 
 - [ ] **`$(@func)`** — command substitution from JS function (in-process, no fork)
 - [ ] **AbortSignal on pipe close** — propagate EPIPE to JS generator as cancellation
+- [ ] **Command-line module import** — Today JS module imports are jshrc-only (via the Node loader hooks registered in `src/repl/index.ts`). A command like `import ./completion.jsm` or `@import ./completion.jsm` should do what jshrc's top-of-file `import` does: dynamically load a module, register its exports as `@`-functions, and make any defined builtins / `complete` specs active in the current session. Unblocks users from packaging completion shims and other @-function libraries as reusable modules instead of pasting everything into jshrc.
 
 ### Terminal / Input
 
@@ -291,7 +292,7 @@ The bridge lives in `src/mb/` and `mb-applet/`. `@last` and `@claude` reference 
 
 ### Completion
 
-- [ ] **Bash completion compat shim** — Implement `compgen`, `complete`, `compopt` builtins and `COMP_WORDS`/`COMP_CWORD`/`COMP_LINE`/`COMP_POINT`/`COMPREPLY` variables so bash completion scripts (e.g. `git-completion.bash`) can be eval'd directly, similar to zsh's approach. jsh already has arrays, `${var%%pat}`, `${var:offset:len}`, and `declare`. Missing pieces: `compgen -W/-f/-d`, `compopt -o nospace`, `declare -F`, and the `COMP_*` ↔ `jsh.complete()` bridge.
+- [ ] **Bash completion compat shim** — Implement `compgen`, `complete`, `compopt` builtins and `COMP_WORDS`/`COMP_CWORD`/`COMP_LINE`/`COMP_POINT`/`COMPREPLY` variables so bash completion scripts (e.g. `git-completion.bash`) can be sourced directly, similar to zsh's `bashcompinit`. Full design and scope in [BASH-COMPLETION.md](./BASH-COMPLETION.md). ~800 LOC, 2-3 days.
 
 ### Long-term exploration
 

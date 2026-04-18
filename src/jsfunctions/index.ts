@@ -27,16 +27,53 @@ export type JsPipelineFunction = (
     stdin: AsyncIterable<string> | null
 ) => unknown;
 
-const registry = new Map<string, JsPipelineFunction>();
-
-export function registerJsFunction(name: string, fn: JsPipelineFunction): void {
-    registry.set(name, fn);
+export interface JsFunctionOptions {
+    // When true, this function is callable only via the @-prefixed form
+    // (@name). Bare-name resolution skips it, so a same-named alias,
+    // shell function, builtin, or PATH command can still be invoked
+    // without the prefix.
+    atOnly?: boolean;
 }
 
+interface RegistryEntry {
+    fn: JsPipelineFunction;
+    atOnly: boolean;
+}
+
+const registry = new Map<string, RegistryEntry>();
+
+export function registerJsFunction(
+    name: string,
+    fn: JsPipelineFunction,
+    opts: JsFunctionOptions = {},
+): void {
+    registry.set(name, { fn, atOnly: opts.atOnly === true });
+}
+
+// Look up a function for explicit @-prefixed invocation. Returns the
+// function regardless of atOnly.
 export function lookupJsFunction(name: string): JsPipelineFunction | undefined {
-    return registry.get(name);
+    return registry.get(name)?.fn;
+}
+
+// Look up a function for bare-name invocation. Returns undefined for
+// atOnly functions so the resolver falls through to other sources.
+export function lookupBareJsFunction(name: string): JsPipelineFunction | undefined {
+    const entry = registry.get(name);
+    if (!entry || entry.atOnly) return undefined;
+    return entry.fn;
 }
 
 export function listJsFunctions(): string[] {
     return [...registry.keys()];
+}
+
+// List function names that are callable via bare-name (excludes atOnly).
+// Used by tab completion and `type`.
+export function listBareJsFunctions(): string[] {
+    const out: string[] = [];
+    for (const [name, entry] of registry) {
+        if (!entry.atOnly) out.push(name);
+    }
+    return out;
 }

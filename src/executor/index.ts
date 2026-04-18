@@ -15,7 +15,7 @@ import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl, registerProcessSubstImpl, evalArithmetic } from "../expander/index.js";
 import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot, declareReadonly, isReadonly, getReadonlyVars } from "../variables/index.js";
 import { pushParams, popParams, shiftParams, setParams, snapshotParams, restoreParams, getAllParams } from "../variables/positional.js";
-import { lookupJsFunction } from "../jsfunctions/index.js";
+import { lookupJsFunction, lookupBareJsFunction } from "../jsfunctions/index.js";
 import { getAlias } from "../api/index.js";
 import { shellOpts, saveShellOpts, restoreShellOpts } from "../shellopts/index.js";
 
@@ -538,6 +538,22 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         finally { popScope(); popParams(); }
     }
 
+    // Bare-name JS function call — resolves to the registered function
+    // unless it was marked atOnly (in which case the user must invoke via
+    // @name explicitly). Slots in after shell functions, before builtins.
+    if (lookupBareJsFunction(command) !== undefined) {
+        const synthetic: JsFunction = {
+            type: "JsFunction",
+            name: command,
+            args: cmd.words.slice(1),
+            buffered: false,
+            redirections: cmd.redirections,
+        };
+        const r = await executeJsStage(synthetic, 0, 1);
+        $["PIPESTATUS"] = [r.exitCode];
+        return r;
+    }
+
     // read builtin
     if (command === "read") {
         const r = runRead(args, redirs);
@@ -578,7 +594,9 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         if (args[0] === "-v" || args[0] === "-V") {
             if (args.length < 2) return { exitCode: 1 };
             const name = args[1]!;
-            if (isBuiltinName(name) || shellFunctions.has(name) || getAlias(name) !== undefined) {
+            if (isBuiltinName(name) || shellFunctions.has(name)
+                || getAlias(name) !== undefined
+                || lookupBareJsFunction(name) !== undefined) {
                 writeStdout(name + "\n");
                 return { exitCode: 0 };
             }
@@ -747,24 +765,30 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
     const hasJs = node.commands.some(c => c.type === "JsFunction");
     const hasCompound = node.commands.some(isCompoundCommand);
 
-    // Check if any pipeline stage is a builtin-only command (no external equivalent).
+    // Check if any pipeline stage is a builtin-only command, or a
+    // SimpleCommand whose first word resolves to a bare-name JS function.
+    // Literal-segment check only — variable-expanded command names fall
+    // through to the external fast path (doing the expansion here would
+    // require async work we can skip for the common case).
     let hasBuiltin = false;
+    let hasBareJsFn = false;
     if (!hasJs && !hasCompound) {
         for (const cmd of node.commands) {
             if (cmd.type === "SimpleCommand") {
                 const sc = cmd as SimpleCommand;
                 if (sc.words.length > 0) {
                     const firstWord = sc.words[0]!.segments[0];
-                    if (firstWord && firstWord.type === "Literal" && isBuiltinOnly((firstWord as { value: string }).value)) {
-                        hasBuiltin = true;
-                        break;
+                    if (firstWord && firstWord.type === "Literal") {
+                        const name = (firstWord as { value: string }).value;
+                        if (isBuiltinOnly(name)) hasBuiltin = true;
+                        else if (lookupBareJsFunction(name) !== undefined) hasBareJsFn = true;
                     }
                 }
             }
         }
     }
 
-    if (hasJs || hasBuiltin || hasCompound) {
+    if (hasJs || hasBuiltin || hasCompound || hasBareJsFn) {
         let exitCode = await executeMixedPipeline(node);
         if (node.negated) exitCode = exitCode === 0 ? 1 : 0;
         return { exitCode };
@@ -813,21 +837,6 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
     const n = node.commands.length;
     const stageExitCodes = new Array<number>(n).fill(0);
 
-    // JS stages + compound stages in the same pipeline deadlock: the JS
-    // loop awaits sequentially, so a JS stage blocked on a pipe that a
-    // later-scheduled compound is supposed to write to hangs forever.
-    // Compound-only and compound+external pipelines still work via the
-    // sync dup2 path below. Tracking in TODO.md.
-    const hasJsStage       = node.commands.some(c => c.type === "JsFunction");
-    const hasCompoundStage = node.commands.some(isCompoundCommand);
-    if (hasJsStage && hasCompoundStage) {
-        writeStderr(
-            "jsh: compound commands (subshells, brace groups, control flow) "
-            + "as pipeline stages with @-functions are not supported yet\n"
-        );
-        return 1;
-    }
-
     // Create cloexec pipes between all adjacent stages.
     // pipes[i] = [readFd, writeFd] connecting stage i → stage i+1.
     const pipes: Array<[number, number]> = [];
@@ -843,25 +852,52 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
     const pidToStage: number[] = [];
     let pgid = 0;
 
-    // Classify stages: find builtin-only stages that must run in-process.
+    // Classify SimpleCommand stages: builtin-only stages and bare-name
+    // JS-function calls both need in-process execution. Build the stage
+    // once and dispatch based on classification. `stageBareJs` holds the
+    // resolved name (from buildStage, after expansion) paired with the
+    // original SimpleCommand for its raw Word[] args and redirections.
     const stageBuiltins = new Map<number, Stage>();
+    const stageBareJs   = new Map<number, { name: string; sc: SimpleCommand }>();
     for (let i = 0; i < n; i++) {
         const stageNode = node.commands[i]!;
-        if (stageNode.type === "SimpleCommand") {
-            const stage = await buildStage(stageNode as SimpleCommand);
-            if (stage && isBuiltinOnly(stage.cmd)) {
-                stageBuiltins.set(i, stage);
-            }
+        if (stageNode.type !== "SimpleCommand") continue;
+        const stage = await buildStage(stageNode as SimpleCommand);
+        if (!stage) continue;
+        if (isBuiltinOnly(stage.cmd)) {
+            stageBuiltins.set(i, stage);
+        } else if (lookupBareJsFunction(stage.cmd) !== undefined) {
+            stageBareJs.set(i, { name: stage.cmd, sc: stageNode as SimpleCommand });
         }
     }
 
-    const isInProcess = (i: number) =>
-        node.commands[i]!.type === "JsFunction" || stageBuiltins.has(i) || isCompoundCommand(node.commands[i]!);
+    // JS stages + compound stages in the same pipeline deadlock: the JS
+    // loop awaits sequentially, so a JS stage blocked on a pipe that a
+    // later-scheduled compound is supposed to write to hangs forever.
+    // Applies to both @-prefixed JsFunction nodes and bare-name JS calls.
+    // Compound-only and compound+external pipelines still work via the
+    // sync dup2 path below. Tracking in TODO.md.
+    const hasJsStage       = node.commands.some(c => c.type === "JsFunction") || stageBareJs.size > 0;
+    const hasCompoundStage = node.commands.some(isCompoundCommand);
+    if (hasJsStage && hasCompoundStage) {
+        writeStderr(
+            "jsh: compound commands (subshells, brace groups, control flow) "
+            + "as pipeline stages with @-functions are not supported yet\n"
+        );
+        return 1;
+    }
 
-    // Fork external stages (skip builtins and JS functions).
+    const isInProcess = (i: number) =>
+        node.commands[i]!.type === "JsFunction"
+            || stageBuiltins.has(i)
+            || stageBareJs.has(i)
+            || isCompoundCommand(node.commands[i]!);
+
+    // Fork external stages (skip builtins, bare-JS-funcs, and @-prefixed JS).
     for (let i = 0; i < n; i++) {
         const stageNode = node.commands[i]!;
-        if (stageNode.type !== "SimpleCommand" || stageBuiltins.has(i)) continue;
+        if (stageNode.type !== "SimpleCommand") continue;
+        if (stageBuiltins.has(i) || stageBareJs.has(i)) continue;
 
         const stage = await buildStage(stageNode as SimpleCommand);
         if (!stage) { writeStderr("jsh: empty stage\n"); continue; }
@@ -918,16 +954,32 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
     // Run JS function stages in-process — concurrently, so an upstream JS
     // stage's output can stream through downstream JS stages without the
     // 64KB pipe-buffer deadlock. Pipe fds close per-stage inside .then() so
-    // downstream readers see EOF promptly.
+    // downstream readers see EOF promptly. Handles both @-prefixed
+    // `JsFunction` nodes and bare-name `SimpleCommand` stages that resolve
+    // to a registered JS function (for the latter, a synthetic JsFunction
+    // is built from the SimpleCommand).
     const jsPromises: Promise<void>[] = [];
     for (let i = 0; i < n; i++) {
         const stageNode = node.commands[i]!;
-        if (stageNode.type !== "JsFunction") continue;
+        let jsNode: JsFunction | null = null;
+        if (stageNode.type === "JsFunction") {
+            jsNode = stageNode as JsFunction;
+        } else if (stageBareJs.has(i)) {
+            const { name, sc } = stageBareJs.get(i)!;
+            jsNode = {
+                type: "JsFunction",
+                name,
+                args: sc.words.slice(1),
+                buffered: false,
+                redirections: sc.redirections,
+            };
+        }
+        if (!jsNode) continue;
         const sin  = stdinFd(i);
         const sout = stdoutFd(i);
         const idx  = i;
         jsPromises.push(
-            executeJsStageRaw(stageNode as JsFunction, sin, sout).then(code => {
+            executeJsStageRaw(jsNode, sin, sout).then(code => {
                 stageExitCodes[idx] = code;
                 if (sout !== 1) native.closeFd(sout);
                 if (sin  !== 0) native.closeFd(sin);
@@ -2893,8 +2945,11 @@ function findInPath(cmd: string): string | null {
 function classifyCommand(name: string): { kind: string; detail: string } | null {
     const alias = getAlias(name);
     if (alias) return { kind: "alias", detail: `${name} is aliased to '${alias}'` };
-    if (BUILTIN_NAMES.has(name)) return { kind: "builtin", detail: `${name} is a shell builtin` };
     if (shellFunctions.has(name)) return { kind: "function", detail: `${name} is a shell function` };
+    // Bare-name JS function — only shown for non-atOnly functions, since
+    // atOnly ones aren't callable via this name.
+    if (lookupBareJsFunction(name) !== undefined) return { kind: "function", detail: `${name} is a JS pipeline function` };
+    if (BUILTIN_NAMES.has(name)) return { kind: "builtin", detail: `${name} is a shell builtin` };
     if (name.startsWith("@") && lookupJsFunction(name.slice(1))) return { kind: "function", detail: `${name} is a JS pipeline function` };
     const path = findInPath(name);
     if (path) return { kind: "file", detail: `${name} is ${path}` };
