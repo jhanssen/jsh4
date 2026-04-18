@@ -148,12 +148,14 @@ interface MbApi {
     /** Create a popup on the shell's pane. Resolves once MB confirms creation. */
     createPopup(opts: { x: number; y: number; w: number; h: number }): Promise<MbPopupHandle>;
     /**
-     * Fetch the most recently completed command on this pane (as recorded by
-     * MB via OSC 133 markers). Resolves with `null` if there isn't one yet.
+     * Fetch a completed command on this pane (as recorded by MB via OSC 133
+     * markers). `index` counts back from the most recent: 0 (default) is the
+     * latest completed command, 1 is the one before it, etc. Resolves with
+     * `null` if the index is out of range or no command has completed yet.
      * Requires the mb-applet to have been loaded with the `shell.commands`
      * permission.
      */
-    getLastCommand(): Promise<MbLastCommand | null>;
+    getLastCommand(index?: number): Promise<MbLastCommand | null>;
     /** True while the WS connection to the applet is live. */
     readonly connected: boolean;
     /**

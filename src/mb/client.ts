@@ -32,7 +32,7 @@ export type MbStateListener = (connected: boolean) => void;
 
 export interface MbApi {
     createPopup(opts: CreatePopupOptions): Promise<PopupHandle>;
-    getLastCommand(): Promise<LastCommand | null>;
+    getLastCommand(index?: number): Promise<LastCommand | null>;
     getSelection(): Promise<string | null>;
     getClipboard(source?: ClipboardSource): Promise<string>;
     setClipboard(text: string, source?: ClipboardSource): Promise<void>;
@@ -274,7 +274,7 @@ class MbClient implements MbApi {
         return popup;
     }
 
-    async getLastCommand(): Promise<LastCommand | null> {
+    async getLastCommand(index?: number): Promise<LastCommand | null> {
         await this.awaitReady();
         const reqId = this.nextReqId++;
         const p = new Promise<LastCommand | null>((resolve, reject) => {
@@ -283,7 +283,7 @@ class MbClient implements MbApi {
                 reject,
             });
         });
-        this.send({ type: "getLastCommand", reqId });
+        this.send({ type: "getLastCommand", reqId, index });
         return p;
     }
 

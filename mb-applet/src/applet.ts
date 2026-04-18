@@ -114,7 +114,15 @@ function handleMessage(conn: MbWsConnection, state: ConnState, raw: string | Arr
             break;
         }
         case "getLastCommand": {
-            const cmd = state.pane.lastCommand;
+            const index = msg.index ?? 0;
+            let cmd: MbCommand | null = null;
+            if (index === 0) {
+                cmd = state.pane.lastCommand;
+            } else if (index > 0) {
+                const ring = state.pane.commands;
+                const pos = ring.length - 1 - index;
+                if (pos >= 0) cmd = ring[pos];
+            }
             if (!cmd) {
                 send(conn, { type: "lastCommandResult", reqId: msg.reqId, command: null });
                 break;

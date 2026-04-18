@@ -21,7 +21,7 @@ export type ClientMessage =
     | { type: "createPopup"; reqId: number; x: number; y: number; w: number; h: number }
     | { type: "writePopup"; id: string; data: string }
     | { type: "closePopup"; id: string }
-    | { type: "getLastCommand"; reqId: number }
+    | { type: "getLastCommand"; reqId: number; index?: number }
     | { type: "getSelection"; reqId: number }
     | { type: "getClipboard"; reqId: number; source?: ClipboardSource }
     | { type: "setClipboard"; reqId: number; text: string; source?: ClipboardSource };
