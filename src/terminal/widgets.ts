@@ -1,6 +1,8 @@
 // Widget registry — unified system for all rendered regions.
 // Each widget has a render function and a handle with update()/remove().
 
+const TIMING_ENABLED = process.env.JSH_TIMING === "1";
+
 export type WidgetZone = "header" | "footer" | "prompt" | "rprompt" | "ps2";
 export type WidgetAlign = "left" | "right" | "center";
 
@@ -270,13 +272,20 @@ export class WidgetManager {
 
     /** Re-evaluate all widgets in a zone. */
     async refreshZone(zone: WidgetZone): Promise<void> {
+        const t0 = TIMING_ENABLED ? performance.now() : 0;
         const promises: Promise<void>[] = [];
+        const ids: string[] = [];
         for (const w of this.widgets.values()) {
             if (w.zone !== zone) continue;
+            ids.push(w.id);
             promises.push(this._evalAsync(w));
         }
         await Promise.all(promises);
         this.invalidateZone(zone);
+        if (TIMING_ENABLED && ids.length > 0) {
+            const dt = ((performance.now() - t0) * 1000) | 0;
+            process.stderr.write(`[jsh timing µs] zone=${zone} dt=${dt} widgets=${ids.join(",")}\n`);
+        }
     }
 
     private _evalSync(widget: WidgetDef): void {
@@ -297,10 +306,15 @@ export class WidgetManager {
     }
 
     private async _evalAsync(widget: WidgetDef): Promise<void> {
+        const t0 = TIMING_ENABLED ? performance.now() : 0;
         try {
             const result = await widget.render();
             const lines = Array.isArray(result) ? result : [result];
             this.cache.set(widget.id, lines);
         } catch {}
+        if (TIMING_ENABLED) {
+            const dt = ((performance.now() - t0) * 1000) | 0;
+            process.stderr.write(`[jsh timing µs]   widget=${widget.id} dt=${dt}\n`);
+        }
     }
 }
