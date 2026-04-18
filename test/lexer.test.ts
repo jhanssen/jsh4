@@ -92,6 +92,13 @@ describe("lexer", () => {
             const tokens = lexer.getTokens().filter(t => t.type !== TokenType.EOF);
             assert.strictEqual(tokens.length, 1);
         });
+
+        it("should request continuation on trailing backslash at EOF", () => {
+            // Mirrors what the REPL sees when the user ends a line with `\` —
+            // line arrives without the newline, so the lexer must ask for more
+            // input (IncompleteInputError) rather than silently drop the `\`.
+            assert.throws(() => new Lexer("echo foo \\").getTokens(), IncompleteInputError);
+        });
     });
 
     describe("variable expansion", () => {

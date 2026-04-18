@@ -504,8 +504,10 @@ export class Lexer {
     private readBackslashEscape(): WordSegment {
         this.pos++; // skip backslash
         if (this.pos >= this.input.length) {
-            // Trailing backslash - line continuation (treat as empty for now)
-            return { type: "Literal", value: "" };
+            // Trailing backslash — request continuation so the REPL reads the
+            // next line. Once appended, the next parse sees `\<newline>` and
+            // consumes it via the branch below.
+            throw new IncompleteInputError("Trailing backslash");
         }
         const ch = this.input[this.pos]!;
         if (ch === "\n") {
