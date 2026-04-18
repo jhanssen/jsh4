@@ -3,7 +3,7 @@
 
 export const HANDSHAKE_OSC = 58300;
 
-export interface LastCommand {
+export interface MbCommandRecord {
     id: number;
     command: string;
     output: string;
@@ -21,7 +21,8 @@ export type ClientMessage =
     | { type: "createPopup"; reqId: number; x: number; y: number; w: number; h: number }
     | { type: "writePopup"; id: string; data: string }
     | { type: "closePopup"; id: string }
-    | { type: "getLastCommand"; reqId: number; index?: number }
+    | { type: "getSelectedCommand"; reqId: number }
+    | { type: "selectCommand"; id: number | null }
     | { type: "getSelection"; reqId: number }
     | { type: "getClipboard"; reqId: number; source?: ClipboardSource }
     | { type: "setClipboard"; reqId: number; text: string; source?: ClipboardSource };
@@ -32,7 +33,7 @@ export type ServerMessage =
     | { type: "error"; reqId?: number; message: string }
     | { type: "createPopupResult"; reqId: number; id: string }
     | { type: "popupClosed"; id: string }
-    | { type: "lastCommandResult"; reqId: number; command: LastCommand | null }
+    | { type: "selectedCommandResult"; reqId: number; command: MbCommandRecord | null }
     | { type: "selectionResult"; reqId: number; text: string | null }
     | { type: "clipboardResult"; reqId: number; text: string }
     | { type: "setClipboardResult"; reqId: number };

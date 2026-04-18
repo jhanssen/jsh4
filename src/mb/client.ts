@@ -3,7 +3,7 @@
 // successful handshake().
 
 import { WebSocket } from "ws";
-import type { ClientMessage, ServerMessage, LastCommand, ClipboardSource } from "./protocol.js";
+import type { ClientMessage, ServerMessage, MbCommandRecord, ClipboardSource } from "./protocol.js";
 import type { HandshakeResult } from "./handshake.js";
 
 /**
@@ -32,7 +32,8 @@ export type MbStateListener = (connected: boolean) => void;
 
 export interface MbApi {
     createPopup(opts: CreatePopupOptions): Promise<PopupHandle>;
-    getLastCommand(index?: number): Promise<LastCommand | null>;
+    getSelectedCommand(): Promise<MbCommandRecord | null>;
+    selectCommand(id: number | null): void;
     getSelection(): Promise<string | null>;
     getClipboard(source?: ClipboardSource): Promise<string>;
     setClipboard(text: string, source?: ClipboardSource): Promise<void>;
@@ -205,7 +206,7 @@ class MbClient implements MbApi {
             }
             return;
         }
-        if (msg.type === "lastCommandResult") {
+        if (msg.type === "selectedCommandResult") {
             const p = this.pending.get(msg.reqId);
             if (p) {
                 this.pending.delete(msg.reqId);
@@ -274,17 +275,22 @@ class MbClient implements MbApi {
         return popup;
     }
 
-    async getLastCommand(index?: number): Promise<LastCommand | null> {
+    async getSelectedCommand(): Promise<MbCommandRecord | null> {
         await this.awaitReady();
         const reqId = this.nextReqId++;
-        const p = new Promise<LastCommand | null>((resolve, reject) => {
+        const p = new Promise<MbCommandRecord | null>((resolve, reject) => {
             this.pending.set(reqId, {
-                resolve: (v) => resolve(v as LastCommand | null),
+                resolve: (v) => resolve(v as MbCommandRecord | null),
                 reject,
             });
         });
-        this.send({ type: "getLastCommand", reqId, index });
+        this.send({ type: "getSelectedCommand", reqId });
         return p;
+    }
+
+    selectCommand(id: number | null): void {
+        if (!this.ready) return;
+        this.send({ type: "selectCommand", id });
     }
 
     async getSelection(): Promise<string | null> {

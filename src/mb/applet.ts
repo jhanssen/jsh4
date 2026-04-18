@@ -15,7 +15,7 @@ const require = createRequire(import.meta.url);
 /** Permissions the shipped applet requests. Kept narrow.
  *  - ui               — popups + mouse events
  *  - io.inject        — echo text into the emulator (future reactive features)
- *  - shell            — pane.lastCommand / commands ring for @last; pane.write for cross-pane send-keys (future)
+ *  - shell            — pane.selectedCommand / commands ring for @last; pane.write for cross-pane send-keys (future)
  *  - net.listen.local — WS server on 127.0.0.1
  *  - pane.selection   — pane.selection + pane.cursor (for @selection, future @word)
  *  - clipboard        — mb.getClipboard() / mb.setClipboard() for @clipboard

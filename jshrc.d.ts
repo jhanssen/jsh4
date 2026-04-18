@@ -134,7 +134,7 @@ interface MbPopupHandle {
     onClose(fn: () => void): void;
 }
 
-interface MbLastCommand {
+interface MbCommandRecord {
     id: number;
     command: string;
     output: string;
@@ -148,14 +148,18 @@ interface MbApi {
     /** Create a popup on the shell's pane. Resolves once MB confirms creation. */
     createPopup(opts: { x: number; y: number; w: number; h: number }): Promise<MbPopupHandle>;
     /**
-     * Fetch a completed command on this pane (as recorded by MB via OSC 133
-     * markers). `index` counts back from the most recent: 0 (default) is the
-     * latest completed command, 1 is the one before it, etc. Resolves with
-     * `null` if the index is out of range or no command has completed yet.
-     * Requires the mb-applet to have been loaded with the `shell.commands`
-     * permission.
+     * Fetch the currently-highlighted OSC 133 command on this pane (set by
+     * click, keyboard nav, or `selectCommand`). Resolves with `null` when
+     * nothing is selected. Requires the mb-applet to have been loaded with
+     * the `shell.commands` permission.
      */
-    getLastCommand(index?: number): Promise<MbLastCommand | null>;
+    getSelectedCommand(): Promise<MbCommandRecord | null>;
+    /**
+     * Set (or clear with `null`) the OSC 133 command selection highlight on
+     * this pane. Unknown ids are silently treated as `null`. Fire-and-forget;
+     * no-op while the WS is not connected.
+     */
+    selectCommand(id: number | null): void;
     /** True while the WS connection to the applet is live. */
     readonly connected: boolean;
     /**

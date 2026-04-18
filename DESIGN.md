@@ -487,7 +487,7 @@ The probe is non-blocking: jsh fires the DCS and OSC queries at startup and proc
 - **Applet → shell, via PTY**: only inside `pane.addEventListener("osc:58300", ...)` handlers. Never elsewhere. Enforced by convention in `mb-applet/src/applet.ts`.
 - **Applet → shell, via WS**: any time the WS is open. `popupClosed`, `commandComplete`, resize events, applet-shutdown notifications, etc.
 - **Shell → applet, via PTY**: only `OSC 58300` queries, emitted while raw mode is active (edit session).
-- **Shell → applet, via WS**: all request/response API calls (`createPopup`, `getLastCommand`, `quiet`, etc.).
+- **Shell → applet, via WS**: all request/response API calls (`createPopup`, `getSelectedCommand`, `quiet`, etc.).
 
 The constraint keeps the PTY race-free: escape sequences only flow when jsh is actively reading stdin, never when a foreground child owns the TTY.
 
@@ -498,7 +498,7 @@ If the WS drops (applet reload, MB restart), jsh attempts reconnect with exponen
 Two mechanisms interact during reconnect:
 
 1. **Fork gate** — on Enter, if any external command is about to be forked and WS is reconnecting, jsh waits briefly (sub-10ms typical) for either WS live or a timeout verdict before calling `fork+exec`. This is a PTY-race defense only: it ensures unsolicited WS events from the applet don't arrive while a non-shell foreground child owns the TTY. Builtins, shell functions, and `@` functions run in-process — they don't take the foreground, so the gate is skipped for AST nodes that contain no externals.
-2. **Per-call await** — every `jsh.mb.*` method internally awaits WS readiness. `@` functions that call `jsh.mb.getLastCommand()` or `jsh.mb.createPopup()` still block on the live connection; they just don't trigger the fork gate. If the reconnect attempt times out, the method rejects with a typed error, which the caller can catch.
+2. **Per-call await** — every `jsh.mb.*` method internally awaits WS readiness. `@` functions that call `jsh.mb.getSelectedCommand()` or `jsh.mb.createPopup()` still block on the live connection; they just don't trigger the fork gate. If the reconnect attempt times out, the method rejects with a typed error, which the caller can catch.
 
 ### API shape
 
@@ -506,7 +506,8 @@ Two mechanisms interact during reconnect:
 interface MbApi {
     readonly connected: boolean;
     createPopup(opts: {x, y, w, h}): Promise<PopupHandle>;
-    getLastCommand(): Promise<LastCommand | null>;
+    getSelectedCommand(): Promise<MbCommandRecord | null>;
+    selectCommand(id: number | null): void;
     // ...
 }
 

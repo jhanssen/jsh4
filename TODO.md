@@ -275,7 +275,7 @@ The bridge lives in `src/mb/` and `mb-applet/`. `@last` and `@claude` reference 
 - [x] **Async handshake (fire-and-continue).** `src/mb/handshake.ts` emits queries after raw mode engages and returns; responses land via the native parser during the first edit session. No startup block, no keystrokes lost.
 - [x] **Shell-carries-applet.** `src/mb/applet.ts` installs the applet tree to `$XDG_CACHE_HOME/jsh/` on startup, emits OSC 58237, awaits the `status=loaded` ack, then proceeds to the OSC 58300 handshake. Opt out with `JSH_MB_NO_APPLET_LOAD=1`. Denied/error acks surface to stderr.
 - [x] **WS reconnect with backoff.** 250ms → 8s exponential. Every reconnect triggers a fresh OSC 58300 handshake (applet consumes the nonce on first hello). Permanent failure sets `givenUp`; `mbApi` reference stays stable so `stateChanged` listeners keep working.
-- [x] **Per-call `jsh.mb.*` auto-await.** `createPopup` and `getLastCommand` internally await ready state with a 10s timeout and reject on timeout or give-up.
+- [x] **Per-call `jsh.mb.*` auto-await.** Request/response methods (`createPopup`, `getSelectedCommand`, etc.) internally await ready state with a 10s timeout and reject on timeout or give-up.
 - [x] **`stateChanged` event** on `MbApi` for prompt-widget reactivity.
 - [x] **Token-length validation** in MB's `createServer` (`mb-shell.<token>` must fit lws's 63-char protocol-name buffer).
 

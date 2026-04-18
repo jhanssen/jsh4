@@ -16,8 +16,20 @@
 
 import ws from "mb:ws";
 import type { MbWsServer, MbWsConnection } from "mb:ws";
-import type { ClientMessage, ServerMessage } from "./protocol.js";
+import type { ClientMessage, ServerMessage, MbCommandRecord } from "./protocol.js";
 import { HANDSHAKE_OSC } from "./protocol.js";
+
+function wireCommand(cmd: MbCommand): MbCommandRecord {
+    return {
+        id: cmd.id,
+        command: cmd.command,
+        output: cmd.output,
+        cwd: cmd.cwd,
+        exitCode: cmd.exitCode,
+        startMs: cmd.startMs,
+        endMs: cmd.endMs,
+    };
+}
 
 const TAG = "jsh-mb-applet:";
 
@@ -113,33 +125,17 @@ function handleMessage(conn: MbWsConnection, state: ConnState, raw: string | Arr
             if (popup) popup.close();
             break;
         }
-        case "getLastCommand": {
-            const index = msg.index ?? 0;
-            let cmd: MbCommand | null = null;
-            if (index === 0) {
-                cmd = state.pane.lastCommand;
-            } else if (index > 0) {
-                const ring = state.pane.commands;
-                const pos = ring.length - 1 - index;
-                if (pos >= 0) cmd = ring[pos];
-            }
-            if (!cmd) {
-                send(conn, { type: "lastCommandResult", reqId: msg.reqId, command: null });
-                break;
-            }
+        case "getSelectedCommand": {
+            const cmd = state.pane.selectedCommand;
             send(conn, {
-                type: "lastCommandResult",
+                type: "selectedCommandResult",
                 reqId: msg.reqId,
-                command: {
-                    id: cmd.id,
-                    command: cmd.command,
-                    output: cmd.output,
-                    cwd: cmd.cwd,
-                    exitCode: cmd.exitCode,
-                    startMs: cmd.startMs,
-                    endMs: cmd.endMs,
-                },
+                command: cmd ? wireCommand(cmd) : null,
             });
+            break;
+        }
+        case "selectCommand": {
+            state.pane.selectCommand(msg.id);
             break;
         }
         case "getSelection": {
