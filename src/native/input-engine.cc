@@ -333,7 +333,15 @@ struct InputState {
     bool in_search = false;
     char search_query[256];
     size_t search_query_len = 0;
-    int search_match_index = -1;  // history index of current match
+    // search_match_index: -1 = no match yet, -2 = match inside the pre-search
+    // buffer (orig_buf), 0+ = history index.
+    int search_match_index = -1;
+    // Snapshot of the buffer + cursor position at the moment search started,
+    // so we can (a) include the live buffer as an implicit search candidate
+    // and (b) restore it when the user steps back from a history match.
+    char orig_buf[INPUT_BUF_SIZE];
+    size_t orig_pos = 0;
+    size_t orig_len = 0;
     // Suggestion (fish-style ghost text)
     std::string suggestion;        // the full suggested line
     uint32_t suggestion_id = 0;    // monotonic ID — incremented on each buffer change
@@ -341,7 +349,8 @@ struct InputState {
     bool in_line_search = false;
     char line_search_query[256];
     size_t line_search_query_len = 0;
-    size_t line_search_start = 0;  // search from this position forward
+    size_t line_search_start = 0;      // search from this position forward
+    size_t line_search_orig_pos = 0;   // cursor position at search entry
 };
 
 static InputState g_state;
@@ -505,22 +514,54 @@ static void editHistoryNav(InputState *s, int dir) {
 // ---- Reverse history search ------------------------------------------------
 
 static void searchHistoryReverse(InputState *s, bool nextMatch = false) {
-    // Search backward from current match position (or end of history).
-    // If nextMatch is false, try the current position first (query may have changed).
-    // If nextMatch is true (Ctrl-R pressed again), skip to the next older match.
+    if (s->search_query_len == 0) {
+        // Empty query — restore the original buffer so backspacing all the way
+        // back reverts any history match that had been shown.
+        s->search_match_index = -1;
+        memcpy(s->buf, s->orig_buf, s->orig_len);
+        s->buf[s->orig_len] = '\0';
+        s->len = s->orig_len;
+        s->pos = s->orig_pos;
+        return;
+    }
+
+    // First try the pre-search buffer. The live text participates as an
+    // implicit candidate, but we only accept a match whose start position is
+    // at or before the cursor — matches that would require advancing the
+    // cursor forward fall through to the normal history search instead.
+    // nextMatch skips this step (Ctrl-R advances past the buffer match).
+    if (!nextMatch && s->search_match_index == -1 && s->orig_len > 0) {
+        const char *hay = s->orig_buf;
+        const char *found = strstr(hay, s->search_query);
+        if (found != nullptr && (size_t)(found - hay) <= s->orig_pos) {
+            s->search_match_index = -2;
+            memcpy(s->buf, s->orig_buf, s->orig_len);
+            s->buf[s->orig_len] = '\0';
+            s->len = s->orig_len;
+            s->pos = (size_t)(found - hay);
+            return;
+        }
+    }
+
+    // History search. Starts from current match (nextMatch=false) or the one
+    // before it (nextMatch=true). A buffer match (-2) advancing via Ctrl-R
+    // starts history from the end.
     int start;
     if (s->search_match_index >= 0) {
         start = nextMatch ? s->search_match_index - 1 : s->search_match_index;
     } else {
-        start = history_len - 2; // -2 because last entry is the temp editing entry
+        start = history_len - 2; // -2 skips the current editing temp entry
     }
-    if (s->search_query_len == 0) { s->search_match_index = -1; return; }
     for (int i = start; i >= 0; i--) {
-        if (strstr(history[i], s->search_query) != nullptr) {
+        const char *match = strstr(history[i], s->search_query);
+        if (match != nullptr) {
             s->search_match_index = i;
             strncpy(s->buf, history[i], s->buflen);
             s->buf[s->buflen] = '\0';
-            s->len = s->pos = strlen(s->buf);
+            s->len = strlen(s->buf);
+            // Cursor lands at the start of the matched substring so arrow
+            // keys step through the match rather than past the end of the line.
+            s->pos = (size_t)(match - history[i]);
             return;
         }
     }
@@ -532,6 +573,12 @@ static void enterSearchMode(InputState *s) {
     s->search_query[0] = '\0';
     s->search_query_len = 0;
     s->search_match_index = -1;
+    // Snapshot the buffer + cursor so the live text can participate in the
+    // search and so exiting search can restore it.
+    memcpy(s->orig_buf, s->buf, s->len);
+    s->orig_buf[s->len] = '\0';
+    s->orig_len = s->len;
+    s->orig_pos = s->pos;
 }
 
 static void exitSearchMode(InputState *s) {
@@ -542,7 +589,13 @@ static void exitSearchMode(InputState *s) {
 // ---- Inline forward search (Ctrl-S) ----------------------------------------
 
 static void lineSearchForward(InputState *s) {
-    if (s->line_search_query_len == 0) return;
+    if (s->line_search_query_len == 0) {
+        // Empty query — put the cursor back where it was when search started,
+        // so backspacing through the query reverts every cursor advance.
+        s->pos = s->line_search_orig_pos;
+        s->line_search_start = s->line_search_orig_pos;
+        return;
+    }
     // Search forward from line_search_start.
     const char *haystack = s->buf + s->line_search_start;
     size_t remaining = s->len - s->line_search_start;
@@ -560,6 +613,7 @@ static void enterLineSearch(InputState *s) {
     s->line_search_query[0] = '\0';
     s->line_search_query_len = 0;
     s->line_search_start = s->pos; // start searching from current cursor
+    s->line_search_orig_pos = s->pos;
 }
 
 static void exitLineSearch(InputState *s) {
@@ -674,7 +728,9 @@ static void notifyRender() {
     }
     if (g_state.in_search) {
         state.Set("searchQuery", Napi::String::New(env, g_state.search_query, g_state.search_query_len));
-        state.Set("searchMatch", Napi::Boolean::New(env, g_state.search_match_index >= 0));
+        // match_index: -1 = no match; -2 = matched in the live buffer;
+        // 0+ = history entry. Anything other than -1 is a match for the UI.
+        state.Set("searchMatch", Napi::Boolean::New(env, g_state.search_match_index != -1));
     }
     if (g_state.in_line_search) {
         state.Set("lineSearchQuery", Napi::String::New(env, g_state.line_search_query, g_state.line_search_query_len));
@@ -811,16 +867,21 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
             *out_line = strdup(s->buf);
             return 1;
         }
-        if (c == CTRL_C || c == ESC) {
-            // Cancel search, restore empty buffer.
+        if (c == CTRL_C) {
+            // Cancel search and restore the pre-search buffer.
             exitSearchMode(s);
-            s->buf[0] = '\0';
-            s->pos = s->len = 0;
+            memcpy(s->buf, s->orig_buf, s->orig_len);
+            s->buf[s->orig_len] = '\0';
+            s->len = s->orig_len;
+            s->pos = s->orig_pos;
             notifyRender();
             return 0;
         }
+        // ESC and arrow-like escape sequences fall through: we exit search
+        // below (keeping the matched buf) and let the main switch interpret
+        // the rest of the sequence as ordinary editing (cursor movement, etc.).
         if (c == BACKSPACE || c == CTRL_H) {
-            // Delete last char from search query, re-search from end.
+            // Delete last char from search query, re-search from scratch.
             if (s->search_query_len > 0) {
                 s->search_query_len--;
                 s->search_query[s->search_query_len] = '\0';
@@ -831,11 +892,14 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
             return 0;
         }
         if (c >= 32 && c < 127) {
-            // Add to search query and search.
+            // Add to search query and re-search from scratch. Resetting
+            // match_index lets the pre-search buffer participate again when
+            // the longer query happens to match it.
             if (s->search_query_len < sizeof(s->search_query) - 1) {
                 s->search_query[s->search_query_len++] = c;
                 s->search_query[s->search_query_len] = '\0';
-                searchHistoryReverse(s);
+                s->search_match_index = -1;
+                searchHistoryReverse(s, false);
             }
             notifyRender();
             return 0;

@@ -349,19 +349,19 @@ export class TerminalUI {
             ? this.widgets.getZoneContent("ps2").join("")
             : "> ";
 
-        // In search mode, show the search prompt instead of the normal prompt.
-        let displayPrompt = prompt;
-        let displayRightPrompt = rprompt;
-        if (state.searchQuery !== undefined) {
-            const failMark = state.searchMatch === false && state.searchQuery.length > 0 ? "failing " : "";
-            displayPrompt = `(${failMark}reverse-i-search)\`${state.searchQuery}': `;
-            displayRightPrompt = "";
-        }
-        // Inline forward search — show in prompt area (consistent with Ctrl-R).
-        if (state.lineSearchQuery !== undefined) {
-            displayPrompt = `(i-search)\`${state.lineSearchQuery}': `;
-            displayRightPrompt = "";
-        }
+        // Reverse-search (Ctrl-R) and inline forward-search (Ctrl-S) indicators
+        // both render on their own line below the input (see after the bufLines
+        // loop). Split into prefix (text before the insertion point) and suffix
+        // ("': ") so the indicator can show a subcursor marking where the next
+        // keystroke lands in the query.
+        const searchIndicatorPrefix = state.searchQuery !== undefined
+            ? `(${state.searchMatch === false && state.searchQuery.length > 0 ? "failing " : ""}reverse-i-search)\`${state.searchQuery}`
+            : state.lineSearchQuery !== undefined
+                ? `(i-search)\`${state.lineSearchQuery}`
+                : null;
+        const searchIndicatorSuffix = "': ";
+        const displayPrompt = prompt;
+        const displayRightPrompt = rprompt;
 
         // Multi-line prompt support: the native renderer treats its prompt arg
         // as a single visual line, so we split on \n and render the leading
@@ -451,14 +451,25 @@ export class TerminalUI {
             inputLines.push(line);
         }
 
-        // Cache clean lines (without ghost text) for onLine/clearFrame reuse.
+        // Cache clean lines (without ghost text or search indicator) for
+        // onLine/clearFrame reuse. The indicator is transient to the search
+        // session and must not be frozen above subsequent output.
         this.lastRenderedInputLines = [...inputLines];
+
+        // Reverse-search indicator on its own line below the input. A faux
+        // cursor (inverse-video `_`) marks where typing lands in the query
+        // field; the real terminal cursor stays on the matched substring in
+        // the buffer so arrow keys visibly step through the match (zsh-style).
+        // Ghost text and completion descriptions don't apply while searching.
+        if (searchIndicatorPrefix !== null) {
+            inputLines.push(searchIndicatorPrefix + "_" + searchIndicatorSuffix);
+        }
 
         // Append ghost text to display (not cached — so it doesn't appear in frozen lines).
         // Truncate so the rendered line + suggestion fits in (cols - 1) cells —
         // reserving the last column avoids the xenl pending-wrap glitch that
         // would otherwise wrap the prompt.
-        if (state.suggestion && state.pos === state.len && inputLines.length > 0) {
+        if (searchIndicatorPrefix === null && state.suggestion && state.pos === state.len && inputLines.length > 0) {
             const lastIdx = inputLines.length - 1;
             const used = displayWidth(inputLines[lastIdx]!);
             const budget = Math.max(0, state.cols - 1 - used);
@@ -481,7 +492,7 @@ export class TerminalUI {
 
         // Append completion description (dimmed, after cursor on the input line).
         // Same width budget as the ghost-text path above.
-        if (state.completionDesc && inputLines.length > 0) {
+        if (searchIndicatorPrefix === null && state.completionDesc && inputLines.length > 0) {
             const lastIdx = inputLines.length - 1;
             const used = displayWidth(inputLines[lastIdx]!);
             const budget = Math.max(0, state.cols - 1 - used - 1); // -1 for leading space

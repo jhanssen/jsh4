@@ -65,13 +65,16 @@ export class Renderer {
             if (i < totalRows - 1) buf += "\r\n";
         }
 
-        // Clear any leftover lines from previous (taller) frame.
+        // Clear any leftover lines from previous (taller) frame. Use \r\n to
+        // return to column 0 (OPOST is off — \n alone only moves down) and
+        // \x1b[2K to erase the full row; \x1b[0K would leave stale content to
+        // the left of the cursor, which on shrink from a wider previous frame
+        // shows up as leftover text from the old render.
         if (this.lastTotalRows > totalRows) {
-            for (let i = 0; i < this.lastTotalRows - totalRows; i++) {
-                buf += "\n\x1b[0K";
-            }
-            // Move back up to where we should be.
             const extra = this.lastTotalRows - totalRows;
+            for (let i = 0; i < extra; i++) {
+                buf += "\r\n\x1b[2K";
+            }
             buf += `\x1b[${extra}A`;
         }
 
