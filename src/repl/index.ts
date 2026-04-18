@@ -202,35 +202,6 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
 let userSetPrompt = false;
 let continuationBuffer = ""; // accumulated buffer from previous lines for colorizer context
 
-// Opt-in per-command timing. Enabled with JSH_TIMING=1. Prints phase deltas
-// (µs) for each accepted line to stderr; useful for diagnosing prompt-return
-// stalls. Cheap no-op when disabled.
-const TIMING_ENABLED = process.env.JSH_TIMING === "1";
-let timingStart = 0;
-let timingLast = 0;
-let timingActive = false;
-let timingParts: string[] = [];
-function timingReset(): void {
-    if (!TIMING_ENABLED) return;
-    timingStart = performance.now();
-    timingLast = timingStart;
-    timingParts = [];
-    timingActive = true;
-}
-function timingMark(label: string): void {
-    if (!TIMING_ENABLED || !timingActive) return;
-    const now = performance.now();
-    timingParts.push(`${label}=${((now - timingLast) * 1000) | 0}`);
-    timingLast = now;
-}
-function timingFlush(): void {
-    if (!TIMING_ENABLED || !timingActive) return;
-    const total = ((performance.now() - timingStart) * 1000) | 0;
-    process.stderr.write(`[jsh timing µs] total=${total} ${timingParts.join(" ")}\n`);
-    timingParts = [];
-    timingActive = false;
-}
-
 async function loadRc(customPath: string | undefined): Promise<void> {
     let rcPath: string | undefined;
     if (customPath) {
@@ -351,13 +322,10 @@ async function promptLoop(buffer: string): Promise<void> {
             process.stderr.write(msg + "\n");
         }
     }
-    timingMark("reap");
-    timingFlush();
 
     const continuation = buffer.length > 0;
 
     await ui.start(continuation, async (line, errno) => {
-        timingReset();
         if (line === null) {
             ui!.clearFrame();
             if (errno === ui!.eagain) {
@@ -393,7 +361,6 @@ async function promptLoop(buffer: string): Promise<void> {
 
         try {
             const ast = parse(finalInput);
-            timingMark("parse");
             if (ast) {
                 // Successful parse — clear frame before executing.
                 ui!.clearFrame();
@@ -404,20 +371,17 @@ async function promptLoop(buffer: string): Promise<void> {
                 }
                 process.stdout.write("\x1b]133;C\x07");
                 popTitle();
-                timingMark("pre-exec");
                 try {
                     await execute(ast);
                 } finally {
                     pushSetTitle();
                 }
-                timingMark("exec");
             } else {
                 ui!.clearFrame();
             }
             const exitCode = String($["?"] ?? "0");
             process.stdout.write(`\x1b]133;D;${exitCode}\x07`);
             emitOsc7();
-            timingMark("post-exec");
             promptLoop("");
         } catch (e: unknown) {
             if (e instanceof IncompleteInputError) {
