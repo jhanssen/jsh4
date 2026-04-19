@@ -302,7 +302,12 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         for (const [name, value] of Object.entries(rc)) {
             if (name === "default") continue;
             if (typeof value === "function") {
-                registerJsFunction(name, value as JsPipelineFunction);
+                // Auto-registration honors `.atOnly` set on the function
+                // (e.g. via `jsh.atOnly(fn)` or a manual assignment) so
+                // exported functions can opt out of bare-name resolution
+                // without a separate registration call.
+                const fn = value as JsPipelineFunction & { atOnly?: boolean };
+                registerJsFunction(name, fn, { atOnly: fn.atOnly === true });
             }
         }
     } catch (e: unknown) {
