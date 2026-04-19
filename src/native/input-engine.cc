@@ -199,10 +199,21 @@ static int enableRawMode(int fd) {
     return 0;
 }
 
+// Ensure fd is in blocking mode. Node / libuv can leave stdin in O_NONBLOCK,
+// which breaks interactive children (they see EAGAIN from their read() loops
+// and bail) and the `read` builtin (readSync throws EAGAIN on empty stdin).
+static void ensureBlocking(int fd) {
+    int fl = fcntl(fd, F_GETFL);
+    if (fl != -1 && (fl & O_NONBLOCK)) {
+        fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+}
+
 static void disableRawMode(int fd) {
     if (rawmode) {
         (void)!write(STDOUT_FILENO, "\x1b[?2004l", 8);
         tcsetattr(fd, TCSAFLUSH, &orig_termios);
+        ensureBlocking(fd);
         rawmode = 0;
     }
 }
@@ -911,6 +922,14 @@ static void historyUpOrPrefixSearch(InputState *s, bool was_in_prefix_search) {
         s->in_prefix_search = true;
         return;
     }
+    // Already mid plain-history-walk (history_index > 0) — keep walking plain
+    // history rather than re-deciding based on the just-loaded buffer. Without
+    // this, Up into "vi" would cause the *next* Up to enter prefix-search mode
+    // on "vi" as the anchor.
+    if (s->history_index > 0) {
+        editHistoryNav(s, 1);
+        return;
+    }
     if (s->pos > 0) {
         prefixSearchStart(s);
         if (prefixSearchOlder(s)) {
@@ -937,6 +956,7 @@ static void historyDownOrPrefixSearch(InputState *s, bool was_in_prefix_search) 
         }
         return;
     }
+    // Plain history nav (Down is a no-op at the bottom; editHistoryNav clamps).
     editHistoryNav(s, -1);
 }
 
