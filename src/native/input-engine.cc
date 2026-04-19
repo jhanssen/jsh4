@@ -353,8 +353,12 @@ struct InputState {
     size_t completion_end = 0;
     std::string completion_pre;      // buf[0..completion_start], preserved
     std::string completion_tail;     // buf[completion_end..], preserved
-    std::vector<std::string> completion_entries; // cached candidates
-    std::vector<std::string> completion_descriptions; // parallel to completion_entries
+    std::vector<std::string> completion_entries; // spliced into buf on accept
+    // Parallel to completion_entries. `completion_displays` is what the menu
+    // grid shows for each entry — typically the basename when entries share a
+    // directory prefix. Empty string = render the entry text itself.
+    std::vector<std::string> completion_descriptions;
+    std::vector<std::string> completion_displays;
     // Menu-complete mode (zsh's `menu-select` behavior; opt-in via
     // jsh.setCompletionStyle("menu")). State machine:
     //   0 = inactive
@@ -1360,17 +1364,25 @@ static size_t entryDisplayWidth(const std::string &s) {
     return w;
 }
 
-// Compute grid dimensions and column width from the entry list and terminal
-// width. Uniform columns (width = longest-entry + 2 gap). Entries are bare
-// candidates (the lexer-driven completion returns just the replacement text),
-// so they render as-is — no prefix stripping.
+// Helper: fetch the display string for entry `i` — prefers the explicit
+// `completion_displays[i]` if set, otherwise falls back to the spliced text.
+static const std::string &menuEntryDisplay(const InputState *s, size_t i) {
+    if (i < s->completion_displays.size() && !s->completion_displays[i].empty()) {
+        return s->completion_displays[i];
+    }
+    return s->completion_entries[i];
+}
+
+// Compute grid dimensions and column width. Column width is based on the
+// widest *display* string (not the spliced-text), since that's what the
+// user sees.
 static void menuLayout(InputState *s) {
     size_t n = s->completion_entries.size();
     if (n == 0) { s->menu_rows = s->menu_cols = 0; return; }
     s->menu_display_prefix_len = 0;
     size_t longest = 0;
-    for (const auto &e : s->completion_entries) {
-        size_t w = entryDisplayWidth(e);
+    for (size_t i = 0; i < n; i++) {
+        size_t w = entryDisplayWidth(menuEntryDisplay(s, i));
         if (w > longest) longest = w;
     }
     const int gap = 2;
@@ -1399,10 +1411,7 @@ static std::vector<std::string> menuRenderLines(InputState *s) {
         for (int c = 0; c < s->menu_cols; c++) {
             size_t idx = static_cast<size_t>(r) * s->menu_cols + c;
             if (idx >= s->completion_entries.size()) break;
-            const std::string &full = s->completion_entries[idx];
-            const char *disp_ptr = full.c_str() + s->menu_display_prefix_len;
-            size_t disp_len = full.size() - s->menu_display_prefix_len;
-            std::string disp(disp_ptr, disp_len);
+            const std::string &disp = menuEntryDisplay(s, idx);
             bool selected = (s->menu_state == 2 && r == s->menu_row && c == s->menu_col);
             if (selected) line.append("\x1b[7m");
             line.append(disp);
@@ -1506,6 +1515,7 @@ static void menuClose(InputState *s, bool restore) {
     s->in_completion = 0;
     s->completion_entries.clear();
     s->completion_descriptions.clear();
+    s->completion_displays.clear();
     s->completion_original.clear();
     s->menu_orig_buf.clear();
 }
@@ -1570,12 +1580,12 @@ static int completeLine(InputState *s, char c) {
         });
 
         std::vector<std::string> entries;
+        std::vector<std::string> displays;
         size_t replaceStart = 0, replaceEnd = 0;
+        bool ambiguous = false;
         bool ok = false;
         if (result.IsArray()) {
             entries = extractCompletionArray(result.As<Napi::Array>());
-            // Legacy shape: entries are full-prefix replacements covering
-            // buf[0..word_end]. Scan forward to the next whitespace.
             replaceStart = 0;
             replaceEnd = s->pos;
             while (replaceEnd < s->len &&
@@ -1588,10 +1598,16 @@ static int completeLine(InputState *s, char c) {
             if (obj.Has("entries") && obj.Get("entries").IsArray()) {
                 entries = extractCompletionArray(obj.Get("entries").As<Napi::Array>());
             }
+            if (obj.Has("displays") && obj.Get("displays").IsArray()) {
+                displays = extractCompletionArray(obj.Get("displays").As<Napi::Array>());
+            }
             replaceStart = obj.Has("replaceStart") && obj.Get("replaceStart").IsNumber()
                 ? obj.Get("replaceStart").As<Napi::Number>().Uint32Value() : s->pos;
             replaceEnd = obj.Has("replaceEnd") && obj.Get("replaceEnd").IsNumber()
                 ? obj.Get("replaceEnd").As<Napi::Number>().Uint32Value() : s->pos;
+            if (obj.Has("ambiguous") && obj.Get("ambiguous").IsBoolean()) {
+                ambiguous = obj.Get("ambiguous").As<Napi::Boolean>().Value();
+            }
             if (replaceStart > s->len) replaceStart = s->len;
             if (replaceEnd > s->len) replaceEnd = s->len;
             if (replaceEnd < replaceStart) replaceEnd = replaceStart;
@@ -1608,9 +1624,27 @@ static int completeLine(InputState *s, char c) {
         s->completion_end = replaceEnd;
         s->completion_pre = std::string(s->buf, replaceStart);
         s->completion_tail = std::string(s->buf + replaceEnd, s->len - replaceEnd);
-        if (g_menu_complete && entries.size() >= 2) {
+        // Single match: splice and commit. Append a trailing space unless
+        //   - it's a directory (already ends in `/`),
+        //   - the existing tail starts with whitespace,
+        //   - or the caller flagged the result as `ambiguous` (LCP extension
+        //     across multiple real matches — next Tab should re-query).
+        // Do NOT enter cycle / menu mode: next Tab starts fresh.
+        if (entries.size() == 1) {
+            std::string e = std::move(entries[0]);
+            bool endsSlash = !e.empty() && e.back() == '/';
+            bool tailHasSpace = !s->completion_tail.empty() &&
+                                std::isspace(static_cast<unsigned char>(s->completion_tail[0]));
+            if (!ambiguous && !endsSlash && !tailHasSpace) e += ' ';
+            spliceCompletion(s, e);
+            bufferChanged();
+            notifyRender();
+            return 0;
+        }
+        if (g_menu_complete) {
             s->completion_original = std::string(s->buf, s->len);
             s->completion_entries = std::move(entries);
+            s->completion_displays = std::move(displays);
             s->completion_idx = 0;
             s->menu_state = 1;
             s->menu_row = 0;
@@ -1620,6 +1654,7 @@ static int completeLine(InputState *s, char c) {
             notifyRender();
             return 0;
         }
+        s->completion_displays = std::move(displays);
         startCompletion(s, std::move(entries));
         return 0;
     }
@@ -1630,6 +1665,14 @@ static int completeLine(InputState *s, char c) {
         // (don't submit the line — user hits Enter again to run the command).
         // Swallow Enter here so the main switch's case ENTER doesn't trigger.
         if (c == ENTER) {
+            menuClose(s, /*restore=*/false);
+            notifyRender();
+            return 0;
+        }
+        // `/` right after a completion that already ends in `/` (directory
+        // match): swallow the duplicate so "ls src/" + Tab accepting "api/"
+        // + "/" doesn't produce "src/api//".
+        if (c == '/' && s->len > 0 && s->buf[s->len - 1] == '/') {
             menuClose(s, /*restore=*/false);
             notifyRender();
             return 0;
@@ -1653,6 +1696,7 @@ static int completeLine(InputState *s, char c) {
     s->in_completion = 0;
     s->completion_entries.clear();
     s->completion_descriptions.clear();
+    s->completion_displays.clear();
     s->completion_original.clear();
     return c;
 }
@@ -2368,7 +2412,9 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
     // next whitespace).
     std::vector<std::string> entries;
     std::vector<std::string> descs;
+    std::vector<std::string> displays;
     int rs = -1, re_ = -1;
+    bool ambiguous = false;
     if (info.Length() > 0 && info[0].IsArray()) {
         entries = extractCompletionArray(info[0].As<Napi::Array>());
     }
@@ -2377,6 +2423,12 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
     }
     if (info.Length() > 2 && info[2].IsNumber()) rs = info[2].As<Napi::Number>().Int32Value();
     if (info.Length() > 3 && info[3].IsNumber()) re_ = info[3].As<Napi::Number>().Int32Value();
+    if (info.Length() > 4 && info[4].IsArray()) {
+        displays = extractCompletionArray(info[4].As<Napi::Array>());
+    }
+    if (info.Length() > 5 && info[5].IsBoolean()) {
+        ambiguous = info[5].As<Napi::Boolean>().Value();
+    }
 
     if (!entries.empty()) {
         size_t replaceStart, replaceEnd;
@@ -2396,10 +2448,21 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
         g_state.completion_end = replaceEnd;
         g_state.completion_pre = std::string(g_state.buf, replaceStart);
         g_state.completion_tail = std::string(g_state.buf + replaceEnd, g_state.len - replaceEnd);
-        if (g_menu_complete && entries.size() >= 2) {
+        // Single-match auto-space logic, parallel to the sync path.
+        if (entries.size() == 1) {
+            std::string e = std::move(entries[0]);
+            bool endsSlash = !e.empty() && e.back() == '/';
+            bool tailHasSpace = !g_state.completion_tail.empty() &&
+                std::isspace(static_cast<unsigned char>(g_state.completion_tail[0]));
+            if (!ambiguous && !endsSlash && !tailHasSpace) e += ' ';
+            spliceCompletion(&g_state, e);
+            bufferChanged();
+            notifyRender();
+        } else if (g_menu_complete) {
             g_state.completion_original = std::string(g_state.buf, g_state.len);
             g_state.completion_entries = std::move(entries);
             g_state.completion_descriptions = std::move(descs);
+            g_state.completion_displays = std::move(displays);
             g_state.completion_idx = 0;
             g_state.menu_state = 1;
             g_state.menu_row = 0;
@@ -2408,6 +2471,7 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
             menuLayout(&g_state);
             notifyRender();
         } else {
+            g_state.completion_displays = std::move(displays);
             startCompletion(&g_state, std::move(entries), std::move(descs));
         }
     }

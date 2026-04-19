@@ -1,4 +1,4 @@
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, statSync, globSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { $ } from "../variables/index.js";
@@ -9,7 +9,13 @@ import type { Token } from "../parser/lexer.js";
 
 // ---- Completion entry type --------------------------------------------------
 
-export type CompletionEntry = string | { text: string; desc?: string };
+// `text` is the value spliced into the buffer on accept.
+// `display` (optional) is what the menu grid shows for this entry — handy
+//    when entries share a common directory prefix (`src/api/`, `src/completion/`)
+//    and you want just the basenames on screen but the full path on accept.
+//    Defaults to `text`.
+// `desc` is a description (future: second column in the grid).
+export type CompletionEntry = string | { text: string; display?: string; desc?: string };
 
 // Lexer-driven completion result. `replaceStart` / `replaceEnd` are byte
 // offsets into the full buffer; the native engine splices entries in by
@@ -19,22 +25,35 @@ export interface CompletionResult {
     entries: CompletionEntry[];
     replaceStart: number;
     replaceEnd: number;
+    // `ambiguous` means "this is a longest-common-prefix extension of the
+    // underlying match list, not a final commit". The native splice uses it
+    // to suppress auto-space so the user can press Tab again to see the
+    // remaining candidates.
+    ambiguous?: boolean;
 }
 
-/** Split CompletionEntry[] into parallel texts[] and descs[] arrays for C++. */
-export function normalizeEntries(entries: CompletionEntry[]): { texts: string[]; descs: string[] } {
+/**
+ * Split CompletionEntry[] into parallel arrays for C++.
+ * - texts: spliced on accept.
+ * - displays: shown in the menu grid (falls back to text when unset).
+ * - descs: optional description.
+ */
+export function normalizeEntries(entries: CompletionEntry[]): { texts: string[]; displays: string[]; descs: string[] } {
     const texts: string[] = [];
+    const displays: string[] = [];
     const descs: string[] = [];
     for (const e of entries) {
         if (typeof e === "string") {
             texts.push(e);
+            displays.push(e);
             descs.push("");
         } else {
             texts.push(e.text);
+            displays.push(e.display ?? e.text);
             descs.push(e.desc ?? "");
         }
     }
-    return { texts, descs };
+    return { texts, displays, descs };
 }
 
 /** Extract the text value from a CompletionEntry. */
@@ -99,7 +118,7 @@ function expandTilde(s: string): string {
     return s;
 }
 
-function completeFile(prefix: string): string[] {
+function completeFile(prefix: string): CompletionEntry[] {
     const expanded = expandTilde(prefix);
     let dir: string, base: string;
     if (expanded.endsWith("/")) {
@@ -128,23 +147,52 @@ function completeFile(prefix: string): string[] {
         matched = visible.filter(e => e.includes(base));
     }
 
-    return matched
-        .map(e => {
-            const full = dir === "." ? e : join(dir, e);
-            try {
-                const isDir = statSync(full).isDirectory();
-                const result = expanded.endsWith("/")
-                    ? prefix + e
-                    : hasSlash
-                    ? join(dirname(prefix), e)
-                    : e;
-                return isDir ? result + "/" : result;
-            } catch {
-                return expanded.endsWith("/") ? prefix + e
-                     : hasSlash ? join(dirname(prefix), e) : e;
-            }
-        })
-        .sort();
+    const results: CompletionEntry[] = matched.map(e => {
+        const full = dir === "." ? e : join(dir, e);
+        let isDir = false;
+        try { isDir = statSync(full).isDirectory(); } catch { /* ignore */ }
+        const text = expanded.endsWith("/")
+            ? prefix + e
+            : hasSlash
+            ? join(dirname(prefix), e)
+            : e;
+        const finalText = isDir ? text + "/" : text;
+        const finalDisplay = isDir ? e + "/" : e;
+        // Only emit a display override if it differs from the text (i.e. the
+        // entry has a directory prefix). Avoids churn for simple cases.
+        return finalText === finalDisplay
+            ? finalText
+            : { text: finalText, display: finalDisplay };
+    });
+    results.sort((a, b) => {
+        const at = typeof a === "string" ? a : a.text;
+        const bt = typeof b === "string" ? b : b.text;
+        return at < bt ? -1 : at > bt ? 1 : 0;
+    });
+    return results;
+}
+
+// If prefix contains glob metacharacters (* ? [), expand it via fs.globSync
+// and return literal matches. Falls back to regular completeFile otherwise.
+function completeFileOrGlob(prefix: string): CompletionEntry[] {
+    if (!/[*?[]/.test(prefix)) return completeFile(prefix);
+    const expanded = expandTilde(prefix);
+    try {
+        const raw = [...globSync(expanded)].map(m => {
+            try { return statSync(m).isDirectory() ? m + "/" : m; }
+            catch { return m; }
+        });
+        raw.sort();
+        // Glob matches are full-path; strip shared leading directory for the
+        // menu display (same rationale as completeFile).
+        return raw.map(m => {
+            const b = basename(m.replace(/\/$/, ""));
+            const display = m.endsWith("/") ? b + "/" : b;
+            return m === display ? m : { text: m, display };
+        });
+    } catch {
+        return completeFile(prefix);
+    }
 }
 
 function completeCommand(prefix: string): string[] {
@@ -181,17 +229,28 @@ function cursorInToken(t: Token, cursor: number): boolean {
     return false;
 }
 
+// Commands that are "command-position modifiers": if they appear as the
+// first word and are followed by more text, the following word is ALSO a
+// command (e.g. `sudo git ...` → `git` should be command-completed).
+const MODIFIER_COMMANDS = new Set([
+    "sudo", "env", "time", "nohup", "command", "builtin", "exec",
+]);
+
 // Walk the token stream up to (but not including) the cursor to determine
 // command context: is the current token in command position (first word
 // after a separator), and if in argument position, what's the command?
+// Also reports whether the immediately preceding non-EOF, non-whitespace
+// token was a Redirect (`>`, `>>`, `<`, `>&`, …) — in that case the cursor
+// word is a redirection target and should file-complete regardless of the
+// enclosing command.
 function findCommandContext(tokens: Token[], cursorToken: Token | null, cursor: number):
-    { isFirstWord: boolean; cmd: string; words: string[] } {
+    { isFirstWord: boolean; cmd: string; words: string[]; prevIsRedirect: boolean } {
     let isFirstWord = true;
     let cmd = "";
-    const words: string[] = [];
+    let words: string[] = [];
+    let lastNonWord: Token | null = null;
     for (const t of tokens) {
         if (t === cursorToken) break;
-        // Stop at cursor even if we're between tokens (cursor in whitespace).
         if (!cursorToken && t.start >= cursor) break;
         if (t.type === TokenType.EOF) continue;
         if (t.type === TokenType.Pipe || t.type === TokenType.PipeAnd ||
@@ -201,18 +260,39 @@ function findCommandContext(tokens: Token[], cursorToken: Token | null, cursor: 
             t.type === TokenType.CaseSemi) {
             isFirstWord = true;
             cmd = "";
-            words.length = 0;
+            words = [];
+            lastNonWord = t;
+            continue;
+        }
+        if (t.type === TokenType.Redirect) {
+            lastNonWord = t;
             continue;
         }
         if (t.type === TokenType.Word) {
             if (isFirstWord) {
                 cmd = t.value;
                 isFirstWord = false;
+            } else if (words.length === 1 && MODIFIER_COMMANDS.has(cmd)) {
+                // Modifier (`sudo`, `env`, …) promotes its first argument back
+                // to command position: everything after the modifier is itself
+                // a command line.
+                cmd = t.value;
+                words = [];
+                isFirstWord = false;
             }
             words.push(t.value);
+            lastNonWord = null;
         }
     }
-    return { isFirstWord, cmd, words };
+    const prevIsRedirect = lastNonWord !== null && lastNonWord.type === TokenType.Redirect;
+    // Post-loop promotion: if the cursor word is the one that *immediately*
+    // follows a modifier (`sudo <cursor>`), treat it as command position.
+    if (cmd && words.length === 1 && MODIFIER_COMMANDS.has(cmd)) {
+        isFirstWord = true;
+        cmd = "";
+        words = [];
+    }
+    return { isFirstWord, cmd, words, prevIsRedirect };
 }
 
 // Locate the token at the cursor (or null if the cursor sits in whitespace
@@ -248,6 +328,41 @@ function tryVariableCompletion(buf: string, cursor: number): CompletionResult | 
     ]);
     const candidates = [...names].filter(n => n.startsWith(prefix)).sort();
     return { entries: candidates, replaceStart: nameStart, replaceEnd: cursor };
+}
+
+function longestCommonPrefix(strs: string[]): string {
+    if (strs.length === 0) return "";
+    let lcp = strs[0]!;
+    for (let i = 1; i < strs.length; i++) {
+        const s = strs[i]!;
+        const max = Math.min(lcp.length, s.length);
+        let j = 0;
+        while (j < max && lcp[j] === s[j]) j++;
+        lcp = lcp.slice(0, j);
+        if (lcp === "") break;
+    }
+    return lcp;
+}
+
+// Wrap a raw entries list into a CompletionResult, collapsing to an LCP
+// pseudo-match when the matches still share a common prefix longer than
+// what's typed — zsh's ambiguous-Tab behavior. The native splice sees the
+// `ambiguous` flag and skips auto-space so the next Tab re-queries and
+// shows the (now narrower) list.
+function makeResult(
+    entries: CompletionEntry[],
+    replaceStart: number,
+    replaceEnd: number,
+    buf: string,
+): CompletionResult {
+    if (entries.length <= 1) return { entries, replaceStart, replaceEnd };
+    const texts = entries.map(e => typeof e === "string" ? e : e.text);
+    const lcp = longestCommonPrefix(texts);
+    const typed = buf.slice(replaceStart, replaceEnd);
+    if (lcp.length > typed.length) {
+        return { entries: [lcp], replaceStart, replaceEnd, ambiguous: true };
+    }
+    return { entries, replaceStart, replaceEnd };
 }
 
 export function getCompletions(buf: string, cursor?: number): CompletionResult | Promise<CompletionResult> {
@@ -291,6 +406,22 @@ export function getCompletions(buf: string, cursor?: number): CompletionResult |
 
     const ctx = findCommandContext(tokens, cursorToken, pos);
 
+    // Redirection target (`cmd > f<cursor>`): always file-complete regardless
+    // of the enclosing command.
+    if (ctx.prevIsRedirect) {
+        return makeResult(completeFile(current), replaceStart, replaceEnd, buf);
+    }
+
+    // Assignment RHS (`FOO=b<cursor>`): split at `=`, complete the value as
+    // a file and adjust the replacement range so the `FOO=` part survives.
+    const eqMatch = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(current);
+    if (eqMatch) {
+        const eqEnd = eqMatch[0]!.length;
+        const value = current.slice(eqEnd);
+        const valueEntries = completeFileOrGlob(value);
+        return makeResult(valueEntries, replaceStart + eqEnd, replaceEnd, buf);
+    }
+
     if (ctx.isFirstWord) {
         let candidates: string[];
         if (current.startsWith("@")) {
@@ -300,20 +431,20 @@ export function getCompletions(buf: string, cursor?: number): CompletionResult |
         } else {
             candidates = completeCommand(current);
         }
-        return { entries: candidates, replaceStart, replaceEnd };
+        return makeResult(candidates, replaceStart, replaceEnd, buf);
     }
 
     const handler = handlers.get(ctx.cmd);
     if (handler) {
         const result = handler({ words: [...ctx.words, current], current });
-        const wrap = (entries: CompletionEntry[]): CompletionResult =>
-            ({ entries, replaceStart, replaceEnd });
         if (result && typeof (result as Promise<CompletionEntry[]>).then === "function") {
-            return (result as Promise<CompletionEntry[]>).then(wrap);
+            return (result as Promise<CompletionEntry[]>).then(
+                entries => makeResult(entries, replaceStart, replaceEnd, buf)
+            );
         }
-        return wrap(result as CompletionEntry[]);
+        return makeResult(result as CompletionEntry[], replaceStart, replaceEnd, buf);
     }
 
-    // Default argument completion: filesystem.
-    return { entries: completeFile(current), replaceStart, replaceEnd };
+    // Default argument completion: filesystem (with glob support).
+    return makeResult(completeFileOrGlob(current), replaceStart, replaceEnd, buf);
 }

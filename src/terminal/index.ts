@@ -47,7 +47,7 @@ interface NativeInputEngine {
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
     inputInsertAtCursor: (text: string) => void;
-    inputSetCompletions: (entries: string[], descs: string[], replaceStart?: number, replaceEnd?: number) => void;
+    inputSetCompletions: (entries: string[], descs: string[], replaceStart?: number, replaceEnd?: number, displays?: string[], ambiguous?: boolean) => void;
     inputEAGAIN: () => number;
 }
 
@@ -115,32 +115,31 @@ export class TerminalUI {
             onCompletion: this.completionFn
                 ? (input: string, cursor: number) => {
                     const result = this.completionFn!(input, cursor);
-                    // Normalize shape: legacy string[] | CompletionResult,
-                    // possibly inside a Promise.
                     const normalize = (r: CompletionEntry[] | CompletionResult) => {
                         if (Array.isArray(r)) {
-                            const { texts, descs } = normalizeEntries(r);
-                            return { texts, descs, replaceStart: -1, replaceEnd: -1 };
+                            const { texts, displays, descs } = normalizeEntries(r);
+                            return { texts, displays, descs, replaceStart: -1, replaceEnd: -1, ambiguous: false };
                         }
-                        const { texts, descs } = normalizeEntries(r.entries);
-                        return { texts, descs, replaceStart: r.replaceStart, replaceEnd: r.replaceEnd };
+                        const { texts, displays, descs } = normalizeEntries(r.entries);
+                        return { texts, displays, descs,
+                                 replaceStart: r.replaceStart, replaceEnd: r.replaceEnd,
+                                 ambiguous: r.ambiguous === true };
                     };
                     if (result && typeof (result as Promise<unknown>).then === "function") {
                         (result as Promise<CompletionEntry[] | CompletionResult>).then(
                             r => {
                                 const n = normalize(r);
-                                this.native.inputSetCompletions(n.texts, n.descs, n.replaceStart, n.replaceEnd);
+                                this.native.inputSetCompletions(n.texts, n.descs, n.replaceStart, n.replaceEnd, n.displays, n.ambiguous);
                             },
-                            () => this.native.inputSetCompletions([], [], -1, -1),
+                            () => this.native.inputSetCompletions([], [], -1, -1, [], false),
                         );
-                        return result; // C++ sees IsPromise()
+                        return result;
                     }
                     const n = normalize(result as CompletionEntry[] | CompletionResult);
-                    // Sync: return an object C++ inspects. Legacy callers that
-                    // returned string[] get replaceStart/replaceEnd = -1 which
-                    // C++ interprets as "compute word_end yourself".
                     return n.replaceStart >= 0
-                        ? { entries: n.texts, replaceStart: n.replaceStart, replaceEnd: n.replaceEnd }
+                        ? { entries: n.texts, displays: n.displays,
+                            replaceStart: n.replaceStart, replaceEnd: n.replaceEnd,
+                            ambiguous: n.ambiguous }
                         : n.texts;
                 }
                 : undefined,

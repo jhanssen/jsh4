@@ -104,11 +104,16 @@ describe("completion — user-defined handlers", () => {
     });
 
     it("should filter by prefix", () => {
+        // "push" and "pull" share the prefix "pu" — LCP extension collapses
+        // the result to a single pseudo-match marked ambiguous.
         const r = sync(getCompletions("git p"));
-        const entries = r.entries.map(text);
-        assert.ok(entries.includes("push"));
-        assert.ok(entries.includes("pull"));
-        assert.ok(!entries.includes("add"));
+        assert.equal(r.ambiguous, true);
+        assert.deepEqual(r.entries.map(text), ["pu"]);
+
+        // Now fully disambiguated — single match, not ambiguous.
+        const r2 = sync(getCompletions("git pus"));
+        assert.equal(r2.ambiguous, undefined);
+        assert.deepEqual(r2.entries.map(text), ["push"]);
     });
 
     it("should support async handlers returning a promise", async () => {
@@ -152,6 +157,67 @@ describe("completion — cursor awareness", () => {
         assert.equal(r.replaceStart, 0);
         assert.equal(r.replaceEnd, 3);
         assert.ok(entries.every(c => c.startsWith("git")), `got: ${entries.slice(0,5)}`);
+    });
+});
+
+describe("completion — redirection target", () => {
+    it("should file-complete after `>` regardless of command", () => {
+        const r = sync(getCompletions("git log > src/", 14));
+        const entries = r.entries.map(text);
+        assert.ok(entries.some(c => c.includes("executor")), `got: ${entries}`);
+    });
+});
+
+describe("completion — assignment RHS", () => {
+    it("should complete path as the value of FOO=path", () => {
+        const r = sync(getCompletions("FOO=src/", 8));
+        const entries = r.entries.map(text);
+        assert.ok(entries.length > 0, `got: ${entries}`);
+        // Replacement range should skip the `FOO=` part.
+        assert.equal(r.replaceStart, 4);
+    });
+});
+
+describe("completion — command modifiers", () => {
+    it("should complete as command after `sudo <cursor>`", () => {
+        const r = sync(getCompletions("sudo ec", 7));
+        const entries = r.entries.map(text);
+        assert.ok(entries.includes("echo"), `got: ${entries}`);
+    });
+
+    it("should dispatch to git handler after `sudo git <cursor>`", () => {
+        // "push" / "pull" → LCP "pu" with ambiguous=true.
+        const r = sync(getCompletions("sudo git p", 10));
+        assert.equal(r.ambiguous, true);
+        assert.deepEqual(r.entries.map(text), ["pu"]);
+    });
+});
+
+describe("completion — glob expansion", () => {
+    it("should expand globs in the current word", () => {
+        const r = sync(getCompletions("ls *.md", 7));
+        const entries = r.entries.map(text);
+        assert.ok(entries.some(c => c.endsWith(".md")), `got: ${entries}`);
+    });
+});
+
+describe("completion — LCP extension", () => {
+    it("should return an ambiguous pseudo-match at the longest common prefix", () => {
+        // `pac` prefix matches package.json and package-lock.json, both
+        // starting with "package". LCP extends beyond typed prefix.
+        const r = sync(getCompletions("ls pac"));
+        assert.equal(r.ambiguous, true);
+        assert.equal(r.entries.length, 1);
+        const t = text(r.entries[0]!);
+        assert.ok(t.startsWith("package"), `got: ${t}`);
+    });
+
+    it("should NOT LCP-extend when typed already equals the common prefix", () => {
+        // "package" — both package.json and package-lock.json match. LCP is
+        // still "package", same length as typed. No extension.
+        const r = sync(getCompletions("ls package"));
+        assert.notEqual(r.ambiguous, true);
+        assert.ok(r.entries.length >= 2);
     });
 });
 
