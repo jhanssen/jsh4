@@ -257,6 +257,13 @@
 ### Testing
 
 - [ ] **Interactive terminal test framework** — Use `node-pty` + headless `xterm.js` to spawn jsh in a real PTY, send keystrokes, and assert against the virtual screen buffer. Enables testing widgets, cursor positioning, ghost text, multi-line rendering, Ctrl-R/Ctrl-S search, tab completion cycling, and other UI behavior that can't be verified via `spawnSync` + stdout capture.
+- [ ] **Completion coverage gaps.** `test/completion.test.ts` exercises the TS `getCompletions` layer only. Nothing tests:
+  - **Native menu state machine** — state 1 (grid shown) → 2 (tentative insert) transitions on Tab / Shift-Tab, arrow nav (`menuNavigate`), viewport scrolling, Enter/Esc/other-key exit paths, `menuClose` with and without restore, the `/`-swallow after a directory match, single-match auto-space.
+  - **Splice logic** (`spliceCompletion`) — `completion_pre` + entry + `completion_tail` composition; buflen truncation ordering; cursor placement; cycle-mode "past-end restores original".
+  - **Object-return bridge** — `replaceStart`/`replaceEnd`, `displays`, `types`, `ambiguous` all round-tripping from TS through the N-API boundary correctly, both sync and async (`inputSetCompletions`) paths.
+  - **Menu rendering** — `menuLayout` column width from widest display, `menuRenderLines` row/col dispatch, LS_COLORS SGR wrapping, inverse-video selection covering padding, viewport windowing.
+  - **LCP extension** behavior — the `ambiguous` flag correctly suppresses auto-space; next Tab after an LCP extension recomputes and either extends further or shows the real list.
+  - Most of this needs the interactive terminal test framework above to do it properly — but isolated unit tests for `spliceCompletion` and `menuLayout`/`menuRenderLines` could cover a lot of the splice + layout math without a PTY.
 
 ### Technical debt
 
@@ -306,6 +313,23 @@ The bridge lives in `src/mb/` and `mb-applet/`. `@last` and `@claude` reference 
 - [ ] **Description column in menu-complete grid** — descriptions are already plumbed native-side (`completion_descriptions`); `menuRenderLines` doesn't use them. zsh renders descriptions in a right-aligned column next to the entry name. Moderate effort, ~100 LOC.
 - [ ] **Empty-handler fallback to file completion** — when a per-command handler (e.g. `git`) returns zero candidates, jsh currently shows nothing; zsh's multi-completer chain (`_complete _match _approximate`, configured via zstyle) falls through to generic file completion, which is why `git add <Tab>` in a clean tree still lists files/dirs. Simple fix: if the handler returns `[]`, fall through to `completeFileOrGlob(current)` in `getCompletions`. Bigger fix: a proper completer chain users can configure. Unclear how often this matters in practice beyond the `git add` case.
 - [x] **LS_COLORS colorization** in the menu-complete grid. Implemented via `jsh.setListColors(process.env.LS_COLORS ?? "")`. GNU format only (zsh itself doesn't parse BSD `LSCOLORS`). `CompletionEntry.type` carries `"file"|"dir"|"exec"|"link"`; `completeFile`/`completeFileOrGlob` set it via `lstat`+`stat`. Native parses colon-separated `key=SGR` rules (two-letter codes + `*.ext`) and wraps each grid cell's display text in the matching SGR. Inverse-video selection overrides the color.
+
+### Daemon + CLI client
+
+- [ ] **`jshd` daemon + `jshcli` client** — avoid Node cold-start (~80-120ms) for scripting use cases (scripts, CI, Makefiles invoking jsh). Strictly non-interactive — does NOT target running interactive jsh sessions (too many state-isolation hazards: cwd, `$?`, shell options, history, tcsetpgrp, concurrent clients — not worth the complexity).
+  - **`jshd`**: long-running jsh started with `jsh --daemon` or equivalent. Loads jshrc, stays warm with full state (Anthropic SDK, secrets, `@`-function handlers, aliases). Listens on a Unix socket at `$XDG_RUNTIME_DIR/jshd.sock` (or `/tmp/jshd-$UID.sock` on macOS).
+  - **`jshcli`**: tiny C program. Connects to the socket, sends the command (read from argv `-c` or stdin), forwards stdout/stderr streams back, returns the exit code. No TTY, no line editor, no readline.
+  - **Autospawn**: if `jshcli` fails to connect, optionally fork+exec `jshd` in the background, wait briefly for the socket, then retry. Opt-out via flag / env var.
+  - **Wire protocol**: WebSocket over Unix socket. `ws` dep already in the project (MB bridge). **Hybrid framing** so streaming large stdin/stdout doesn't pay base64 overhead:
+    - **Text frames** (JSON) for control:
+      - Client → daemon: `{type:"exec", cmd, cwd, env}` (handshake), `{type:"stdin-end"}` (EOF), `{type:"signal", sig:"INT"}` (SIGINT forwarding).
+      - Daemon → client: `{type:"exit", code}` (command done).
+    - **Binary frames** for data chunks. First byte = stream ID (`0x00`=stdin, `0x01`=stdout, `0x02`=stderr), rest = raw bytes. Supports `cat /tmp/largefile | jshcli @claude | grep …` without base64 tax.
+    - **Backpressure**: writer pauses when `ws.bufferedAmount` > 1 MiB, resumes on drain. `stream.pipeline` wrappers make this automatic on the Node side.
+  - **C client**: hand-roll a minimal WS client over Unix socket (~200 LOC) or link against libwebsockets (MB build vendors it; could share).
+  - **Concurrency**: the daemon's *state* is single-threaded (Node event loop), but multiple in-flight RPCs are fine as long as each command runs in its own subshell `( ... )` to keep cwd/vars/opts isolated. That's the only isolation layer needed for a dedicated daemon; no foreign user to protect from.
+  - Scope: ~300 LOC C client + ~200 LOC in jsh (socket listener, subshell-wrap request handler, protocol framing). A couple of days.
+  - **Not in scope**: interactive TTY forwarding (tmux-style attach — a different, bigger feature); serving RPCs from inside a running interactive jsh (rejected — state-mutation risk).
 
 ### Long-term exploration
 
