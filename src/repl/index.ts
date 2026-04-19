@@ -46,6 +46,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputSetInput: (text: string) => void;
     inputInsertAtCursor: (text: string) => void;
     inputSetCompletions: (entries: string[]) => void;
+    inputSetWordChars: (chars: string) => void;
     inputEAGAIN: () => number;
 };
 
@@ -251,6 +252,9 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         // Input buffer manipulation
         setInput: (text: string) => ui?.setInput(text),
         insertAtCursor: (text: string) => ui?.insertAtCursor(text),
+        // Word-boundary characters for Alt-B/F/D/Backspace and Ctrl-W (zsh's
+        // WORDCHARS). Defaults to zsh's default; override from jshrc to taste.
+        setWordChars: (chars: string) => native.inputSetWordChars(chars),
         // Colors
         colors,
         makeFgColor,

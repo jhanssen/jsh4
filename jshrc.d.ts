@@ -387,6 +387,21 @@ declare const jsh: {
      */
     insertAtCursor(text: string): void;
 
+    /**
+     * Set the punctuation characters that count as word-interior for
+     * Alt-B / Alt-F / Alt-D / Alt-Backspace / Ctrl-W. Mirrors zsh's
+     * WORDCHARS parameter. Letters and digits are always word chars; only
+     * pass the *additional* punctuation you want included. Non-ASCII bytes
+     * are always treated as word chars.
+     *
+     * Default is zsh's default: *?_-.[]~=/&;!#$%^(){}<>
+     *
+     * @example
+     * // Tighter word boundaries — only letters, digits, underscore count.
+     * jsh.setWordChars("_");
+     */
+    setWordChars(chars: string): void;
+
     // ---- Aliases ----
 
     alias(name: string, expansion: string): void;

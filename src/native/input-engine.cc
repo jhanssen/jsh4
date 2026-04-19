@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 
 extern "C" {
 #include <grapheme.h>
@@ -191,11 +192,16 @@ static int enableRawMode(int fd) {
     raw.c_cc[VTIME] = 0;
     if (tcsetattr(fd, TCSAFLUSH, &raw) < 0) return -1;
     rawmode = 1;
+    // Enable bracketed paste (DECSET 2004). Write to stdout (not the input
+    // fd, which may be O_RDONLY). Safe on terminals that don't support it —
+    // they ignore unknown private-mode sequences.
+    (void)!write(STDOUT_FILENO, "\x1b[?2004h", 8);
     return 0;
 }
 
 static void disableRawMode(int fd) {
     if (rawmode) {
+        (void)!write(STDOUT_FILENO, "\x1b[?2004l", 8);
         tcsetattr(fd, TCSAFLUSH, &orig_termios);
         rawmode = 0;
     }
@@ -351,6 +357,45 @@ struct InputState {
     size_t line_search_query_len = 0;
     size_t line_search_start = 0;      // search from this position forward
     size_t line_search_orig_pos = 0;   // cursor position at search entry
+    // Pending Esc: we've read an Esc byte but no follow-up was in the kernel
+    // buffer yet. The next byte (whenever it arrives — could be ms later for a
+    // split CSI burst, or seconds later for user-typed Esc-then-B) is
+    // dispatched as the second byte of an Esc-prefixed sequence.
+    bool esc_pending = false;
+    // Bracketed paste (DECSET 2004). Terminal wraps pasted content in
+    // ESC[200~ ... ESC[201~. While in_paste is true, bytes accumulate in
+    // paste_buf; the end marker is matched one byte at a time against
+    // "[201~" via paste_marker_state (0 = no partial match, 1 = saw ESC,
+    // 2..5 = matched "[201" prefix).
+    bool in_paste = false;
+    std::string paste_buf;
+    int paste_marker_state = 0;
+    // Kill ring (zsh KRINGCTDEF = 8). `cut_buf` is the current accumulator;
+    // a non-kill action between kills pushes the old cut_buf onto the ring
+    // and starts a new accumulator on the next kill. `last_was_kill` snapshot
+    // at the top of editFeed drives the accumulate-vs-new-entry decision.
+    // Yank inserts cut_buf; yank-pop replaces the [yank_start, yank_end)
+    // range with older ring entries, rotating.
+    std::string cut_buf;
+    std::vector<std::string> kill_ring;
+    size_t kill_ring_head = 0;
+    bool last_was_kill = false;
+    bool last_was_yank = false;
+    size_t yank_start = 0;
+    size_t yank_end = 0;
+    // yank_pop_idx: -1 = cut_buf, 0+ = kill_ring offset back from head.
+    int yank_pop_idx = -1;
+    // Prefix history search (Up/Down / Ctrl-P/Ctrl-N — zsh's
+    // up-line-or-beginning-search). Live across consecutive Up/Down presses;
+    // cleared whenever any other key fires.
+    bool in_prefix_search = false;
+    char prefix_anchor[INPUT_BUF_SIZE];     // buffer[0..cursor] at first Up
+    size_t prefix_anchor_len = 0;
+    size_t prefix_cursor = 0;               // cursor byte offset to restore
+    int prefix_index = -1;                  // history index of current match
+    char prefix_orig_buf[INPUT_BUF_SIZE];   // for restore on Down-past-newest
+    size_t prefix_orig_len = 0;
+    size_t prefix_orig_pos = 0;
 };
 
 static InputState g_state;
@@ -359,6 +404,17 @@ static InputState g_state;
 
 // Forward declarations — defined later in this file.
 static void bufferChanged();
+static void notifyRender();
+static inline int finalizedCount();
+static std::optional<std::string> readEscPayload(int fd, char introducer);
+static void deliverEscResponse(char introducer, const std::string& payload);
+static void prefixSearchStart(InputState *s);
+static bool prefixSearchOlder(InputState *s);
+static bool prefixSearchNewer(InputState *s);
+static void historyUpOrPrefixSearch(InputState *s, bool was_in_prefix_search);
+static void historyDownOrPrefixSearch(InputState *s, bool was_in_prefix_search);
+static int dispatchEscPrefix(InputState *s, char first, bool was_in_prefix_search,
+                             bool was_kill, bool was_yank);
 static size_t lineStart(const char *buf, size_t pos);
 
 static void editInsert(InputState *s, const char *c, size_t clen) {
@@ -484,14 +540,151 @@ static bool editMoveDown(InputState *s) {
     return true;
 }
 
-static void editDeletePrevWord(InputState *s) {
-    size_t old_pos = s->pos;
-    while (s->pos > 0 && s->buf[s->pos - 1] == ' ') s->pos--;
-    while (s->pos > 0 && s->buf[s->pos - 1] != ' ') s->pos--;
-    size_t diff = old_pos - s->pos;
-    memmove(s->buf + s->pos, s->buf + old_pos, s->len - old_pos + 1);
-    s->len -= diff;
+// Word-boundary predicate for Alt-B / Alt-F / Alt-D / Alt-Backspace / Ctrl-W.
+// A cluster is a word char if: non-ASCII (treats CJK, accented latin, emoji
+// as word-interior), ASCII alnum, or ASCII punctuation listed in `wordchars`
+// (zsh's WORDCHARS — settable via jsh.setWordChars). Defaults to zsh's
+// DEFAULT_WORDCHARS = *?_-.[]~=/&;!#$%^(){}<>, so `-foo`, `path/to/file`,
+// `VAR=val` are each a single word.
+static std::string wordchars = "*?_-.[]~=/&;!#$%^(){}<>";
+
+static bool isWordCluster(const char *buf, size_t pos, size_t clen) {
+    if (clen == 0) return false;
+    unsigned char c = static_cast<unsigned char>(buf[pos]);
+    if (c >= 0x80) return true;
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return true;
+    return wordchars.find(static_cast<char>(c)) != std::string::npos;
+}
+
+static void editMoveWordRight(InputState *s) {
+    // Skip non-word clusters, then skip word clusters — standard emacs M-f.
+    while (s->pos < s->len) {
+        size_t clen = graphemeNextLen(s->buf, s->pos, s->len);
+        if (clen == 0) break;
+        if (isWordCluster(s->buf, s->pos, clen)) break;
+        s->pos += clen;
+    }
+    while (s->pos < s->len) {
+        size_t clen = graphemeNextLen(s->buf, s->pos, s->len);
+        if (clen == 0) break;
+        if (!isWordCluster(s->buf, s->pos, clen)) break;
+        s->pos += clen;
+    }
+}
+
+static void editMoveWordLeft(InputState *s) {
+    // Mirror: skip non-word clusters backward, then skip word clusters backward.
+    // Bounded scan from line start keeps graphemePrevLen's forward walk O(line).
+    size_t line_begin = lineStart(s->buf, s->pos);
+    while (s->pos > line_begin) {
+        size_t clen = graphemePrevLen(s->buf, s->pos, line_begin);
+        if (clen == 0) break;
+        if (isWordCluster(s->buf, s->pos - clen, clen)) break;
+        s->pos -= clen;
+    }
+    while (s->pos > line_begin) {
+        size_t clen = graphemePrevLen(s->buf, s->pos, line_begin);
+        if (clen == 0) break;
+        if (!isWordCluster(s->buf, s->pos - clen, clen)) break;
+        s->pos -= clen;
+    }
+}
+
+// ---- Kill ring (zsh-compatible) -------------------------------------------
+
+static constexpr size_t KILL_RING_MAX = 8;
+
+// Save `text` to the kill ring. `was_kill` = last action was also a kill
+// (coalesce into cut_buf); `front` = text came from before the cursor
+// (prepend to cut_buf so original order is preserved for yank).
+static void killSave(InputState *s, const char *text, size_t len, bool was_kill, bool front) {
+    if (len == 0) return;
+    if (!was_kill) {
+        // Non-kill action broke the streak — push old cut_buf to ring, start
+        // a new accumulator.
+        if (!s->cut_buf.empty()) {
+            if (s->kill_ring.size() < KILL_RING_MAX) {
+                s->kill_ring.push_back(std::move(s->cut_buf));
+                s->kill_ring_head = s->kill_ring.size() - 1;
+            } else {
+                s->kill_ring_head = (s->kill_ring_head + 1) % KILL_RING_MAX;
+                s->kill_ring[s->kill_ring_head] = std::move(s->cut_buf);
+            }
+        }
+        s->cut_buf.clear();
+    }
+    if (front) {
+        s->cut_buf.insert(0, text, len);
+    } else {
+        s->cut_buf.append(text, len);
+    }
+}
+
+static void yank(InputState *s) {
+    if (s->cut_buf.empty() && s->kill_ring.empty()) return;
+    const std::string *src = &s->cut_buf;
+    if (src->empty() && !s->kill_ring.empty()) {
+        src = &s->kill_ring[s->kill_ring_head];
+    }
+    if (s->len + src->size() > s->buflen) return;
+    s->yank_start = s->pos;
+    editInsert(s, src->data(), src->size());
+    s->yank_end = s->pos;
+    s->last_was_yank = true;
+    s->yank_pop_idx = -1;
+}
+
+static void yankPop(InputState *s, bool was_yank) {
+    if (!was_yank) return; // only valid immediately after yank / yank-pop
+    if (s->kill_ring.empty()) return;
+    // Advance to next-older entry. -1 means we're sitting on cut_buf; move
+    // to ring[head], then ring[head-1], wrapping through the ring size.
+    s->yank_pop_idx = (s->yank_pop_idx + 1) % static_cast<int>(s->kill_ring.size());
+    int idx = (static_cast<int>(s->kill_ring_head) -
+               s->yank_pop_idx + static_cast<int>(s->kill_ring.size())) %
+              static_cast<int>(s->kill_ring.size());
+    const std::string &next = s->kill_ring[idx];
+
+    // Replace [yank_start, yank_end) with `next`.
+    size_t cur_len = s->yank_end - s->yank_start;
+    if (s->len - cur_len + next.size() > s->buflen) return;
+    memmove(s->buf + s->yank_start + next.size(),
+            s->buf + s->yank_end, s->len - s->yank_end);
+    memcpy(s->buf + s->yank_start, next.data(), next.size());
+    s->len = s->len - cur_len + next.size();
+    s->buf[s->len] = '\0';
+    s->pos = s->yank_start + next.size();
+    s->yank_end = s->pos;
+    s->last_was_yank = true;
     bufferChanged();
+}
+
+// Common path for all kill operations: save [start, end) to the kill ring,
+// splice it out of the buffer, park the cursor at `start`, and mark the
+// last action as a kill so the next consecutive kill coalesces.
+static void doKill(InputState *s, size_t start, size_t end, bool was_kill, bool front) {
+    if (end <= start) return;
+    killSave(s, s->buf + start, end - start, was_kill, front);
+    memmove(s->buf + start, s->buf + end, s->len - end);
+    s->len -= (end - start);
+    s->buf[s->len] = '\0';
+    s->pos = start;
+    s->last_was_kill = true;
+    bufferChanged();
+}
+
+static void editKillWordRight(InputState *s, bool was_kill) {
+    size_t start = s->pos;
+    editMoveWordRight(s);
+    size_t end = s->pos;
+    s->pos = start;
+    doKill(s, start, end, was_kill, /*front=*/false);
+}
+
+static void editKillWordLeft(InputState *s, bool was_kill) {
+    size_t end = s->pos;
+    editMoveWordLeft(s);
+    doKill(s, s->pos, end, was_kill, /*front=*/true);
 }
 
 static void editHistoryNav(InputState *s, int dir) {
@@ -608,12 +801,263 @@ static void lineSearchForward(InputState *s) {
     }
 }
 
+// Dispatch an Esc-prefixed input byte. `first` is the byte immediately
+// following Esc — either the only byte of a Meta-char sequence (Alt-B etc.),
+// the DCS/OSC introducer (P/]), or the CSI/SS3 introducer ([ or O). Returns 0
+// for "consumed; need more input" / 1 for line accepted. Currently no bindings
+// produce a line, so always returns 0.
+static int dispatchEscPrefix(InputState *s, char first, bool was_in_prefix_search,
+                             bool was_kill, bool was_yank) {
+    char seq[3];
+    seq[0] = first;
+
+    // DCS (ESC P ... ST) and OSC (ESC ] ... ST|BEL) responses — collect
+    // payload and dispatch to JS instead of treating as keystrokes.
+    if (seq[0] == 'P' || seq[0] == ']') {
+        auto payload = readEscPayload(s->ifd, seq[0]);
+        if (payload.has_value()) deliverEscResponse(seq[0], *payload);
+        return 0;
+    }
+
+    // Meta/Alt single-char sequences (ESC + c).
+    if (seq[0] == 'b') { editMoveWordLeft(s); notifyRender(); return 0; }
+    if (seq[0] == 'f') { editMoveWordRight(s); notifyRender(); return 0; }
+    if (seq[0] == 'd') { editKillWordRight(s, was_kill); notifyRender(); return 0; }
+    if (seq[0] == 0x7F || seq[0] == 0x08) { editKillWordLeft(s, was_kill); notifyRender(); return 0; }
+    if (seq[0] == 'y') { yankPop(s, was_yank); notifyRender(); return 0; }
+
+    // CSI (ESC [) and SS3 (ESC O) — need further bytes. These always arrive
+    // as a burst so the blocking read suffices (libuv's kernel buffer already
+    // holds them when the first byte became readable).
+    if (seq[0] != '[' && seq[0] != 'O') return 0;
+    if (read(s->ifd, seq+1, 1) == -1) return 0;
+
+    if (seq[0] == '[') {
+        if (seq[1] >= '0' && seq[1] <= '9') {
+            // Multi-digit parameter, terminated by '~' (or abandoned on any
+            // unexpected byte). Collect digits into `params` then dispatch.
+            char params[16];
+            params[0] = seq[1];
+            size_t n = 1;
+            while (n < sizeof(params) - 1) {
+                char ch;
+                if (read(s->ifd, &ch, 1) != 1) break;
+                if (ch == '~') {
+                    params[n] = '\0';
+                    if (strcmp(params, "3") == 0) { editDelete(s); notifyRender(); }
+                    else if (strcmp(params, "200") == 0) {
+                        // Bracketed paste begins. Subsequent bytes go through
+                        // processPasteByte until ESC[201~ ends the paste.
+                        s->in_paste = true;
+                        s->paste_buf.clear();
+                        s->paste_marker_state = 0;
+                    }
+                    // ESC[201~ outside paste mode is ignored — the end marker
+                    // is only meaningful in paste mode, where it's matched
+                    // one byte at a time inside processPasteByte.
+                    break;
+                }
+                if (ch < '0' || ch > '9') break;
+                params[n++] = ch;
+            }
+        } else {
+            switch (seq[1]) {
+            case 'A':
+                historyUpOrPrefixSearch(s, was_in_prefix_search);
+                notifyRender();
+                break;
+            case 'B':
+                historyDownOrPrefixSearch(s, was_in_prefix_search);
+                notifyRender();
+                break;
+            case 'C': // Right
+                if (s->pos == s->len && !s->suggestion.empty() &&
+                    s->suggestion.size() > s->len &&
+                    s->suggestion.compare(0, s->len, s->buf, s->len) == 0) {
+                    size_t slen = s->suggestion.size();
+                    if (slen <= s->buflen) {
+                        memcpy(s->buf, s->suggestion.c_str(), slen);
+                        s->buf[slen] = '\0';
+                        s->pos = s->len = slen;
+                        bufferChanged();
+                    }
+                } else {
+                    editMoveRight(s);
+                }
+                notifyRender();
+                break;
+            case 'D': editMoveLeft(s); notifyRender(); break;
+            case 'H': editMoveHome(s); notifyRender(); break;
+            case 'F': editMoveEnd(s); notifyRender(); break;
+            }
+        }
+    } else if (seq[0] == 'O') {
+        switch (seq[1]) {
+        case 'H': editMoveHome(s); notifyRender(); break;
+        case 'F': editMoveEnd(s); notifyRender(); break;
+        }
+    }
+    return 0;
+}
+
+// Unified Up/Down-in-buffer-or-history dispatch used by arrow keys and
+// Ctrl-P/Ctrl-N. `was_in_prefix_search` is the flag as observed at the top of
+// editFeed (before the per-call reset); on entry to prefix search we capture
+// the anchor, on subsequent Up/Down we walk the match list.
+static void historyUpOrPrefixSearch(InputState *s, bool was_in_prefix_search) {
+    if (editMoveUp(s)) return;
+    if (was_in_prefix_search) {
+        prefixSearchOlder(s);
+        s->in_prefix_search = true;
+        return;
+    }
+    if (s->pos > 0) {
+        prefixSearchStart(s);
+        if (prefixSearchOlder(s)) {
+            s->in_prefix_search = true;
+            return;
+        }
+        // No match: leave the buffer untouched and don't engage prefix search
+        // so a second Up falls back to plain history nav like the old behavior.
+        return;
+    }
+    // Empty prefix — fall through to plain history nav (older).
+    editHistoryNav(s, 1);
+}
+
+static void historyDownOrPrefixSearch(InputState *s, bool was_in_prefix_search) {
+    if (editMoveDown(s)) return;
+    if (was_in_prefix_search) {
+        prefixSearchNewer(s);
+        // prefixSearchNewer clears in_prefix_search on overshoot; otherwise
+        // keep the streak alive.
+        if (s->len != s->prefix_orig_len ||
+            memcmp(s->buf, s->prefix_orig_buf, s->len) != 0) {
+            s->in_prefix_search = true;
+        }
+        return;
+    }
+    editHistoryNav(s, -1);
+}
+
 static void enterLineSearch(InputState *s) {
     s->in_line_search = true;
     s->line_search_query[0] = '\0';
     s->line_search_query_len = 0;
     s->line_search_start = s->pos; // start searching from current cursor
     s->line_search_orig_pos = s->pos;
+}
+
+// ---- Bracketed paste (DECSET 2004) -----------------------------------------
+
+// Partial end-marker bytes matched so far get flushed to the paste buffer as
+// literal content when a mismatch interrupts the match.
+static void flushPasteMarker(InputState *s) {
+    static const char partial[] = "\x1b[201~";
+    for (int i = 0; i < s->paste_marker_state; i++) {
+        s->paste_buf.push_back(partial[i]);
+    }
+    s->paste_marker_state = 0;
+}
+
+static void commitPaste(InputState *s) {
+    if (!s->paste_buf.empty()) {
+        // editInsert itself caps at buflen, so oversized pastes truncate
+        // cleanly. Newlines pass through as literal bytes — the TS renderer
+        // already handles multi-line buffers (history recall of `\`-continued
+        // entries exercises the same path).
+        editInsert(s, s->paste_buf.data(), s->paste_buf.size());
+    }
+    s->paste_buf.clear();
+}
+
+// Feed one byte into the paste reader. Either extends the partial end-marker
+// match, flushes a broken partial match + re-processes the byte, or appends
+// plain content.
+static void processPasteByte(InputState *s, char c) {
+    static const char expected[] = "\x1b[201~";
+    static const int expected_len = 6;
+    if (s->paste_marker_state < expected_len && c == expected[s->paste_marker_state]) {
+        s->paste_marker_state++;
+        if (s->paste_marker_state == expected_len) {
+            commitPaste(s);
+            s->in_paste = false;
+            s->paste_marker_state = 0;
+        }
+        return;
+    }
+    if (s->paste_marker_state > 0) {
+        // Partial match broken — emit the matched bytes as literal content,
+        // then re-interpret c from a fresh state (it may start a new marker).
+        flushPasteMarker(s);
+        processPasteByte(s, c);
+        return;
+    }
+    s->paste_buf.push_back(c);
+}
+
+// ---- Prefix history search (up-line-or-beginning-search) -------------------
+
+static void prefixSearchStart(InputState *s) {
+    // Anchor = buffer[0..pos]. Snapshot orig buf so Down past the newest match
+    // can restore the line you were editing.
+    s->prefix_anchor_len = s->pos;
+    memcpy(s->prefix_anchor, s->buf, s->pos);
+    s->prefix_anchor[s->pos] = '\0';
+    s->prefix_cursor = s->pos;
+    memcpy(s->prefix_orig_buf, s->buf, s->len);
+    s->prefix_orig_buf[s->len] = '\0';
+    s->prefix_orig_len = s->len;
+    s->prefix_orig_pos = s->pos;
+    // Start searching from one past the newest finalized entry. finalizedCount
+    // excludes the current editing slot so the anchor's own in-progress line
+    // doesn't match itself.
+    s->prefix_index = finalizedCount();
+}
+
+static void prefixSearchApply(InputState *s, const char *entry) {
+    strncpy(s->buf, entry, s->buflen);
+    s->buf[s->buflen] = '\0';
+    s->len = strlen(s->buf);
+    s->pos = (s->prefix_cursor <= s->len) ? s->prefix_cursor : s->len;
+    bufferChanged();
+}
+
+// Walk to older match. Returns true if a match was found (buf updated).
+static bool prefixSearchOlder(InputState *s) {
+    for (int i = s->prefix_index - 1; i >= 0; i--) {
+        const char *e = history[i];
+        if (strncmp(e, s->prefix_anchor, s->prefix_anchor_len) == 0) {
+            s->prefix_index = i;
+            prefixSearchApply(s, e);
+            return true;
+        }
+    }
+    // No older match — stay on current entry (buf unchanged), beep-equivalent.
+    return false;
+}
+
+// Walk to newer match. Returns true if buf was updated. On overshoot past the
+// newest match, restores the pre-search buffer and clears in_prefix_search.
+static bool prefixSearchNewer(InputState *s) {
+    int n = finalizedCount();
+    for (int i = s->prefix_index + 1; i < n; i++) {
+        const char *e = history[i];
+        if (strncmp(e, s->prefix_anchor, s->prefix_anchor_len) == 0) {
+            s->prefix_index = i;
+            prefixSearchApply(s, e);
+            return true;
+        }
+    }
+    // Past the newest match — restore the original buffer and cursor.
+    memcpy(s->buf, s->prefix_orig_buf, s->prefix_orig_len);
+    s->buf[s->prefix_orig_len] = '\0';
+    s->len = s->prefix_orig_len;
+    s->pos = s->prefix_orig_pos;
+    s->in_prefix_search = false;
+    s->prefix_index = n; // past-the-end so subsequent Down is a no-op
+    bufferChanged();
+    return true;
 }
 
 static void exitLineSearch(InputState *s) {
@@ -637,6 +1081,7 @@ static void exitLineSearch(InputState *s) {
 #define CTRL_T 20
 #define CTRL_U 21
 #define CTRL_W 23
+#define CTRL_Y 25
 #define ENTER 13
 #define ESC 27
 #define BACKSPACE 127
@@ -671,13 +1116,31 @@ static void bufferChanged() {
 // Returns the payload (without introducer or terminator) on success, or
 // std::nullopt on malformed / oversized input. Caller has already consumed
 // ESC and the introducer byte ('P' or ']').
+// Blocking read of a single byte from fd, resilient to non-blocking state.
+// Returns 1 on success, 0 on EOF / timeout, -1 on hard error. Uses poll() with
+// a generous timeout so OSC/DCS payloads arriving in chunks don't truncate if
+// the fd happens to be non-blocking (libuv/Node may set O_NONBLOCK on stdin).
+static ssize_t readByteResilient(int fd, char *out) {
+    while (true) {
+        ssize_t n = read(fd, out, 1);
+        if (n == 1) return 1;
+        if (n == 0) return 0;
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+        // EAGAIN — wait for readability. Terminal-originated OSC/DCS should
+        // arrive within ms; 1s cap catches a hung peer without hanging jsh.
+        struct pollfd pfd = { fd, POLLIN, 0 };
+        int pr = poll(&pfd, 1, 1000);
+        if (pr <= 0) return 0; // timeout or error — abandon payload
+    }
+}
+
 static std::optional<std::string> readEscPayload(int fd, char introducer) {
     std::string payload;
     const size_t MAX = 8192;
     while (payload.size() < MAX) {
         char c;
-        ssize_t n = read(fd, &c, 1);
-        if (n != 1) return std::nullopt;
+        if (readByteResilient(fd, &c) != 1) return std::nullopt;
 
         // OSC accepts BEL as terminator.
         if (introducer == ']' && c == 0x07) return payload;
@@ -685,7 +1148,7 @@ static std::optional<std::string> readEscPayload(int fd, char introducer) {
         // ST is ESC \ for both DCS and OSC.
         if (c == 0x1b) {
             char c2;
-            if (read(fd, &c2, 1) != 1) return std::nullopt;
+            if (readByteResilient(fd, &c2) != 1) return std::nullopt;
             if (c2 == '\\') return payload;
             // Stray ESC inside payload — include both bytes and continue.
             payload.push_back(c);
@@ -851,6 +1314,51 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         return -1;
     }
     if (nread == 0) { *out_errno = 0; return -1; } // EOF
+
+    // Prefix history search is only sticky across consecutive Up/Down. Any
+    // other key breaks the streak — clear at the top; the Up/Down handlers
+    // below re-set the flag when they continue the search.
+    bool was_in_prefix_search = s->in_prefix_search;
+    s->in_prefix_search = false;
+
+    // Kill/yank streak tracking. Any action other than a kill breaks the
+    // accumulator (next kill pushes the old cut_buf to the ring and starts
+    // fresh). Any action other than a yank makes Alt-Y a no-op.
+    bool was_kill = s->last_was_kill;
+    s->last_was_kill = false;
+    bool was_yank = s->last_was_yank;
+    s->last_was_yank = false;
+
+    // Bracketed paste: once we've matched ESC[200~, all subsequent bytes
+    // accumulate in a side buffer until the ESC[201~ end marker arrives. Drain
+    // everything available per editFeed call — a multi-KB paste would
+    // otherwise take thousands of poll round-trips.
+    if (s->in_paste) {
+        processPasteByte(s, c);
+        while (s->in_paste) {
+            struct pollfd pfd = { s->ifd, POLLIN, 0 };
+            if (poll(&pfd, 1, 0) <= 0) break;
+            char next;
+            if (read(s->ifd, &next, 1) != 1) break;
+            processPasteByte(s, next);
+        }
+        notifyRender();
+        return 0;
+    }
+
+    // Pending Esc: we previously saw Esc with no follow-up in the buffer.
+    // Treat this byte as the second byte of an Esc-prefixed sequence —
+    // unless it's another Esc, in which case keep pending (user rolled the
+    // Esc key, next byte after this one becomes the Meta-byte).
+    if (s->esc_pending) {
+        s->esc_pending = false;
+        if (c == ESC) {
+            s->esc_pending = true;
+            return 0;
+        }
+        dispatchEscPrefix(s, c, was_in_prefix_search, was_kill, was_yank);
+        return 0;
+    }
 
     // Reverse search mode handling.
     if (s->in_search) {
@@ -1039,11 +1547,11 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         notifyRender();
         break;
     case CTRL_P:
-        if (!editMoveUp(s)) editHistoryNav(s, 1);
+        historyUpOrPrefixSearch(s, was_in_prefix_search);
         notifyRender();
         break;
     case CTRL_N:
-        if (!editMoveDown(s)) editHistoryNav(s, -1);
+        historyDownOrPrefixSearch(s, was_in_prefix_search);
         notifyRender();
         break;
     case CTRL_A: editMoveHome(s); notifyRender(); break;
@@ -1051,16 +1559,15 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
     case CTRL_S: enterLineSearch(s); notifyRender(); break;
 
     case CTRL_U:
-        s->buf[0] = '\0';
-        s->pos = s->len = 0;
-        bufferChanged();
+        // kill-whole-line: the killed range covers both sides of the cursor.
+        // Treat as a non-coalescing kill (pass was_kill=false) so the whole
+        // line becomes its own ring entry.
+        doKill(s, 0, s->len, /*was_kill=*/false, /*front=*/false);
         notifyRender();
         break;
 
     case CTRL_K:
-        s->buf[s->pos] = '\0';
-        s->len = s->pos;
-        bufferChanged();
+        doKill(s, s->pos, s->len, was_kill, /*front=*/false);
         notifyRender();
         break;
 
@@ -1077,74 +1584,33 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         break;
 
     case CTRL_W:
-        editDeletePrevWord(s);
+        // zsh binds ^W to backward-kill-word (word-char-bounded, same as
+        // Alt-Backspace) rather than readline's whitespace-only flavor.
+        editKillWordLeft(s, was_kill);
+        notifyRender();
+        break;
+
+    case CTRL_Y:
+        yank(s);
         notifyRender();
         break;
 
     case ESC: {
-        char seq[3];
-        if (read(s->ifd, seq, 1) == -1) break;
-
-        // DCS (ESC P ... ST) and OSC (ESC ] ... ST|BEL) responses — collect
-        // payload and dispatch to JS instead of treating as keystrokes. Enables
-        // async XTGETTCAP / handshake replies to be received during raw-mode
-        // edit sessions.
-        if (seq[0] == 'P' || seq[0] == ']') {
-            auto payload = readEscPayload(s->ifd, seq[0]);
-            if (payload.has_value()) {
-                deliverEscResponse(seq[0], *payload);
-            }
+        // Fast path: if the follow-up byte is already in the kernel buffer
+        // (CSI/SS3 burst from the terminal, or DCS/OSC payload), read and
+        // dispatch synchronously. Otherwise mark Esc pending — the next
+        // editFeed tick will treat the arriving byte as the second byte of
+        // this Esc sequence, however long the user takes. Mirrors zsh's
+        // "wait indefinitely for the next key" behavior without blocking the
+        // Node event loop.
+        struct pollfd pfd = { s->ifd, POLLIN, 0 };
+        if (poll(&pfd, 1, 0) <= 0) {
+            s->esc_pending = true;
             break;
         }
-
-        if (read(s->ifd, seq+1, 1) == -1) break;
-
-        if (seq[0] == '[') {
-            if (seq[1] >= '0' && seq[1] <= '9') {
-                if (read(s->ifd, seq+2, 1) == -1) break;
-                if (seq[2] == '~') {
-                    switch (seq[1]) {
-                    case '3': editDelete(s); notifyRender(); break; // Delete
-                    }
-                }
-            } else {
-                switch (seq[1]) {
-                case 'A': // Up
-                    if (!editMoveUp(s)) editHistoryNav(s, 1);
-                    notifyRender();
-                    break;
-                case 'B': // Down
-                    if (!editMoveDown(s)) editHistoryNav(s, -1);
-                    notifyRender();
-                    break;
-                case 'C': // Right
-                    if (s->pos == s->len && !s->suggestion.empty() &&
-                        s->suggestion.size() > s->len &&
-                        s->suggestion.compare(0, s->len, s->buf, s->len) == 0) {
-                        // Accept suggestion: replace buffer with the full suggestion.
-                        size_t slen = s->suggestion.size();
-                        if (slen <= s->buflen) {
-                            memcpy(s->buf, s->suggestion.c_str(), slen);
-                            s->buf[slen] = '\0';
-                            s->pos = s->len = slen;
-                            bufferChanged();
-                        }
-                    } else {
-                        editMoveRight(s);
-                    }
-                    notifyRender();
-                    break;
-                case 'D': editMoveLeft(s); notifyRender(); break;        // Left
-                case 'H': editMoveHome(s); notifyRender(); break;        // Home
-                case 'F': editMoveEnd(s); notifyRender(); break;         // End
-                }
-            }
-        } else if (seq[0] == 'O') {
-            switch (seq[1]) {
-            case 'H': editMoveHome(s); notifyRender(); break;
-            case 'F': editMoveEnd(s); notifyRender(); break;
-            }
-        }
+        char first;
+        if (read(s->ifd, &first, 1) == -1) break;
+        dispatchEscPrefix(s, first, was_in_prefix_search, was_kill, was_yank);
         break;
     }
 
@@ -1504,6 +1970,14 @@ static Napi::Value SetInput(const Napi::CallbackInfo &info) {
     return env.Undefined();
 }
 
+static Napi::Value SetWordChars(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() >= 1 && info[0].IsString()) {
+        wordchars = info[0].As<Napi::String>().Utf8Value();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
     if (!g_state.waiting_for_completions) return env.Undefined();
@@ -1629,6 +2103,7 @@ Napi::Object InitInputEngine(Napi::Env env, Napi::Object exports) {
     exports.Set("inputSetInput",       Napi::Function::New(env, SetInput));
     exports.Set("inputInsertAtCursor", Napi::Function::New(env, InsertAtCursor));
     exports.Set("inputSetCompletions", Napi::Function::New(env, SetCompletions));
+    exports.Set("inputSetWordChars",  Napi::Function::New(env, SetWordChars));
     exports.Set("inputEAGAIN",        Napi::Function::New(env, GetEAGAIN));
     // Fd utilities (previously in linenoise.cc)
     exports.Set("closeFd",            Napi::Function::New(env, CloseFd));
