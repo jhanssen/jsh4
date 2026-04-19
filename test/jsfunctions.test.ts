@@ -357,4 +357,67 @@ export async function* gen(args, stdin) {
         const { stdout } = withRc(rc, "gen | head -3");
         assert.strictEqual(stdout, "1\n2\n3");
     });
+
+    it("should route console.log inside an @-fn into the next pipeline stage", () => {
+        const rc = `
+export async function emit(args, stdin) {
+    console.log("hello-from-console");
+    console.log("second-line");
+}
+`;
+        const { stdout } = withRc(rc, "emit | grep hello");
+        assert.strictEqual(stdout, "hello-from-console");
+    });
+
+    it("should route jsh.stdout.write inside an @-fn into the next pipeline stage", () => {
+        const rc = `
+export async function emit(args, stdin) {
+    await jsh.stdout.write("a\\nb\\nc\\n");
+}
+`;
+        const { stdout } = withRc(rc, "emit | wc -l | tr -d ' '");
+        assert.strictEqual(stdout, "3");
+    });
+
+    it("should send console.error to stderr (terminal), not the pipeline", () => {
+        // stderr stays on fd 2 in pipelines unless 2>&1 — so console.error
+        // from an @-fn should *not* land in downstream stage.
+        const rc = `
+export async function emit(args, stdin) {
+    console.error("error-msg");
+    console.log("data-msg");
+}
+`;
+        const { stdout, stderr } = withRc(rc, "emit | cat");
+        assert.strictEqual(stdout, "data-msg");
+        assert.match(stderr, /error-msg/);
+    });
+
+    it("should preserve write order when many concurrent writers target the same fd", () => {
+        // Fire 100 echo-via-builtin writes to stderr from concurrent async
+        // chains (Promise.all over a JS function that calls jsh.exec on
+        // builtins). Per-fd queue must serialize them in enqueue order.
+        // Using stderr because pipelines don't redirect it, so all writers
+        // share fd 2.
+        const rc = `
+export async function fanout() {
+    const tasks = [];
+    for (let i = 0; i < 100; i++) {
+        tasks.push(jsh.exec("printf 'line%03d\\n' " + i, { stderr: "merge" }));
+    }
+    const results = await Promise.all(tasks);
+    return results.map(r => r.stdout).join("\\n") + "\\n";
+}
+`;
+        const { stdout } = withRc(rc, "fanout");
+        const lines = stdout.split("\n").filter(Boolean);
+        assert.strictEqual(lines.length, 100);
+        // All 100 lines present (no drops, no duplicates).
+        const seen = new Set(lines);
+        assert.strictEqual(seen.size, 100);
+        for (let i = 0; i < 100; i++) {
+            assert.ok(seen.has(`line${String(i).padStart(3, "0")}`),
+                `missing line${String(i).padStart(3, "0")}`);
+        }
+    });
 });

@@ -8,7 +8,10 @@ import { $ } from "../variables/index.js";
 import {
     setColorize, getColorize, setTheme, getAlias,
     alias, unalias, registerJsFunction, exec, registerCompletion,
+    stdin as jshStdin, stdout as jshStdout, stderr as jshStderr,
 } from "../api/index.js";
+import { writeStdout as _writeStdout, writeStderr as _writeStderr } from "../executor/index.js";
+import { format as utilFormat } from "node:util";
 import { getCompletions } from "../completion/index.js";
 import { colorize, getCurrentTheme, registerCommandExists, getResolvedColor, onThemeChange } from "../colorize/index.js";
 import { commandExists } from "../completion/index.js";
@@ -271,8 +274,26 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         makeBgColor,
         makeUlColor,
         style,
+        // IO — stream-shaped handles that always read the current IO context
+        // fd. Outside any pipeline, they target the terminal; inside an
+        // @-pipeline stage, they target the stage's pipe.
+        stdin: jshStdin,
+        stdout: jshStdout,
+        stderr: jshStderr,
     };
     (globalThis as Record<string, unknown>)["jsh"] = jshApi;
+
+    // Take over console.* so jshrc / dependency / @-function code that
+    // calls console.log routes through the IO context. log/info/debug go
+    // to stdout, error/warn go to stderr. util.format handles multi-arg
+    // and object inspection like Node's stock console. Fire-and-forget
+    // (returns void to match Node's signature) — failures surface as
+    // unhandled rejections, same as today's process.stdout.write hazard.
+    console.log   = (...args: unknown[]) => { void _writeStdout(utilFormat(...args) + "\n"); };
+    console.info  = console.log;
+    console.debug = console.log;
+    console.error = (...args: unknown[]) => { void _writeStderr(utilFormat(...args) + "\n"); };
+    console.warn  = console.error;
 
     if (!rcPath) return;
 

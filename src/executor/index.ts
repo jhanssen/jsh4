@@ -53,11 +53,32 @@ export function withIoContext<T>(ctx: IoContext, fn: () => Promise<T>): Promise<
     return ioStorage.run(ctx, fn);
 }
 
+// Per-fd serial write queue. Concurrent writeAll() calls to the same fd
+// chain through one Promise so bytes land in enqueue order — independent
+// callers (timer ticks, multiple pipeline stages writing to fd 2, etc.)
+// don't interleave. Different fds stay independent. The queue swallows
+// errors so a failed write doesn't poison the chain; each caller still
+// sees its own write's error via the returned Promise.
+const writeQueues = new Map<number, Promise<void>>();
+
+async function writeAll(fd: number, data: Buffer | string): Promise<void> {
+    const buf = typeof data === "string" ? Buffer.from(data) : data;
+    const prior = writeQueues.get(fd) ?? Promise.resolve();
+    const next  = prior.then(() => writeAllRaw(fd, buf));
+    const tracked = next.catch(() => {});
+    writeQueues.set(fd, tracked);
+    // Drop the map entry once the chain settles — keeps it bounded by the
+    // count of *currently active* fds, not the total seen across the session.
+    tracked.then(() => {
+        if (writeQueues.get(fd) === tracked) writeQueues.delete(fd);
+    });
+    return next;
+}
+
 // Promise-wrapped fs.write with partial-write loop. EPIPE / EBADF /
 // stream-destroyed errors propagate as Error objects whose .code matches
 // the existing catch shapes throughout the executor (no rewrap).
-async function writeAll(fd: number, data: Buffer | string): Promise<void> {
-    const buf = typeof data === "string" ? Buffer.from(data) : data;
+async function writeAllRaw(fd: number, buf: Buffer): Promise<void> {
     let off = 0;
     while (off < buf.length) {
         const bytesWritten = await new Promise<number>((res, rej) => {
@@ -72,8 +93,8 @@ async function writeAll(fd: number, data: Buffer | string): Promise<void> {
 
 // Builtin output. Always async; routes through the IO context so pipeline
 // stages can run concurrently without dup2 contention on process.fd 1/2.
-async function writeStdout(s: string): Promise<void> { await writeAll(getStdoutFd(), s); }
-async function writeStderr(s: string): Promise<void> { await writeAll(getStderrFd(), s); }
+export async function writeStdout(s: string): Promise<void> { await writeAll(getStdoutFd(), s); }
+export async function writeStderr(s: string): Promise<void> { await writeAll(getStderrFd(), s); }
 
 // Buffered writer — amortizes per-write Promise allocation for builtins
 // that emit many short lines (declare -p, jobs, hash list, set -o list,
@@ -999,35 +1020,45 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
         }
     };
 
-    try {
-        let result: unknown;
-        if (node.buffered && stdinIterable) {
-            let input = "";
-            for await (const line of stdinIterable) input += line + "\n";
-            result = await Promise.resolve(fn(args, input));
-        } else {
-            result = await Promise.resolve(fn(args, stdinIterable));
-        }
+    // Run user code inside an IO context tied to this stage's fds. Any
+    // console.log / jsh.stdout.write / writeStdout call inside the function
+    // (or inside an async generator yielded by it) routes to the stage's
+    // pipe. Yield/return values still flow through the explicit `out`
+    // writer below — both paths target the same fd, so users can mix.
+    const userCtx: IoContext = { stdinFd, stdoutFd, stderrFd: getStderrFd() };
 
-        // Handle return types.
-        if (result === undefined || result === null) {
-            // void — nothing to write
-        } else if (typeof result === "object" && "exitCode" in (result as object)) {
-            return (result as { exitCode: number }).exitCode;
-        } else if (isAsyncGenerator(result) || isGenerator(result)) {
-            for await (const chunk of result as AsyncIterable<unknown>) writeOut(chunk);
-        } else if (Buffer.isBuffer(result) || result instanceof Uint8Array) {
-            out.write(result);
-        } else {
-            const str = String(result);
-            // Add trailing newline only when writing to terminal, not into a pipe.
-            if (stdoutFd === 1) {
-                out.write(str.endsWith("\n") ? str : str + "\n");
+    try {
+        const exitCode = await withIoContext(userCtx, async () => {
+            let result: unknown;
+            if (node.buffered && stdinIterable) {
+                let input = "";
+                for await (const line of stdinIterable) input += line + "\n";
+                result = await Promise.resolve(fn(args, input));
             } else {
-                out.write(str);
+                result = await Promise.resolve(fn(args, stdinIterable));
             }
-        }
-        return 0;
+
+            // Handle return types.
+            if (result === undefined || result === null) {
+                // void — nothing to write
+            } else if (typeof result === "object" && "exitCode" in (result as object)) {
+                return (result as { exitCode: number }).exitCode;
+            } else if (isAsyncGenerator(result) || isGenerator(result)) {
+                for await (const chunk of result as AsyncIterable<unknown>) writeOut(chunk);
+            } else if (Buffer.isBuffer(result) || result instanceof Uint8Array) {
+                out.write(result);
+            } else {
+                const str = String(result);
+                // Add trailing newline only when writing to terminal, not into a pipe.
+                if (stdoutFd === 1) {
+                    out.write(str.endsWith("\n") ? str : str + "\n");
+                } else {
+                    out.write(str);
+                }
+            }
+            return 0;
+        });
+        return exitCode;
     } catch (e: unknown) {
         // Suppress EPIPE / stream-destroyed — normal when a downstream stage
         // closes early (`seq 100 | @filter | head -3`). Report as 141 to
@@ -1839,7 +1870,7 @@ function readLineFromFd(fd: number): string | null {
     return null;
 }
 
-async function readLineFromFdAsync(fd: number): Promise<string | null> {
+export async function readLineFromFdAsync(fd: number): Promise<string | null> {
     let state = fdReadBuffers.get(fd);
     if (!state) {
         state = { buf: Buffer.alloc(4096), data: "" };
@@ -1868,7 +1899,7 @@ async function readLineFromFdAsync(fd: number): Promise<string | null> {
     return null;
 }
 
-async function readBytesFromFdAsync(fd: number, count: number): Promise<string> {
+export async function readBytesFromFdAsync(fd: number, count: number): Promise<string> {
     const buf = Buffer.alloc(count);
     let off = 0;
     while (off < count) {

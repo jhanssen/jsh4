@@ -489,4 +489,46 @@ declare const jsh: {
      * });
      */
     complete(cmd: string, fn: (ctx: CompletionCtx) => string[] | Promise<string[]>): void;
+
+    // ---- IO ----
+
+    /**
+     * Stream-shaped handles tied to the *current* IO context. Outside any
+     * pipeline (jshrc top-level, widget callbacks, timers), they target the
+     * terminal. Inside an `@`-pipeline stage, they target the stage's pipe.
+     * Code can use them uniformly without checking which context it's in.
+     *
+     * Concurrent writes to the same fd are serialized by a per-fd queue, so
+     * order is preserved even across independent callers.
+     *
+     * Note on `console.*`: jsh patches `console.log` / `info` / `debug` to
+     * route through `jsh.stdout` and `console.error` / `warn` through
+     * `jsh.stderr`. Use console for ergonomic logging; use these handles
+     * directly when you need `await`, binary output, or stream piping.
+     *
+     * @example
+     * // Inside an @-function
+     * export async function* tee(args, stdin) {
+     *     for await (const line of stdin) {
+     *         await jsh.stderr.write(`[${args[0]}] ${line}\n`);
+     *         yield line + "\n";
+     *     }
+     * }
+     *
+     * // Read stdin without an explicit param (e.g., in a buffered helper)
+     * for await (const line of jsh.stdin) { ... }
+     */
+    readonly stdin: {
+        readonly fd: number;
+        read(n: number): Promise<string>;
+        [Symbol.asyncIterator](): AsyncIterator<string>;
+    };
+    readonly stdout: {
+        readonly fd: number;
+        write(data: string | Buffer | Uint8Array): Promise<void>;
+    };
+    readonly stderr: {
+        readonly fd: number;
+        write(data: string | Buffer | Uint8Array): Promise<void>;
+    };
 };
