@@ -5,6 +5,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -359,6 +360,9 @@ struct InputState {
     // directory prefix. Empty string = render the entry text itself.
     std::vector<std::string> completion_descriptions;
     std::vector<std::string> completion_displays;
+    // Type hint for LS_COLORS colorization in the menu grid. Values are the
+    // short names "file" / "dir" / "exec" / "link" or "" for no-color.
+    std::vector<std::string> completion_types;
     // Menu-complete mode (zsh's `menu-select` behavior; opt-in via
     // jsh.setCompletionStyle("menu")). State machine:
     //   0 = inactive
@@ -597,6 +601,64 @@ static std::string wordchars = "*?_-.[]~=/&;!#$%^(){}<>";
 // Menu-complete opt-in. Set via jsh.setCompletionStyle("menu" | "cycle").
 // Default is "cycle" (current behavior — Tab cycles through candidates).
 static bool g_menu_complete = false;
+
+// ---- LS_COLORS (GNU format) -----------------------------------------------
+//
+// Populated via jsh.setListColors(str). Used by menuRenderLines to colorize
+// grid cells. Format: colon-separated "key=SGR" entries where key is either
+// a two-letter type code (di, ln, ex, fi, ...) or a glob-ish "*.ext".
+static std::unordered_map<std::string, std::string> g_lscolors_types;
+static std::vector<std::pair<std::string, std::string>> g_lscolors_exts; // {".ext", "01;31"}
+
+static void parseLsColors(const std::string &s) {
+    g_lscolors_types.clear();
+    g_lscolors_exts.clear();
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t end = s.find(':', i);
+        if (end == std::string::npos) end = s.size();
+        size_t eq = s.find('=', i);
+        if (eq != std::string::npos && eq < end) {
+            std::string key(s, i, eq - i);
+            std::string val(s, eq + 1, end - eq - 1);
+            if (!val.empty()) {
+                if (!key.empty() && key[0] == '*') {
+                    // Glob-ish extension rule ("*.tar", "*.png"). Store the
+                    // suffix starting from the '.' for simple endsWith().
+                    g_lscolors_exts.emplace_back(key.substr(1), std::move(val));
+                } else {
+                    g_lscolors_types.emplace(std::move(key), std::move(val));
+                }
+            }
+        }
+        i = (end < s.size()) ? end + 1 : end;
+    }
+}
+
+// Returns the SGR parameter string ("01;34") for an entry, or "" if no rule
+// applies. `type_hint` is one of "file" / "dir" / "exec" / "link" / "" from
+// the TS side; `display` is the user-visible cell text (used for *.ext match).
+static const std::string *lookupLsColor(const std::string &type_hint,
+                                        const std::string &display) {
+    const char *key = nullptr;
+    if      (type_hint == "dir")  key = "di";
+    else if (type_hint == "exec") key = "ex";
+    else if (type_hint == "link") key = "ln";
+    else if (type_hint == "file") {
+        // Try *.ext first — more specific than generic "fi".
+        for (const auto &pr : g_lscolors_exts) {
+            if (display.size() >= pr.first.size() &&
+                display.compare(display.size() - pr.first.size(),
+                                pr.first.size(), pr.first) == 0) {
+                return &pr.second;
+            }
+        }
+        key = "fi";
+    }
+    if (!key) return nullptr;
+    auto it = g_lscolors_types.find(key);
+    return it == g_lscolors_types.end() ? nullptr : &it->second;
+}
 
 static bool isWordCluster(const char *buf, size_t pos, size_t clen) {
     if (clen == 0) return false;
@@ -1413,12 +1475,28 @@ static std::vector<std::string> menuRenderLines(InputState *s) {
             if (idx >= s->completion_entries.size()) break;
             const std::string &disp = menuEntryDisplay(s, idx);
             bool selected = (s->menu_state == 2 && r == s->menu_row && c == s->menu_col);
+            // Pick up LS_COLORS style for this cell, if any. Inverse-video
+            // (selected) overrides the color so the highlight is visible.
+            const std::string *sgr = nullptr;
+            if (!selected && idx < s->completion_types.size()) {
+                sgr = lookupLsColor(s->completion_types[idx], disp);
+            }
             if (selected) line.append("\x1b[7m");
+            else if (sgr) { line.append("\x1b["); line.append(*sgr); line.append("m"); }
             line.append(disp);
+            // For non-selected cells close the SGR right after the text so
+            // padding isn't colored (LS_COLORS background codes would bleed).
+            // For selected cells keep the inverse-video active through the
+            // padding — matches zsh's full-column selection highlight.
             size_t ew = entryDisplayWidth(disp);
             int pad = s->menu_col_width - gap - static_cast<int>(ew);
-            if (pad > 0) line.append(pad, ' ');
-            if (selected) line.append("\x1b[27m");
+            if (selected) {
+                if (pad > 0) line.append(pad, ' ');
+                line.append("\x1b[27m");
+            } else {
+                if (sgr) line.append("\x1b[0m");
+                if (pad > 0) line.append(pad, ' ');
+            }
             line.append(gap, ' ');
         }
         lines.push_back(std::move(line));
@@ -1516,6 +1594,7 @@ static void menuClose(InputState *s, bool restore) {
     s->completion_entries.clear();
     s->completion_descriptions.clear();
     s->completion_displays.clear();
+    s->completion_types.clear();
     s->completion_original.clear();
     s->menu_orig_buf.clear();
 }
@@ -1581,6 +1660,7 @@ static int completeLine(InputState *s, char c) {
 
         std::vector<std::string> entries;
         std::vector<std::string> displays;
+        std::vector<std::string> types;
         size_t replaceStart = 0, replaceEnd = 0;
         bool ambiguous = false;
         bool ok = false;
@@ -1600,6 +1680,9 @@ static int completeLine(InputState *s, char c) {
             }
             if (obj.Has("displays") && obj.Get("displays").IsArray()) {
                 displays = extractCompletionArray(obj.Get("displays").As<Napi::Array>());
+            }
+            if (obj.Has("types") && obj.Get("types").IsArray()) {
+                types = extractCompletionArray(obj.Get("types").As<Napi::Array>());
             }
             replaceStart = obj.Has("replaceStart") && obj.Get("replaceStart").IsNumber()
                 ? obj.Get("replaceStart").As<Napi::Number>().Uint32Value() : s->pos;
@@ -1645,6 +1728,7 @@ static int completeLine(InputState *s, char c) {
             s->completion_original = std::string(s->buf, s->len);
             s->completion_entries = std::move(entries);
             s->completion_displays = std::move(displays);
+            s->completion_types = std::move(types);
             s->completion_idx = 0;
             s->menu_state = 1;
             s->menu_row = 0;
@@ -1655,6 +1739,7 @@ static int completeLine(InputState *s, char c) {
             return 0;
         }
         s->completion_displays = std::move(displays);
+        s->completion_types = std::move(types);
         startCompletion(s, std::move(entries));
         return 0;
     }
@@ -1697,6 +1782,7 @@ static int completeLine(InputState *s, char c) {
     s->completion_entries.clear();
     s->completion_descriptions.clear();
     s->completion_displays.clear();
+    s->completion_types.clear();
     s->completion_original.clear();
     return c;
 }
@@ -2402,6 +2488,16 @@ static Napi::Value SetCompletionStyle(const Napi::CallbackInfo &info) {
     return env.Undefined();
 }
 
+static Napi::Value SetListColors(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() >= 1 && info[0].IsString()) {
+        parseLsColors(info[0].As<Napi::String>().Utf8Value());
+    } else {
+        parseLsColors("");
+    }
+    return env.Undefined();
+}
+
 static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
     if (!g_state.waiting_for_completions) return env.Undefined();
@@ -2413,6 +2509,7 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
     std::vector<std::string> entries;
     std::vector<std::string> descs;
     std::vector<std::string> displays;
+    std::vector<std::string> types;
     int rs = -1, re_ = -1;
     bool ambiguous = false;
     if (info.Length() > 0 && info[0].IsArray()) {
@@ -2428,6 +2525,9 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
     }
     if (info.Length() > 5 && info[5].IsBoolean()) {
         ambiguous = info[5].As<Napi::Boolean>().Value();
+    }
+    if (info.Length() > 6 && info[6].IsArray()) {
+        types = extractCompletionArray(info[6].As<Napi::Array>());
     }
 
     if (!entries.empty()) {
@@ -2463,6 +2563,7 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
             g_state.completion_entries = std::move(entries);
             g_state.completion_descriptions = std::move(descs);
             g_state.completion_displays = std::move(displays);
+            g_state.completion_types = std::move(types);
             g_state.completion_idx = 0;
             g_state.menu_state = 1;
             g_state.menu_row = 0;
@@ -2472,6 +2573,7 @@ static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
             notifyRender();
         } else {
             g_state.completion_displays = std::move(displays);
+            g_state.completion_types = std::move(types);
             startCompletion(&g_state, std::move(entries), std::move(descs));
         }
     }
@@ -2582,6 +2684,7 @@ Napi::Object InitInputEngine(Napi::Env env, Napi::Object exports) {
     exports.Set("inputSetCompletions", Napi::Function::New(env, SetCompletions));
     exports.Set("inputSetWordChars",  Napi::Function::New(env, SetWordChars));
     exports.Set("inputSetCompletionStyle", Napi::Function::New(env, SetCompletionStyle));
+    exports.Set("inputSetListColors", Napi::Function::New(env, SetListColors));
     exports.Set("inputEAGAIN",        Napi::Function::New(env, GetEAGAIN));
     // Fd utilities (previously in linenoise.cc)
     exports.Set("closeFd",            Napi::Function::New(env, CloseFd));

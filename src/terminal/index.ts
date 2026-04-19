@@ -47,7 +47,7 @@ interface NativeInputEngine {
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
     inputInsertAtCursor: (text: string) => void;
-    inputSetCompletions: (entries: string[], descs: string[], replaceStart?: number, replaceEnd?: number, displays?: string[], ambiguous?: boolean) => void;
+    inputSetCompletions: (entries: string[], descs: string[], replaceStart?: number, replaceEnd?: number, displays?: string[], ambiguous?: boolean, types?: string[]) => void;
     inputEAGAIN: () => number;
 }
 
@@ -117,11 +117,11 @@ export class TerminalUI {
                     const result = this.completionFn!(input, cursor);
                     const normalize = (r: CompletionEntry[] | CompletionResult) => {
                         if (Array.isArray(r)) {
-                            const { texts, displays, descs } = normalizeEntries(r);
-                            return { texts, displays, descs, replaceStart: -1, replaceEnd: -1, ambiguous: false };
+                            const { texts, displays, descs, types } = normalizeEntries(r);
+                            return { texts, displays, descs, types, replaceStart: -1, replaceEnd: -1, ambiguous: false };
                         }
-                        const { texts, displays, descs } = normalizeEntries(r.entries);
-                        return { texts, displays, descs,
+                        const { texts, displays, descs, types } = normalizeEntries(r.entries);
+                        return { texts, displays, descs, types,
                                  replaceStart: r.replaceStart, replaceEnd: r.replaceEnd,
                                  ambiguous: r.ambiguous === true };
                     };
@@ -129,15 +129,15 @@ export class TerminalUI {
                         (result as Promise<CompletionEntry[] | CompletionResult>).then(
                             r => {
                                 const n = normalize(r);
-                                this.native.inputSetCompletions(n.texts, n.descs, n.replaceStart, n.replaceEnd, n.displays, n.ambiguous);
+                                this.native.inputSetCompletions(n.texts, n.descs, n.replaceStart, n.replaceEnd, n.displays, n.ambiguous, n.types);
                             },
-                            () => this.native.inputSetCompletions([], [], -1, -1, [], false),
+                            () => this.native.inputSetCompletions([], [], -1, -1, [], false, []),
                         );
                         return result;
                     }
                     const n = normalize(result as CompletionEntry[] | CompletionResult);
                     return n.replaceStart >= 0
-                        ? { entries: n.texts, displays: n.displays,
+                        ? { entries: n.texts, displays: n.displays, types: n.types,
                             replaceStart: n.replaceStart, replaceEnd: n.replaceEnd,
                             ambiguous: n.ambiguous }
                         : n.texts;

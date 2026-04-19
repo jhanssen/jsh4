@@ -45,7 +45,8 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
     inputInsertAtCursor: (text: string) => void;
-    inputSetCompletions: (entries: string[], descs?: string[], replaceStart?: number, replaceEnd?: number, displays?: string[], ambiguous?: boolean) => void;
+    inputSetCompletions: (entries: string[], descs?: string[], replaceStart?: number, replaceEnd?: number, displays?: string[], ambiguous?: boolean, types?: string[]) => void;
+    inputSetListColors: (value: string) => void;
     inputSetWordChars: (chars: string) => void;
     inputSetCompletionStyle: (style: string) => void;
     inputEAGAIN: () => number;
@@ -260,6 +261,10 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         // repeated Tab; "menu" shows a zsh-style grid and navigates it with
         // Tab / arrow keys.
         setCompletionStyle: (style: "cycle" | "menu") => native.inputSetCompletionStyle(style),
+        // Colorize menu-complete grid cells using a GNU-format LS_COLORS
+        // string (`di=01;34:ln=01;36:ex=01;32:*.tar=01;31:...`). Pass "" to
+        // clear. Typically: jsh.setListColors(process.env.LS_COLORS ?? "").
+        setListColors: (value: string) => native.inputSetListColors(value),
         // Colors
         colors,
         makeFgColor,

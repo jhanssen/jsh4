@@ -304,6 +304,7 @@ The bridge lives in `src/mb/` and `mb-applet/`. `@last` and `@claude` reference 
 - [ ] **Auto-remove-space** — zsh's `AUTOREMOVESLASH` / `autoparamkeys`: if the user types `|`, `;`, `&`, `)`, etc. immediately after the auto-added space, zsh pulls the space back so the line looks clean. jsh leaves `cmd foo |` with the stray space. Mirror by tracking "just auto-appended a space" state, consume it on those trigger keys.
 - [ ] **Custom per-match suffixes** (`compadd -S`) — zsh completers can register arbitrary closing text per match (e.g., closing parens, URL query delimiters). No equivalent hook on jsh's `CompletionEntry` today. Low priority.
 - [ ] **Description column in menu-complete grid** — descriptions are already plumbed native-side (`completion_descriptions`); `menuRenderLines` doesn't use them. zsh renders descriptions in a right-aligned column next to the entry name. Moderate effort, ~100 LOC.
+- [x] **LS_COLORS colorization** in the menu-complete grid. Implemented via `jsh.setListColors(process.env.LS_COLORS ?? "")`. GNU format only (zsh itself doesn't parse BSD `LSCOLORS`). `CompletionEntry.type` carries `"file"|"dir"|"exec"|"link"`; `completeFile`/`completeFileOrGlob` set it via `lstat`+`stat`. Native parses colon-separated `key=SGR` rules (two-letter codes + `*.ext`) and wraps each grid cell's display text in the matching SGR. Inverse-video selection overrides the color.
 
 ### Long-term exploration
 

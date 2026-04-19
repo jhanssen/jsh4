@@ -411,6 +411,20 @@ declare const jsh: {
      */
     setCompletionStyle(style: "cycle" | "menu"): void;
 
+    /**
+     * Colorize file entries in the menu-complete grid via a GNU-format
+     * LS_COLORS string (colon-separated `key=SGR` rules, same as GNU `ls`).
+     * Recognized keys: `di` (dir), `ex` (exec), `ln` (link), `fi` (file),
+     * and `*.ext` extension rules. Pass "" to clear.
+     *
+     * Typical usage (forward your shell's LS_COLORS, same as zsh's
+     * `zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"`):
+     *
+     * @example
+     * jsh.setListColors(process.env.LS_COLORS ?? "");
+     */
+    setListColors(value: string): void;
+
     // ---- Aliases ----
 
     alias(name: string, expansion: string): void;

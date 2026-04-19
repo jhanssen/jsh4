@@ -1,4 +1,4 @@
-import { readdirSync, statSync, globSync } from "node:fs";
+import { readdirSync, statSync, lstatSync, globSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { $ } from "../variables/index.js";
@@ -10,12 +10,19 @@ import type { Token } from "../parser/lexer.js";
 // ---- Completion entry type --------------------------------------------------
 
 // `text` is the value spliced into the buffer on accept.
-// `display` (optional) is what the menu grid shows for this entry — handy
-//    when entries share a common directory prefix (`src/api/`, `src/completion/`)
-//    and you want just the basenames on screen but the full path on accept.
-//    Defaults to `text`.
+// `display` (optional) is what the menu grid shows — useful when entries
+//    share a common path prefix (defaults to `text`).
 // `desc` is a description (future: second column in the grid).
-export type CompletionEntry = string | { text: string; display?: string; desc?: string };
+// `type` is a hint used for LS_COLORS colorization in the menu. Omit for
+//    non-filesystem matches (commands, variables, subcommand names, etc.);
+//    those render without type-specific color.
+export type CompletionEntryType = "file" | "dir" | "exec" | "link";
+export type CompletionEntry = string | {
+    text: string;
+    display?: string;
+    desc?: string;
+    type?: CompletionEntryType;
+};
 
 // Lexer-driven completion result. `replaceStart` / `replaceEnd` are byte
 // offsets into the full buffer; the native engine splices entries in by
@@ -37,23 +44,27 @@ export interface CompletionResult {
  * - texts: spliced on accept.
  * - displays: shown in the menu grid (falls back to text when unset).
  * - descs: optional description.
+ * - types: "file" | "dir" | "exec" | "link" | "" (for LS_COLORS).
  */
-export function normalizeEntries(entries: CompletionEntry[]): { texts: string[]; displays: string[]; descs: string[] } {
+export function normalizeEntries(entries: CompletionEntry[]): { texts: string[]; displays: string[]; descs: string[]; types: string[] } {
     const texts: string[] = [];
     const displays: string[] = [];
     const descs: string[] = [];
+    const types: string[] = [];
     for (const e of entries) {
         if (typeof e === "string") {
             texts.push(e);
             displays.push(e);
             descs.push("");
+            types.push("");
         } else {
             texts.push(e.text);
             displays.push(e.display ?? e.text);
             descs.push(e.desc ?? "");
+            types.push(e.type ?? "");
         }
     }
-    return { texts, displays, descs };
+    return { texts, displays, descs, types };
 }
 
 /** Extract the text value from a CompletionEntry. */
@@ -149,8 +160,21 @@ function completeFile(prefix: string): CompletionEntry[] {
 
     const results: CompletionEntry[] = matched.map(e => {
         const full = dir === "." ? e : join(dir, e);
+        let type: CompletionEntryType = "file";
         let isDir = false;
-        try { isDir = statSync(full).isDirectory(); } catch { /* ignore */ }
+        try {
+            // lstat first so symlinks are detected as-is; then follow for
+            // directory detection so symlinked dirs still get the `/`.
+            const lst = lstatSync(full);
+            if (lst.isSymbolicLink()) {
+                type = "link";
+                try { if (statSync(full).isDirectory()) { type = "dir"; isDir = true; } } catch { /* dangling */ }
+            } else if (lst.isDirectory()) {
+                type = "dir"; isDir = true;
+            } else if (lst.isFile() && (lst.mode & 0o111) !== 0) {
+                type = "exec";
+            }
+        } catch { /* ignore */ }
         const text = expanded.endsWith("/")
             ? prefix + e
             : hasSlash
@@ -158,11 +182,7 @@ function completeFile(prefix: string): CompletionEntry[] {
             : e;
         const finalText = isDir ? text + "/" : text;
         const finalDisplay = isDir ? e + "/" : e;
-        // Only emit a display override if it differs from the text (i.e. the
-        // entry has a directory prefix). Avoids churn for simple cases.
-        return finalText === finalDisplay
-            ? finalText
-            : { text: finalText, display: finalDisplay };
+        return { text: finalText, display: finalDisplay, type };
     });
     results.sort((a, b) => {
         const at = typeof a === "string" ? a : a.text;
@@ -178,17 +198,23 @@ function completeFileOrGlob(prefix: string): CompletionEntry[] {
     if (!/[*?[]/.test(prefix)) return completeFile(prefix);
     const expanded = expandTilde(prefix);
     try {
-        const raw = [...globSync(expanded)].map(m => {
-            try { return statSync(m).isDirectory() ? m + "/" : m; }
-            catch { return m; }
-        });
+        const raw = [...globSync(expanded)];
         raw.sort();
-        // Glob matches are full-path; strip shared leading directory for the
-        // menu display (same rationale as completeFile).
         return raw.map(m => {
+            let type: CompletionEntryType = "file";
+            let isDir = false;
+            try {
+                const lst = lstatSync(m);
+                if (lst.isSymbolicLink()) {
+                    type = "link";
+                    try { if (statSync(m).isDirectory()) { type = "dir"; isDir = true; } } catch { /* dangling */ }
+                } else if (lst.isDirectory()) { type = "dir"; isDir = true; }
+                else if (lst.isFile() && (lst.mode & 0o111) !== 0) type = "exec";
+            } catch { /* ignore */ }
+            const text = isDir ? m + "/" : m;
             const b = basename(m.replace(/\/$/, ""));
-            const display = m.endsWith("/") ? b + "/" : b;
-            return m === display ? m : { text: m, display };
+            const display = isDir ? b + "/" : b;
+            return { text, display, type };
         });
     } catch {
         return completeFile(prefix);
