@@ -43,8 +43,10 @@ std::string g_path;
 //  - Multi-line entry  → each internal "\n" becomes "\\\n" (backslash-newline
 //    = continuation marker), followed by a final "\n".
 //  - Empty entry       → single blank line, so reload preserves shape.
-// Kept identical to the encoding historySave() used previously so in-flight
-// upgrades of the shell don't produce files the loader can't read.
+//  - If the final segment ends with '\' (optionally followed by spaces),
+//    append an extra space before the terminating "\n". Without this, a line
+//    ending "foo\" is ambiguous with the continuation marker "\\\n". zsh
+//    uses the same disambiguator; see savehistfile() in zsh's Src/hist.c.
 std::string encode(const std::string &entry) {
     std::string out;
     out.reserve(entry.size() + 8);
@@ -54,13 +56,21 @@ std::string encode(const std::string &entry) {
         size_t nl = entry.find('\n', i);
         if (nl == std::string::npos) {
             out.append(entry, i, std::string::npos);
-            out.push_back('\n');
             break;
         }
         out.append(entry, i, nl - i);
         out.append("\\\n");
         i = nl + 1;
     }
+    // Walk back through any trailing spaces on the final segment; if the
+    // run is preceded by a literal backslash, add one more space so the
+    // loader can distinguish "entry ends in \" from "\<newline> continuation".
+    size_t k = out.size();
+    while (k > 0 && out[k-1] == ' ') k--;
+    if (k > 0 && out[k-1] == '\\') {
+        out.push_back(' ');
+    }
+    out.push_back('\n');
     return out;
 }
 
@@ -171,6 +181,17 @@ LoadStatus load(const std::string &path,
             entry += buf;
             cont = true;
         } else {
+            // Reverse the encoder's trailing-space disambiguator: if the
+            // line's tail is '\' followed by 1+ spaces, strip one space to
+            // recover the literal trailing-backslash entry.
+            if (n >= 2 && buf[n-1] == ' ') {
+                size_t k = n - 1;
+                while (k > 0 && buf[k-1] == ' ') k--;
+                if (k > 0 && buf[k-1] == '\\') {
+                    n--;
+                    buf[n] = '\0';
+                }
+            }
             if (cont) {
                 entry += '\n';
                 entry += buf;
