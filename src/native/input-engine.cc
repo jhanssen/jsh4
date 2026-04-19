@@ -252,7 +252,9 @@ static int historyAddInMemory(const char *line) {
 
 int historyAdd(const char *line) {
     int added = historyAddInMemory(line);
-    if (added && !history_loading) {
+    // Skip persisting empty entries — historyAdd("") is the scratch slot for
+    // the current edit session, not a real command.
+    if (added && !history_loading && line && *line) {
         jsh::hist_writer::enqueue(std::string(line));
     }
     return added;
