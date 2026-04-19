@@ -293,3 +293,68 @@ export function greet(args, stdin) { return "js"; }
         assert.strictEqual(stdout, "sh");
     });
 });
+
+// ---- Pipeline concurrency / deadlock regression tests ---------------------
+//
+// Pre-fix: builtin-stage output to a JS-stage downstream used writeSync(1)
+// while fd 1 was dup2'd to the inter-stage pipe. The JS stage hadn't started
+// yet (stages ran sequentially), so once the builtin's output exceeded the
+// pipe buffer (~64 KB on macOS) writeSync would block forever — hard hang.
+// Post-fix: builtins write asynchronously through an IO context, all stages
+// run concurrently, the event loop drains downstream readers as they go.
+
+const COUNT_LINES_RC = `
+export async function* count_lines(args, stdin) {
+    let n = 0;
+    for await (const _ of stdin) n++;
+    yield String(n) + "\\n";
+}
+export async function* upper(args, stdin) {
+    for await (const line of stdin) yield line.toUpperCase() + "\\n";
+}
+`;
+
+describe("pipeline concurrency", () => {
+    it("should not deadlock when a builtin emits >64KB into a JS stage", () => {
+        // 50_000 lines × ~6 bytes = ~300 KB, well past macOS 64 KB pipe buffer.
+        const { stdout } = withRc(COUNT_LINES_RC, "printf '%s\\n' {1..50000} | count_lines");
+        assert.strictEqual(stdout, "50000");
+    });
+
+    it("should stream large declare -p output through a JS stage", () => {
+        // Define ~1000 vars, then dump them through a JS counter.
+        const { stdout } = withRc(
+            COUNT_LINES_RC,
+            "for i in {1..1000}; do declare V$i=$i; done; declare -p | count_lines",
+        );
+        // ≥1000 lines (env vars push the count higher; just assert the
+        // builtin actually streamed everything through).
+        assert.ok(parseInt(stdout, 10) >= 1000, `expected >=1000 lines, got ${stdout}`);
+    });
+
+    it("should support a brace group as a pipeline stage feeding a JS stage", () => {
+        const { stdout } = withRc(COUNT_LINES_RC, "{ echo a; echo b; echo c; } | count_lines");
+        assert.strictEqual(stdout, "3");
+    });
+
+    it("should support a subshell as a pipeline stage feeding a JS stage", () => {
+        const { stdout } = withRc(COUNT_LINES_RC, "( echo x; echo y; ) | upper");
+        assert.strictEqual(stdout, "X\nY");
+    });
+
+    it("should support a for-loop as a pipeline stage feeding a JS stage", () => {
+        const { stdout } = withRc(COUNT_LINES_RC, "for i in 1 2 3 4 5; do echo $i; done | count_lines");
+        assert.strictEqual(stdout, "5");
+    });
+
+    it("should drain correctly when a JS stage feeds a downstream builtin", () => {
+        // JS stage produces 5 lines, head -3 takes 3.
+        const rc = `
+export async function* gen(args, stdin) {
+    for (let i = 1; i <= 5; i++) yield i + "\\n";
+}
+`;
+        const { stdout } = withRc(rc, "gen | head -3");
+        assert.strictEqual(stdout, "1\n2\n3");
+    });
+});

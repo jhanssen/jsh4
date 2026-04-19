@@ -386,6 +386,12 @@ struct PipelineReq {
     std::vector<std::string> pipeOps;
     bool captureOutput = false;
     bool background    = false;
+    // -1 = inherit from parent. When set, applies as the default fd for
+    // stage 0 stdin / stage n-1 stdout (capture mode ignores stdoutFd) /
+    // every stage's stderr — only when no explicit redirection overrides.
+    int  stdinFd  = -1;
+    int  stdoutFd = -1;
+    int  stderrFd = -1;
 };
 
 // Spawn all stages and register their pids. Returns false on unrecoverable
@@ -454,6 +460,9 @@ static bool spawnPipelineInline(PipelineReq& req, SpawnCtx* ctx) {
             if (i > 0) {
                 posix_spawn_file_actions_adddup2(&actions, pipes[i - 1][0], STDIN_FILENO);
                 stdinSet = true;
+            } else if (req.stdinFd >= 0 && req.stdinFd != STDIN_FILENO) {
+                posix_spawn_file_actions_adddup2(&actions, req.stdinFd, STDIN_FILENO);
+                stdinSet = true;
             }
             if (i < n - 1) {
                 posix_spawn_file_actions_adddup2(&actions, pipes[i][1], STDOUT_FILENO);
@@ -465,6 +474,13 @@ static bool spawnPipelineInline(PipelineReq& req, SpawnCtx* ctx) {
             } else if (capturePipe[1] != -1) {
                 posix_spawn_file_actions_adddup2(&actions, capturePipe[1], STDOUT_FILENO);
                 stdoutSet = true;
+            } else if (req.stdoutFd >= 0 && req.stdoutFd != STDOUT_FILENO) {
+                posix_spawn_file_actions_adddup2(&actions, req.stdoutFd, STDOUT_FILENO);
+                stdoutSet = true;
+            }
+            if (!stderrSet && req.stderrFd >= 0 && req.stderrFd != STDERR_FILENO) {
+                posix_spawn_file_actions_adddup2(&actions, req.stderrFd, STDERR_FILENO);
+                stderrSet = true;
             }
 
             for (int j = 0; j < n - 1; j++) {
@@ -572,6 +588,7 @@ static bool spawnPipelineInline(PipelineReq& req, SpawnCtx* ctx) {
                 sigaction(SIGPIPE, &sa, nullptr);
 
                 if (i > 0) dup2(pipes[i - 1][0], STDIN_FILENO);
+                else if (req.stdinFd >= 0 && req.stdinFd != STDIN_FILENO) dup2(req.stdinFd, STDIN_FILENO);
                 if (i < n - 1) {
                     dup2(pipes[i][1], STDOUT_FILENO);
                     if (i < static_cast<int>(pipeOps.size()) && pipeOps[i] == "|&") {
@@ -579,6 +596,14 @@ static bool spawnPipelineInline(PipelineReq& req, SpawnCtx* ctx) {
                     }
                 } else if (capturePipe[1] != -1) {
                     dup2(capturePipe[1], STDOUT_FILENO);
+                } else if (req.stdoutFd >= 0 && req.stdoutFd != STDOUT_FILENO) {
+                    dup2(req.stdoutFd, STDOUT_FILENO);
+                }
+                if (req.stderrFd >= 0 && req.stderrFd != STDERR_FILENO) {
+                    bool mergeFromPipe = (i < n - 1)
+                        && (i < static_cast<int>(pipeOps.size()))
+                        && (pipeOps[i] == "|&");
+                    if (!mergeFromPipe) dup2(req.stderrFd, STDERR_FILENO);
                 }
 
                 for (int j = 0; j < n - 1; j++) {
@@ -753,13 +778,16 @@ static SpawnCtx* makeCtx(Napi::Env env, bool capture) {
 static Napi::Value SpawnPipeline(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[0].IsArray() || !info[1].IsArray()) {
-        Napi::TypeError::New(env, "spawnPipeline(stages, pipeOps)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "spawnPipeline(stages, pipeOps, [bg], [stdinFd], [stdoutFd], [stderrFd])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     PipelineReq req;
     parseStages(env, info[0].As<Napi::Array>(), info[1].As<Napi::Array>(), req.stages, req.pipeOps);
     req.background = info.Length() > 2 && info[2].IsBoolean() && info[2].As<Napi::Boolean>().Value();
     req.captureOutput = false;
+    if (info.Length() > 3 && info[3].IsNumber()) req.stdinFd  = info[3].As<Napi::Number>().Int32Value();
+    if (info.Length() > 4 && info[4].IsNumber()) req.stdoutFd = info[4].As<Napi::Number>().Int32Value();
+    if (info.Length() > 5 && info[5].IsNumber()) req.stderrFd = info[5].As<Napi::Number>().Int32Value();
 
     auto* ctx = makeCtx(env, false);
     auto promise = ctx->deferred.Promise();
@@ -770,12 +798,15 @@ static Napi::Value SpawnPipeline(const Napi::CallbackInfo& info) {
 static Napi::Value CaptureOutput(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[0].IsArray() || !info[1].IsArray()) {
-        Napi::TypeError::New(env, "captureOutput(stages, pipeOps)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "captureOutput(stages, pipeOps, [stdinFd], [stderrFd])").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     PipelineReq req;
     parseStages(env, info[0].As<Napi::Array>(), info[1].As<Napi::Array>(), req.stages, req.pipeOps);
     req.captureOutput = true;
+    // capture mode owns stdout — only stdin / stderr are user-overridable.
+    if (info.Length() > 2 && info[2].IsNumber()) req.stdinFd  = info[2].As<Napi::Number>().Int32Value();
+    if (info.Length() > 3 && info[3].IsNumber()) req.stderrFd = info[3].As<Napi::Number>().Int32Value();
 
     auto* ctx = makeCtx(env, true);
     auto promise = ctx->deferred.Promise();

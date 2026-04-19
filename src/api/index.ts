@@ -35,3 +35,7 @@ export function unalias(name: string): void {
 export function getAlias(name: string): string | undefined {
     return aliasMap.get(name);
 }
+
+export function getAllAliases(): Iterable<[string, string]> {
+    return aliasMap.entries();
+}

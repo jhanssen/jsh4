@@ -1,9 +1,10 @@
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
-import { createReadStream, createWriteStream, read as fsRead, readFileSync, readSync, writeSync, accessSync, openSync, closeSync, constants as fsConstants } from "node:fs";
+import { createReadStream, createWriteStream, read as fsRead, write as fsWrite, readFileSync, readSync, writeSync, accessSync, openSync, closeSync, constants as fsConstants } from "node:fs";
 import { resolve } from "node:path";
 import { constants as osConstants } from "node:os";
 import { promisify } from "node:util";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 const fsReadAsync = promisify(fsRead);
 import type {
@@ -31,13 +32,77 @@ import { setTrap, getAllTraps, runTrap } from "../trap/index.js";
 
 const require = createRequire(import.meta.url);
 
-// Builtins run in-process in pipeline stages with dup2'd fd 1/2. Node's
-// process.stdout/stderr streams buffer async writes that may flush to the
-// wrong fd after the stage restores stdio. Use writeSync so output lands on
-// the current fd before the caller dup2's it back. EPIPE is surfaced as a
-// thrown Error with code "EPIPE", which the pipeline machinery already catches.
-function writeStdout(s: string): void { writeSync(1, s); }
-function writeStderr(s: string): void { writeSync(2, s); }
+// IO context — carries per-pipeline-stage stdin/stdout/stderr fds through
+// AsyncLocalStorage so concurrent pipeline stages don't have to fight over
+// process.fd 1/2 via dup2. Builtins, compounds, and JS stages all read
+// their fds from this context. Defaults to the process fds (0/1/2) when
+// no context is active (interactive prompt, top-level script).
+interface IoContext {
+    stdinFd: number;
+    stdoutFd: number;
+    stderrFd: number;
+}
+
+const ioStorage = new AsyncLocalStorage<IoContext>();
+
+export function getStdinFd(): number  { return ioStorage.getStore()?.stdinFd  ?? 0; }
+export function getStdoutFd(): number { return ioStorage.getStore()?.stdoutFd ?? 1; }
+export function getStderrFd(): number { return ioStorage.getStore()?.stderrFd ?? 2; }
+
+export function withIoContext<T>(ctx: IoContext, fn: () => Promise<T>): Promise<T> {
+    return ioStorage.run(ctx, fn);
+}
+
+// Promise-wrapped fs.write with partial-write loop. EPIPE / EBADF /
+// stream-destroyed errors propagate as Error objects whose .code matches
+// the existing catch shapes throughout the executor (no rewrap).
+async function writeAll(fd: number, data: Buffer | string): Promise<void> {
+    const buf = typeof data === "string" ? Buffer.from(data) : data;
+    let off = 0;
+    while (off < buf.length) {
+        const bytesWritten = await new Promise<number>((res, rej) => {
+            fsWrite(fd, buf, off, buf.length - off, null, (err, n) => {
+                if (err) rej(err); else res(n);
+            });
+        });
+        if (bytesWritten === 0) break;
+        off += bytesWritten;
+    }
+}
+
+// Builtin output. Always async; routes through the IO context so pipeline
+// stages can run concurrently without dup2 contention on process.fd 1/2.
+async function writeStdout(s: string): Promise<void> { await writeAll(getStdoutFd(), s); }
+async function writeStderr(s: string): Promise<void> { await writeAll(getStderrFd(), s); }
+
+// Buffered writer — amortizes per-write Promise allocation for builtins
+// that emit many short lines (declare -p, jobs, hash list, set -o list,
+// trap -p list, etc.). Flushes on threshold and on explicit flush().
+class BufferedWriter {
+    private chunks: Buffer[] = [];
+    private len = 0;
+    constructor(private fd: number, private threshold: number = 16384) {}
+    async write(data: string | Buffer): Promise<void> {
+        const b = typeof data === "string" ? Buffer.from(data) : data;
+        this.chunks.push(b);
+        this.len += b.length;
+        if (this.len >= this.threshold) await this.flush();
+    }
+    async flush(): Promise<void> {
+        if (this.len === 0) return;
+        const combined = this.chunks.length === 1
+            ? this.chunks[0]!
+            : Buffer.concat(this.chunks, this.len);
+        this.chunks = [];
+        this.len = 0;
+        await writeAll(this.fd, combined);
+    }
+}
+
+async function withBufferedStdout<T>(fn: (bw: BufferedWriter) => Promise<T>): Promise<T> {
+    const bw = new BufferedWriter(getStdoutFd());
+    try { return await fn(bw); } finally { await bw.flush(); }
+}
 
 interface PipelineResult {
     exitCode: number;
@@ -52,11 +117,16 @@ const native = require("../../build/Release/jsh_native.node") as {
     spawnPipeline: (
         stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
         pipeOps: string[],
-        background?: boolean
+        background?: boolean,
+        stdinFd?: number,
+        stdoutFd?: number,
+        stderrFd?: number
     ) => Promise<PipelineResult>;
     captureOutput: (
         stages: Array<{ cmd: string; args: string[]; redirs: Array<{ op: string; fd: number; target: string }> }>,
-        pipeOps: string[]
+        pipeOps: string[],
+        stdinFd?: number,
+        stderrFd?: number
     ) => Promise<{ exitCode: number; output: string }>;
     createCloexecPipe: () => [number, number];
     clearCloexec: (fd: number) => void;
@@ -213,7 +283,7 @@ async function executeNode(node: ASTNode): Promise<ExecResult> {
         case "ConditionalExpr": return executeConditionalExpr(node as ConditionalExpr);
         case "JsFunction":     return executeJsStage(node as JsFunction, 0, 1);
         default:
-            writeStderr(`jsh: unimplemented: ${node.type}\n`);
+            await writeStderr(`jsh: unimplemented: ${node.type}\n`);
             return { exitCode: 1 };
     }
 }
@@ -260,7 +330,7 @@ async function withRedirections(redirs: Redirection[], body: () => Promise<ExecR
                     if (r.op === ">" && shellOpts.noclobber) {
                         try {
                             accessSync(target, fsConstants.F_OK);
-                            writeStderr(`jsh: ${target}: cannot overwrite existing file\n`);
+                            await writeStderr(`jsh: ${target}: cannot overwrite existing file\n`);
                             return { exitCode: 1 };
                         } catch {
                             // File doesn't exist — proceed.
@@ -398,11 +468,11 @@ async function captureAst(node: ASTNode): Promise<string> {
         const stages: Stage[] = [];
         for (const stageNode of pipe.commands) {
             if (stageNode.type !== "SimpleCommand") {
-                writeStderr("jsh: $(): complex pipeline stage not supported\n");
+                await writeStderr("jsh: $(): complex pipeline stage not supported\n");
                 return "";
             }
             const stage = await buildStage(stageNode as SimpleCommand);
-            if (!stage) { writeStderr("jsh: $(): empty stage\n"); return ""; }
+            if (!stage) { await writeStderr("jsh: $(): empty stage\n"); return ""; }
             stages.push(stage);
         }
         const result = await native.captureOutput(stages, pipe.pipeOps);
@@ -448,7 +518,7 @@ async function captureAst(node: ASTNode): Promise<string> {
 async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     for (const a of cmd.assignments) {
         if (isReadonly(a.name)) {
-            writeStderr(`jsh: ${a.name}: readonly variable\n`);
+            await writeStderr(`jsh: ${a.name}: readonly variable\n`);
             return { exitCode: 1 };
         }
         if (a.array) {
@@ -500,26 +570,10 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
     // xtrace: print command before execution
     if (shellOpts.xtrace) {
         const trace = [command, ...args].join(" ");
-        writeStderr(`+ ${trace}\n`);
+        await writeStderr(`+ ${trace}\n`);
     }
 
-    // time keyword: measure execution time
-    if (command === "time") {
-        const remaining = args.join(" ");
-        if (!remaining.trim()) return { exitCode: 0 };
-        const startTime = process.hrtime.bigint();
-        const ast = parse(remaining);
-        const result = ast ? await executeNode(ast) : { exitCode: 0 };
-        const elapsed = Number(process.hrtime.bigint() - startTime) / 1e9;
-        const mins = Math.floor(elapsed / 60);
-        const secs = elapsed - mins * 60;
-        writeStderr(`\nreal\t${mins}m${secs.toFixed(3)}s\n`);
-        writeStderr(`user\t0m0.000s\n`);
-        writeStderr(`sys\t0m0.000s\n`);
-        return result;
-    }
-
-    // Shell functions take priority.
+    // Shell functions take priority over builtins.
     const func = shellFunctions.get(command);
     if (func) {
         pushParams(args);
@@ -554,176 +608,42 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         return r;
     }
 
-    // read builtin
-    if (command === "read") {
-        const r = runRead(args, redirs);
-        $["PIPESTATUS"] = [r.exitCode];
-        return r;
-    }
-
-    // source / . — read file, parse, execute in current context
-    if (command === "source" || command === ".") {
-        if (args.length === 0) {
-            writeStderr(`${command}: filename argument required\n`);
-            $["PIPESTATUS"] = [2];
-            return { exitCode: 2 };
-        }
-        const r = await runSource(args[0]!, args.slice(1));
-        $["PIPESTATUS"] = [r.exitCode];
-        return r;
-    }
-
-    // break/continue — loop flow control
-    if (command === "break") {
-        const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
-        throw new ShellBreak(isNaN(n) || n < 1 ? 1 : n);
-    }
-    if (command === "continue") {
-        const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
-        throw new ShellContinue(isNaN(n) || n < 1 ? 1 : n);
-    }
-
-    // return — exit from shell function with code
-    if (command === "return") {
-        const code = args[0] !== undefined ? parseInt(args[0], 10) : Number($["?"] ?? 0);
-        throw new ShellReturn(isNaN(code) ? 0 : code);
-    }
-
-    // command — bypass functions/aliases, or check existence with -v
-    if (command === "command") {
-        if (args[0] === "-v" || args[0] === "-V") {
-            if (args.length < 2) return { exitCode: 1 };
-            const name = args[1]!;
-            if (isBuiltinName(name) || shellFunctions.has(name)
-                || getAlias(name) !== undefined
-                || lookupBareJsFunction(name) !== undefined) {
-                writeStdout(name + "\n");
-                return { exitCode: 0 };
-            }
-            // Check PATH
-            const resolved = findInPath(name);
-            if (resolved) { writeStdout(resolved + "\n"); return { exitCode: 0 }; }
-            return { exitCode: 1 };
-        }
-        // command NAME ARGS — run NAME bypassing functions and aliases
-        if (args.length > 0) {
-            const subCmd = args[0]!;
-            const subArgs = args.slice(1);
-            // Try builtins first
-            const builtin = runBuiltin(subCmd, subArgs);
-            if (builtin !== null) return builtin;
-            // External command
-            const result = await native.spawnPipeline([{ cmd: subCmd, args: subArgs, redirs }], []);
-            return { exitCode: result.exitCode };
-        }
-        return { exitCode: 0 };
-    }
-
-    // exit — run EXIT trap before exiting
-    if (command === "exit") {
-        const code = args[0] !== undefined ? parseInt(args[0], 10) : Number($["?"] ?? 0);
-        await runTrap("EXIT", executeString);
-        process.exit(isNaN(code) ? 0 : code);
-    }
-
-    // trap — register signal handlers
-    if (command === "trap") {
-        return runTrapBuiltin(args);
-    }
-
-    // eval — parse and execute string in current context
-    if (command === "eval") {
-        if (args.length === 0) return { exitCode: 0 };
-        const code = args.join(" ");
-        try {
-            const ast = parse(code);
-            if (!ast) return { exitCode: 0 };
-            const r = await executeNode(ast);
-            $["PIPESTATUS"] = [r.exitCode];
-            return r;
-        } catch (e: unknown) {
-            writeStderr(`eval: ${e instanceof Error ? e.message : e}\n`);
-            return { exitCode: 1 };
-        }
-    }
-
-    // exec with redirections only — apply permanently (no restore).
+    // `exec` with no command + redirections is permanent — bypass
+    // withRedirections (which would restore fds on return).
     if (command === "exec" && args.length === 0 && redirs.length > 0) {
-        for (const r of redirs) {
-            if (r.isHereDoc) continue;
-            switch (r.op) {
-                case ">": case ">>": {
-                    const flags = r.op === ">"
-                        ? fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC
-                        : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
-                    const fileFd = openSync(r.target, flags, 0o666);
-                    native.dup2Fd(fileFd, r.fd >= 0 ? r.fd : 1);
-                    native.closeFd(fileFd);
-                    break;
-                }
-                case "<": {
-                    const fileFd = openSync(r.target, fsConstants.O_RDONLY);
-                    native.dup2Fd(fileFd, r.fd >= 0 ? r.fd : 0);
-                    native.closeFd(fileFd);
-                    break;
-                }
-                case ">&": {
-                    const dstFd = parseInt(r.target, 10);
-                    native.dup2Fd(dstFd, r.fd >= 0 ? r.fd : 1);
-                    break;
-                }
-                case "<&": {
-                    const dstFd = parseInt(r.target, 10);
-                    native.dup2Fd(dstFd, r.fd >= 0 ? r.fd : 0);
-                    break;
-                }
-                case "&>": case "&>>": {
-                    const flags = r.op === "&>"
-                        ? fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC
-                        : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
-                    const fileFd = openSync(r.target, flags, 0o666);
-                    native.dup2Fd(fileFd, 1);
-                    native.dup2Fd(fileFd, 2);
-                    native.closeFd(fileFd);
-                    break;
-                }
-            }
-        }
+        await applyExecRedirs(redirs);
+        $["PIPESTATUS"] = [0];
         return { exitCode: 0 };
     }
 
-    // Job control builtins (async).
-    if (command === "fg") return runFg(args);
-    if (command === "bg") return runBg(args);
-    if (command === "jobs") return runJobs();
-    if (command === "wait") return runWait(args);
-
-    // Run builtins in-process. If redirections present, apply fd-level redirection.
-    const builtinFn = () => runBuiltin(command, args);
-    if (redirs.length === 0) {
-        const builtin = builtinFn();
-        if (builtin !== null) {
-            $["PIPESTATUS"] = [builtin.exitCode];
-            return builtin;
+    // Run builtins in-process. If redirections present, apply fd-level
+    // redirection around the call. Builtins receive the raw redirs in ctx
+    // because some (read) inspect them directly for here-strings and
+    // here-doc bodies that withRedirections doesn't materialize as fds.
+    const builtin = builtins[command];
+    if (builtin) {
+        const ctx: BuiltinCtx = { redirs };
+        let r: ExecResult;
+        if (redirs.length === 0) {
+            r = await builtin.run(args, ctx);
+        } else {
+            r = await withRedirections(cmd.redirections, () => builtin.run(args, ctx));
         }
-    } else {
-        // Test if it's a builtin by checking the name (don't execute yet).
-        if (isBuiltinName(command)) {
-            const r = await withRedirections(cmd.redirections, async () => {
-                const result = builtinFn();
-                return result ?? { exitCode: 0 };
-            });
-            $["PIPESTATUS"] = [r.exitCode];
-            return r;
-        }
+        $["PIPESTATUS"] = [r.exitCode];
+        return r;
     }
 
-    const result = await native.spawnPipeline([{ cmd: command, args, redirs }], []);
+    // External command — pass IO context fds so builtin-spawned externals
+    // (via `command`, `eval`, etc.) and pipeline contexts land in the right pipes.
+    const result = await native.spawnPipeline(
+        [{ cmd: command, args, redirs }], [],
+        false, getStdinFd(), getStdoutFd(), getStderrFd()
+    );
     if (result.stopped) {
         const pids = result.pids ?? [];
         const cmdText = [command, ...args].join(" ");
         const job = addJob(result.pgid, pids, cmdText, "stopped");
-        writeStderr(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
+        await writeStderr(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
         return { exitCode: 128 + result.stoppedSignal };
     }
     $["PIPESTATUS"] = result.pipeStatus;
@@ -745,7 +665,7 @@ async function expandAliasesInPipeline(commands: ASTNode[]): Promise<ASTNode[] |
         const restWords = (await Promise.all(sc.words.slice(1).map(expandWord))).flat();
         const expanded = [expansion, ...restWords].join(" ").trim();
         const ast = parse(expanded);
-        if (!ast) { writeStderr(`jsh: bad alias expansion: ${expanded}\n`); return null; }
+        if (!ast) { await writeStderr(`jsh: bad alias expansion: ${expanded}\n`); return null; }
         // Inline the expanded command (may itself be a pipeline segment).
         result.push(ast);
     }
@@ -802,21 +722,24 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
     const stages: Stage[] = [];
     for (const stageNode of resolvedCommands) {
         if (stageNode.type !== "SimpleCommand") {
-            writeStderr(`jsh: unsupported pipeline stage: ${stageNode.type}\n`);
+            await writeStderr(`jsh: unsupported pipeline stage: ${stageNode.type}\n`);
             return { exitCode: 1 };
         }
         const stage = await buildStage(stageNode as SimpleCommand);
-        if (!stage) { writeStderr("jsh: empty pipeline stage\n"); return { exitCode: 1 }; }
+        if (!stage) { await writeStderr("jsh: empty pipeline stage\n"); return { exitCode: 1 }; }
         stages.push(stage);
     }
-    const result = await native.spawnPipeline(stages, node.pipeOps);
+    const result = await native.spawnPipeline(
+        stages, node.pipeOps,
+        false, getStdinFd(), getStdoutFd(), getStderrFd()
+    );
 
     // Handle stopped (Ctrl-Z).
     if (result.stopped) {
         const pids = result.pids ?? [];
         const cmdText = stages.map(s => [s.cmd, ...s.args].join(" ")).join(" | ");
         const job = addJob(result.pgid, pids, cmdText, "stopped");
-        writeStderr(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
+        await writeStderr(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
         return { exitCode: 128 + result.stoppedSignal };
     }
 
@@ -844,8 +767,14 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         pipes.push(native.createCloexecPipe());
     }
 
-    const stdinFd  = (i: number) => i === 0     ? 0 : pipes[i - 1]![0];
-    const stdoutFd = (i: number) => i === n - 1 ? 1 : pipes[i]![1];
+    // First/last stage inherit IO context (or process fds 0/1/2 by default)
+    // so a pipeline nested inside another pipeline's @-function or builtin
+    // stage gets the right fds.
+    const ctxStdin  = getStdinFd();
+    const ctxStdout = getStdoutFd();
+    const ctxStderr = getStderrFd();
+    const stdinFd  = (i: number) => i === 0     ? ctxStdin  : pipes[i - 1]![0];
+    const stdoutFd = (i: number) => i === n - 1 ? ctxStdout : pipes[i]![1];
 
     const pids: number[] = [];
     // Map from pids index to pipeline stage index.
@@ -871,156 +800,112 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
         }
     }
 
-    // JS stages + compound stages in the same pipeline deadlock: the JS
-    // loop awaits sequentially, so a JS stage blocked on a pipe that a
-    // later-scheduled compound is supposed to write to hangs forever.
-    // Applies to both @-prefixed JsFunction nodes and bare-name JS calls.
-    // Compound-only and compound+external pipelines still work via the
-    // sync dup2 path below. Tracking in TODO.md.
-    const hasJsStage       = node.commands.some(c => c.type === "JsFunction") || stageBareJs.size > 0;
-    const hasCompoundStage = node.commands.some(isCompoundCommand);
-    if (hasJsStage && hasCompoundStage) {
-        writeStderr(
-            "jsh: compound commands (subshells, brace groups, control flow) "
-            + "as pipeline stages with @-functions are not supported yet\n"
-        );
-        return 1;
-    }
-
     const isInProcess = (i: number) =>
         node.commands[i]!.type === "JsFunction"
             || stageBuiltins.has(i)
             || stageBareJs.has(i)
             || isCompoundCommand(node.commands[i]!);
 
-    // Fork external stages (skip builtins, bare-JS-funcs, and @-prefixed JS).
+    // Fork external stages (skip builtins, bare-JS-funcs, @-prefixed JS,
+    // and compound stages — those run in-process via withIoContext).
     for (let i = 0; i < n; i++) {
         const stageNode = node.commands[i]!;
         if (stageNode.type !== "SimpleCommand") continue;
         if (stageBuiltins.has(i) || stageBareJs.has(i)) continue;
 
         const stage = await buildStage(stageNode as SimpleCommand);
-        if (!stage) { writeStderr("jsh: empty stage\n"); continue; }
+        if (!stage) { await writeStderr("jsh: empty stage\n"); continue; }
 
         const sin  = stdinFd(i);
         const sout = stdoutFd(i);
 
-        const pid = native.forkExec(stage.cmd, stage.args, sin, sout, -1, pgid);
+        const pid = native.forkExec(stage.cmd, stage.args, sin, sout, ctxStderr === 2 ? -1 : ctxStderr, pgid);
         if (pgid === 0) pgid = pid;
         pids.push(pid);
         pidToStage.push(i);
     }
 
-    // Close pipe ends owned by external stages.
+    // Close pipe ends owned by forked-out external stages. In-process
+    // stages keep their pipe fds open until their stage promise's
+    // finally{} closes them.
     for (let i = 0; i < n - 1; i++) {
         const [r, w] = pipes[i]!;
         if (!isInProcess(i + 1)) native.closeFd(r);
         if (!isInProcess(i)) native.closeFd(w);
     }
 
-    // Builtin stages run first: synchronous, small-output, and close their
-    // downstream pipe end on exit so later JS/compound stages can read cleanly.
-    // If a builtin's output exceeds the pipe buffer (~64KB on macOS), writeSync
-    // will block and deadlock — real buffering for that case would need threads.
-    for (const [i, stage] of stageBuiltins) {
-        const sin  = stdinFd(i);
-        const sout = stdoutFd(i);
-        // Create a writable stream for the pipe fd so builtins write to the pipe.
-        const savedStdout = native.dupFd(1);
-        const savedStdin = sin !== 0 ? native.dupFd(0) : -1;
-        native.clearCloexec(sout);
-        native.dup2Fd(sout, 1);
-        native.closeFd(sout);  // Close original — fd 1 is now the only write end
-        if (sin !== 0) {
-            native.clearCloexec(sin);
-            native.dup2Fd(sin, 0);
-            native.closeFd(sin);  // Close original — fd 0 is now the only read end
-        }
-        try {
-            const result = runBuiltin(stage.cmd, stage.args);
-            stageExitCodes[i] = result?.exitCode ?? 0;
-        } catch (e: unknown) {
-            const code = (e as NodeJS.ErrnoException)?.code;
-            if (code !== "EPIPE" && code !== "ERR_STREAM_DESTROYED") throw e;
-            stageExitCodes[i] = 141;
-        } finally {
-            // Restore stdout/stdin. dup2 implicitly closes the pipe fd copy at fd 1/0.
-            native.dup2Fd(savedStdout, 1);
-            native.closeFd(savedStdout);
-            if (savedStdin !== -1) { native.dup2Fd(savedStdin, 0); native.closeFd(savedStdin); }
-        }
-    }
+    // Run all in-process stages (builtins, JS, compound) concurrently.
+    // Each stage's writes/reads route through its own IoContext via ALS,
+    // so they can interleave through the event loop without dup2-contending
+    // on process fds 0/1/2. Pipe-end fds close in per-stage finally{}'s so
+    // EOF propagates correctly to the next stage.
+    const stagePromises: Promise<void>[] = [];
 
-    // Run JS function stages in-process — concurrently, so an upstream JS
-    // stage's output can stream through downstream JS stages without the
-    // 64KB pipe-buffer deadlock. Pipe fds close per-stage inside .then() so
-    // downstream readers see EOF promptly. Handles both @-prefixed
-    // `JsFunction` nodes and bare-name `SimpleCommand` stages that resolve
-    // to a registered JS function (for the latter, a synthetic JsFunction
-    // is built from the SimpleCommand).
-    const jsPromises: Promise<void>[] = [];
+    const closeStageFds = (sin: number, sout: number) => {
+        if (sout !== ctxStdout) { try { native.closeFd(sout); } catch {} }
+        if (sin  !== ctxStdin)  { try { native.closeFd(sin);  } catch {} }
+    };
+
+    const handleStageError = (e: unknown): number => {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return 141;
+        throw e;
+    };
+
     for (let i = 0; i < n; i++) {
         const stageNode = node.commands[i]!;
-        let jsNode: JsFunction | null = null;
-        if (stageNode.type === "JsFunction") {
-            jsNode = stageNode as JsFunction;
-        } else if (stageBareJs.has(i)) {
-            const { name, sc } = stageBareJs.get(i)!;
-            jsNode = {
-                type: "JsFunction",
-                name,
-                args: sc.words.slice(1),
-                buffered: false,
-                redirections: sc.redirections,
-            };
-        }
-        if (!jsNode) continue;
         const sin  = stdinFd(i);
         const sout = stdoutFd(i);
         const idx  = i;
-        jsPromises.push(
-            executeJsStageRaw(jsNode, sin, sout).then(code => {
-                stageExitCodes[idx] = code;
-                if (sout !== 1) native.closeFd(sout);
-                if (sin  !== 0) native.closeFd(sin);
-            })
-        );
-    }
-    await Promise.all(jsPromises);
+        const ioCtx: IoContext = { stdinFd: sin, stdoutFd: sout, stderrFd: ctxStderr };
 
-    // Run compound command stages in-process with dup2-based fd redirection.
-    // Only reachable when no JS stages exist (see early-return above); the
-    // dup2 approach is safe because nothing else on the main thread contends
-    // for fd 0/1 during executeNode. Real fix tracked in TODO.md.
-    for (let i = 0; i < n; i++) {
-        const stageNode = node.commands[i]!;
-        if (!isCompoundCommand(stageNode)) continue;
-        const sin  = stdinFd(i);
-        const sout = stdoutFd(i);
-        const savedStdout = sout !== 1 ? native.dupFd(1) : -1;
-        const savedStdin = sin !== 0 ? native.dupFd(0) : -1;
-        if (sout !== 1) {
-            native.clearCloexec(sout);
-            native.dup2Fd(sout, 1);
-            native.closeFd(sout);
-        }
-        if (sin !== 0) {
-            native.clearCloexec(sin);
-            native.dup2Fd(sin, 0);
-            native.closeFd(sin);
-        }
-        try {
-            const result = await executeNode(stageNode);
-            stageExitCodes[i] = result.exitCode;
-        } catch (e: unknown) {
-            const code = (e as NodeJS.ErrnoException)?.code;
-            if (code !== "EPIPE" && code !== "ERR_STREAM_DESTROYED") throw e;
-            stageExitCodes[i] = 141;
-        } finally {
-            if (savedStdout !== -1) { native.dup2Fd(savedStdout, 1); native.closeFd(savedStdout); }
-            if (savedStdin !== -1) { native.dup2Fd(savedStdin, 0); native.closeFd(savedStdin); }
+        if (stageBuiltins.has(idx)) {
+            const stage = stageBuiltins.get(idx)!;
+            stagePromises.push((async () => {
+                try {
+                    const result = await withIoContext(ioCtx, () => runBuiltin(stage.cmd, stage.args));
+                    stageExitCodes[idx] = result?.exitCode ?? 0;
+                } catch (e: unknown) {
+                    stageExitCodes[idx] = handleStageError(e);
+                } finally {
+                    closeStageFds(sin, sout);
+                }
+            })());
+        } else if (stageNode.type === "JsFunction" || stageBareJs.has(idx)) {
+            let jsNode: JsFunction;
+            if (stageNode.type === "JsFunction") {
+                jsNode = stageNode as JsFunction;
+            } else {
+                const { name, sc } = stageBareJs.get(idx)!;
+                jsNode = {
+                    type: "JsFunction",
+                    name,
+                    args: sc.words.slice(1),
+                    buffered: false,
+                    redirections: sc.redirections,
+                };
+            }
+            stagePromises.push(
+                executeJsStageRaw(jsNode, sin, sout).then(code => {
+                    stageExitCodes[idx] = code;
+                    closeStageFds(sin, sout);
+                })
+            );
+        } else if (isCompoundCommand(stageNode)) {
+            stagePromises.push((async () => {
+                try {
+                    const result = await withIoContext(ioCtx, () => executeNode(stageNode));
+                    stageExitCodes[idx] = result.exitCode;
+                } catch (e: unknown) {
+                    stageExitCodes[idx] = handleStageError(e);
+                } finally {
+                    closeStageFds(sin, sout);
+                }
+            })());
         }
     }
+
+    await Promise.all(stagePromises);
 
     // Wait for all external processes.
     if (pids.length > 0) {
@@ -1078,13 +963,13 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
                 return 0;
             }
         } catch (e) {
-            writeStderr(`jsh: @{}: ${e instanceof Error ? e.message : e}\n`);
+            await writeStderr(`jsh: @{}: ${e instanceof Error ? e.message : e}\n`);
             return 1;
         }
     } else {
         const found = lookupJsFunction(node.name);
         if (!found) {
-            writeStderr(`jsh: @${node.name}: function not found\n`);
+            await writeStderr(`jsh: @${node.name}: function not found\n`);
             return 1;
         }
         fn = found;
@@ -1152,7 +1037,7 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
             return 141;
         }
         if (e !== null && e !== undefined) {
-            writeStderr(`jsh: @${node.name || "{"}: ${e instanceof Error ? e.message : e}\n`);
+            await writeStderr(`jsh: @${node.name || "{"}: ${e instanceof Error ? e.message : e}\n`);
         }
         return 1;
     } finally {
@@ -1244,7 +1129,7 @@ async function executeBackground(node: ASTNode): Promise<ExecResult> {
     }
 
     if (!stages || stages.length === 0) {
-        writeStderr("jsh: background not supported for this command type\n");
+        await writeStderr("jsh: background not supported for this command type\n");
         return executeNode(node);
     }
 
@@ -1254,7 +1139,7 @@ async function executeBackground(node: ASTNode): Promise<ExecResult> {
     const job = addJob(result.pgid, pids, cmdText, "running");
     const lastPid = pids.length > 0 ? pids[pids.length - 1]! : result.pgid;
     $["!"] = lastPid;
-    writeStderr(`[${job.id}] ${lastPid}\n`);
+    await writeStderr(`[${job.id}] ${lastPid}\n`);
     return { exitCode: 0 };
 }
 
@@ -1264,10 +1149,10 @@ async function runFg(args: string[]): Promise<ExecResult> {
     const spec = args[0] ?? "%%";
     const job = getJobBySpec(spec) ?? getCurrentJob();
     if (!job) {
-        writeStderr("jsh: fg: no current job\n");
+        await writeStderr("jsh: fg: no current job\n");
         return { exitCode: 1 };
     }
-    writeStderr(`${job.command}\n`);
+    await writeStderr(`${job.command}\n`);
     markJobRunning(job.id);
     native.tcsetpgrpFg(job.pgid);
     native.sendSignal(-job.pgid, native.SIGCONT);
@@ -1275,7 +1160,7 @@ async function runFg(args: string[]): Promise<ExecResult> {
     native.tcsetpgrpShell();
     if (result.stopped) {
         markJobStopped(job.id, result.stoppedSignal);
-        writeStderr(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
+        await writeStderr(`\n[${job.id}]+  Stopped\t\t${job.command}\n`);
         return { exitCode: 128 + result.stoppedSignal };
     }
     removeJob(job.id);
@@ -1287,22 +1172,24 @@ async function runBg(args: string[]): Promise<ExecResult> {
     const spec = args[0] ?? "%%";
     const job = getJobBySpec(spec) ?? getCurrentJob();
     if (!job || job.status !== "stopped") {
-        writeStderr("jsh: bg: no stopped job\n");
+        await writeStderr("jsh: bg: no stopped job\n");
         return { exitCode: 1 };
     }
     markJobRunning(job.id);
     native.sendSignal(-job.pgid, native.SIGCONT);
-    writeStderr(`[${job.id}]+ ${job.command} &\n`);
+    await writeStderr(`[${job.id}]+ ${job.command} &\n`);
     return { exitCode: 0 };
 }
 
-function runJobs(): ExecResult {
+async function runJobs(): Promise<ExecResult> {
     const currentJob = getCurrentJob();
-    for (const job of getAllJobs()) {
-        const marker = job === currentJob ? "+" : " ";
-        const status = job.status === "running" ? "Running" : "Stopped";
-        writeStdout(`[${job.id}]${marker}  ${status}\t\t${job.command}\n`);
-    }
+    await withBufferedStdout(async (bw) => {
+        for (const job of getAllJobs()) {
+            const marker = job === currentJob ? "+" : " ";
+            const status = job.status === "running" ? "Running" : "Stopped";
+            await bw.write(`[${job.id}]${marker}  ${status}\t\t${job.command}\n`);
+        }
+    });
     return { exitCode: 0 };
 }
 
@@ -1338,18 +1225,20 @@ const SIGNAL_MAP: Record<string, number> = {};
     }
 }
 
-function runKill(args: string[]): ExecResult {
+async function runKill(args: string[]): Promise<ExecResult> {
     if (args.length === 0) {
-        writeStderr("kill: usage: kill [-signal] pid ...\n");
+        await writeStderr("kill: usage: kill [-signal] pid ...\n");
         return { exitCode: 1 };
     }
     // -l: list signals
     if (args[0] === "-l" || args[0] === "-L") {
         const sigs = osConstants.signals as Record<string, number>;
         const entries = Object.entries(sigs).filter(([n]) => n.startsWith("SIG")).sort((a, b) => a[1] - b[1]);
-        for (const [name, num] of entries) {
-            writeStdout(`${num}) ${name}\n`);
-        }
+        await withBufferedStdout(async (bw) => {
+            for (const [name, num] of entries) {
+                await bw.write(`${num}) ${name}\n`);
+            }
+        });
         return { exitCode: 0 };
     }
 
@@ -1364,7 +1253,7 @@ function runKill(args: string[]): ExecResult {
         } else {
             const resolved = SIGNAL_MAP[sigSpec] ?? SIGNAL_MAP["SIG" + sigSpec];
             if (resolved === undefined) {
-                writeStderr(`kill: ${args[0]}: invalid signal specification\n`);
+                await writeStderr(`kill: ${args[0]}: invalid signal specification\n`);
                 return { exitCode: 1 };
             }
             signal = resolved;
@@ -1373,7 +1262,7 @@ function runKill(args: string[]): ExecResult {
     }
 
     if (startIdx >= args.length) {
-        writeStderr("kill: usage: kill [-signal] pid ...\n");
+        await writeStderr("kill: usage: kill [-signal] pid ...\n");
         return { exitCode: 1 };
     }
 
@@ -1384,7 +1273,7 @@ function runKill(args: string[]): ExecResult {
         if (arg.startsWith("%")) {
             const job = getJobBySpec(arg);
             if (!job) {
-                writeStderr(`kill: ${arg}: no such job\n`);
+                await writeStderr(`kill: ${arg}: no such job\n`);
                 exitCode = 1;
                 continue;
             }
@@ -1392,14 +1281,14 @@ function runKill(args: string[]): ExecResult {
         } else {
             pid = parseInt(arg, 10);
             if (isNaN(pid)) {
-                writeStderr(`kill: ${arg}: invalid pid\n`);
+                await writeStderr(`kill: ${arg}: invalid pid\n`);
                 exitCode = 1;
                 continue;
             }
         }
         const r = native.sendSignal(pid, signal);
         if (r !== 0) {
-            writeStderr(`kill: (${pid}) - No such process\n`);
+            await writeStderr(`kill: (${pid}) - No such process\n`);
             exitCode = 1;
         }
     }
@@ -1408,12 +1297,12 @@ function runKill(args: string[]): ExecResult {
 
 // ---- disown builtin ---------------------------------------------------------
 
-function runDisown(args: string[]): ExecResult {
+async function runDisown(args: string[]): Promise<ExecResult> {
     if (args.length === 0) {
         // Disown current job
         const job = getCurrentJob();
         if (!job) {
-            writeStderr("jsh: disown: no current job\n");
+            await writeStderr("jsh: disown: no current job\n");
             return { exitCode: 1 };
         }
         removeJob(job.id);
@@ -1435,7 +1324,7 @@ function runDisown(args: string[]): ExecResult {
         }
         const job = getJobBySpec(arg);
         if (!job) {
-            writeStderr(`jsh: disown: ${arg}: no such job\n`);
+            await writeStderr(`jsh: disown: ${arg}: no such job\n`);
             exitCode = 1;
             continue;
         }
@@ -1448,15 +1337,17 @@ function runDisown(args: string[]): ExecResult {
 
 const hashTable = new Map<string, string>();
 
-function runHash(args: string[]): ExecResult {
+async function runHash(args: string[]): Promise<ExecResult> {
     if (args.length === 0) {
         if (hashTable.size === 0) {
-            writeStderr("hash: hash table empty\n");
+            await writeStderr("hash: hash table empty\n");
             return { exitCode: 0 };
         }
-        for (const [name, path] of hashTable) {
-            writeStdout(`${name}=${path}\n`);
-        }
+        await withBufferedStdout(async (bw) => {
+            for (const [name, path] of hashTable) {
+                await bw.write(`${name}=${path}\n`);
+            }
+        });
         return { exitCode: 0 };
     }
     if (args[0] === "-r") {
@@ -1470,7 +1361,7 @@ function runHash(args: string[]): ExecResult {
         if (path) {
             hashTable.set(name, path);
         } else {
-            writeStderr(`hash: ${name}: not found\n`);
+            await writeStderr(`hash: ${name}: not found\n`);
             exitCode = 1;
         }
     }
@@ -1484,9 +1375,9 @@ export function hashLookup(name: string): string | undefined {
 
 // ---- let builtin ------------------------------------------------------------
 
-function runLet(args: string[]): ExecResult {
+async function runLet(args: string[]): Promise<ExecResult> {
     if (args.length === 0) {
-        writeStderr("let: usage: let expression ...\n");
+        await writeStderr("let: usage: let expression ...\n");
         return { exitCode: 1 };
     }
     let lastResult = 0;
@@ -1499,18 +1390,19 @@ function runLet(args: string[]): ExecResult {
 
 // ---- declare builtin --------------------------------------------------------
 
-function runDeclare(args: string[]): ExecResult {
+async function runDeclare(args: string[]): Promise<ExecResult> {
     if (args.length === 0) {
-        // Print all variables
-        for (const key of Object.keys($)) {
-            const val = $[key];
-            if (Array.isArray(val)) {
-                const elements = (val as unknown[]).map((v, i) => `[${i}]="${v}"`).join(" ");
-                writeStdout(`declare -a ${key}=(${elements})\n`);
-            } else {
-                writeStdout(`declare -- ${key}="${val}"\n`);
+        await withBufferedStdout(async (bw) => {
+            for (const key of Object.keys($)) {
+                const val = $[key];
+                if (Array.isArray(val)) {
+                    const elements = (val as unknown[]).map((v, i) => `[${i}]="${v}"`).join(" ");
+                    await bw.write(`declare -a ${key}=(${elements})\n`);
+                } else {
+                    await bw.write(`declare -- ${key}="${val}"\n`);
+                }
             }
-        }
+        });
         return { exitCode: 0 };
     }
 
@@ -1533,24 +1425,25 @@ function runDeclare(args: string[]): ExecResult {
                 case "r": isReadonly = true; break;
                 case "p": isPrint = true; break;
                 default:
-                    writeStderr(`declare: -${f}: invalid option\n`);
+                    await writeStderr(`declare: -${f}: invalid option\n`);
                     return { exitCode: 1 };
             }
         }
     }
 
     if (isPrint || startIdx >= args.length) {
-        // Print matching variables
-        for (const key of Object.keys($)) {
-            const val = $[key];
-            if (isArray && !Array.isArray(val)) continue;
-            if (Array.isArray(val)) {
-                const elements = (val as unknown[]).map((v, i) => `[${i}]="${v}"`).join(" ");
-                writeStdout(`declare -a ${key}=(${elements})\n`);
-            } else {
-                writeStdout(`declare -- ${key}="${val}"\n`);
+        await withBufferedStdout(async (bw) => {
+            for (const key of Object.keys($)) {
+                const val = $[key];
+                if (isArray && !Array.isArray(val)) continue;
+                if (Array.isArray(val)) {
+                    const elements = (val as unknown[]).map((v, i) => `[${i}]="${v}"`).join(" ");
+                    await bw.write(`declare -a ${key}=(${elements})\n`);
+                } else {
+                    await bw.write(`declare -- ${key}="${val}"\n`);
+                }
             }
-        }
+        });
         return { exitCode: 0 };
     }
 
@@ -1726,13 +1619,13 @@ async function executeSelect(node: SelectClause): Promise<ExecResult> {
 
     // Display menu.
     for (let i = 0; i < items.length; i++) {
-        writeStderr(`${i + 1}) ${items[i]}\n`);
+        await writeStderr(`${i + 1}) ${items[i]}\n`);
     }
 
     let last: ExecResult = { exitCode: 0 };
     // Loop: read choice from stdin.
     while (true) {
-        writeStderr("#? ");
+        await writeStderr("#? ");
         const line = readLineFromFd(0);
         if (line === null) break; // EOF
         const trimmed = line.trim();
@@ -1915,6 +1808,10 @@ function expandHereDocVars(body: string): string {
 
 const fdReadBuffers = new Map<number, { buf: Buffer; data: string }>();
 
+// Sync line reader from an fd — kept for the interactive `select` loop and
+// other call sites that genuinely want a synchronous read from the terminal.
+// `read` uses the async variant below so it can sit in pipelines without
+// blocking the main thread when reading from a pipe.
 function readLineFromFd(fd: number): string | null {
     let state = fdReadBuffers.get(fd);
     if (!state) {
@@ -1942,11 +1839,54 @@ function readLineFromFd(fd: number): string | null {
     return null;
 }
 
+async function readLineFromFdAsync(fd: number): Promise<string | null> {
+    let state = fdReadBuffers.get(fd);
+    if (!state) {
+        state = { buf: Buffer.alloc(4096), data: "" };
+        fdReadBuffers.set(fd, state);
+    }
+    while (true) {
+        const nl = state.data.indexOf("\n");
+        if (nl >= 0) {
+            const line = state.data.slice(0, nl);
+            state.data = state.data.slice(nl + 1);
+            return line;
+        }
+        let n: number;
+        try {
+            const result = await fsReadAsync(fd, state.buf, 0, state.buf.length, null);
+            n = typeof result === "number" ? result : (result as { bytesRead: number }).bytesRead;
+        } catch { break; }
+        if (n === 0) break;
+        state.data += state.buf.toString("utf8", 0, n);
+    }
+    if (state.data.length > 0) {
+        const line = state.data;
+        state.data = "";
+        return line;
+    }
+    return null;
+}
+
+async function readBytesFromFdAsync(fd: number, count: number): Promise<string> {
+    const buf = Buffer.alloc(count);
+    let off = 0;
+    while (off < count) {
+        try {
+            const result = await fsReadAsync(fd, buf, off, count - off, null);
+            const n = typeof result === "number" ? result : (result as { bytesRead: number }).bytesRead;
+            if (n === 0) break;
+            off += n;
+        } catch { break; }
+    }
+    return buf.slice(0, off).toString("utf8");
+}
+
 function clearFdReadBuffer(fd: number): void {
     fdReadBuffers.delete(fd);
 }
 
-function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
+async function runRead(args: string[], redirs: Stage["redirs"]): Promise<ExecResult> {
     // Parse options
     let raw = false;
     let silent = false;
@@ -1967,7 +1907,7 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
         else if (arg === "-n" && i + 1 < args.length) { nchars = parseInt(args[i + 1]!, 10); i += 2; }
         else if (arg === "-a" && i + 1 < args.length) { arrayName = args[i + 1]!; i += 2; }
         else if (arg.startsWith("-") && arg.length > 1 && !/^[a-zA-Z_]/.test(arg[1]!)) {
-            writeStderr(`read: ${arg}: unsupported option\n`);
+            await writeStderr(`read: ${arg}: unsupported option\n`);
             return { exitCode: 2 };
         } else {
             varNames.push(arg);
@@ -1975,7 +1915,7 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
         }
     }
 
-    if (prompt) writeStderr(prompt);
+    if (prompt) await writeStderr(prompt);
 
     // For -s (silent): disable terminal echo while reading.
     let savedTermios: Buffer | null = null;
@@ -2002,41 +1942,35 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
         let fd: number;
         try { fd = fs.openSync(stdinRedir.target, "r"); }
         catch (e) {
-            writeStderr(`read: ${e instanceof Error ? e.message : e}\n`);
+            await writeStderr(`read: ${e instanceof Error ? e.message : e}\n`);
             return { exitCode: 1 };
         }
         clearFdReadBuffer(fd);
-        try { line = readLineFromFd(fd); }
+        try { line = await readLineFromFdAsync(fd); }
         finally { clearFdReadBuffer(fd); fs.closeSync(fd); }
     } else {
+        const stdinFd = getStdinFd();
         if (nchars > 0) {
-            // Read exactly N characters.
-            const buf = Buffer.alloc(1);
-            let chars = "";
-            for (let c = 0; c < nchars; c++) {
-                try {
-                    const n = readSync(0, buf, 0, 1, null);
-                    if (n === 0) break;
-                    chars += buf.toString("utf8", 0, 1);
-                } catch { break; }
-            }
+            const chars = await readBytesFromFdAsync(stdinFd, nchars);
             line = chars || null;
         } else if (delimiter !== null) {
-            // Read until delimiter character.
+            // Read until delimiter character — byte-at-a-time async loop.
             const buf = Buffer.alloc(1);
             let chars = "";
             while (true) {
+                let n: number;
                 try {
-                    const n = readSync(0, buf, 0, 1, null);
-                    if (n === 0) break;
-                    const ch = buf.toString("utf8", 0, 1);
-                    if (ch === delimiter) break;
-                    chars += ch;
+                    const result = await fsReadAsync(stdinFd, buf, 0, 1, null);
+                    n = typeof result === "number" ? result : (result as { bytesRead: number }).bytesRead;
                 } catch { break; }
+                if (n === 0) break;
+                const ch = buf.toString("utf8", 0, 1);
+                if (ch === delimiter) break;
+                chars += ch;
             }
             line = chars || null;
         } else {
-            line = readLineFromFd(0);
+            line = await readLineFromFdAsync(stdinFd);
         }
     }
     // Restore terminal echo if -s was used.
@@ -2045,7 +1979,7 @@ function runRead(args: string[], redirs: Stage["redirs"]): ExecResult {
             const { execSync } = require("node:child_process") as typeof import("node:child_process");
             execSync(`stty ${savedTermios.toString().trim()}`, { stdio: "inherit" });
         } catch {}
-        writeStderr("\n"); // Echo the newline that was suppressed.
+        await writeStderr("\n"); // Echo the newline that was suppressed.
     }
 
     if (line === null) return { exitCode: 1 };
@@ -2113,7 +2047,7 @@ async function runSource(file: string, extraArgs: string[]): Promise<ExecResult>
                 try { accessSync(candidate, fsConstants.R_OK); path = candidate; found = true; break; } catch {}
             }
             if (!found) {
-                writeStderr(`source: ${file}: No such file or directory\n`);
+                await writeStderr(`source: ${file}: No such file or directory\n`);
                 return { exitCode: 1 };
             }
         }
@@ -2122,14 +2056,14 @@ async function runSource(file: string, extraArgs: string[]): Promise<ExecResult>
     try {
         content = readFileSync(path, "utf8");
     } catch (e) {
-        writeStderr(`source: ${e instanceof Error ? e.message : e}\n`);
+        await writeStderr(`source: ${e instanceof Error ? e.message : e}\n`);
         return { exitCode: 1 };
     }
     let ast;
     try {
         ast = parse(content);
     } catch (e) {
-        writeStderr(`source: ${path}: ${e instanceof Error ? e.message : e}\n`);
+        await writeStderr(`source: ${path}: ${e instanceof Error ? e.message : e}\n`);
         return { exitCode: 1 };
     }
     if (!ast) return { exitCode: 0 };
@@ -2143,11 +2077,11 @@ async function runSource(file: string, extraArgs: string[]): Promise<ExecResult>
 
 // ---- test / [ builtin -------------------------------------------------------
 
-function runTest(args: string[]): ExecResult {
+async function runTest(args: string[]): Promise<ExecResult> {
     try {
         return { exitCode: evalTestExpr(args, 0, args.length)[0] ? 0 : 1 };
     } catch (e) {
-        writeStderr(`test: ${e instanceof Error ? e.message : e}\n`);
+        await writeStderr(`test: ${e instanceof Error ? e.message : e}\n`);
         return { exitCode: 2 };
     }
 }
@@ -2287,9 +2221,9 @@ function toInt(s: string): number {
 
 // ---- getopts builtin --------------------------------------------------------
 
-function runGetopts(args: string[]): ExecResult {
+async function runGetopts(args: string[]): Promise<ExecResult> {
     if (args.length < 2) {
-        writeStderr("getopts: usage: getopts optstring name [args]\n");
+        await writeStderr("getopts: usage: getopts optstring name [args]\n");
         return { exitCode: 2 };
     }
     const optstring = args[0]!;
@@ -2337,7 +2271,7 @@ function runGetopts(args: string[]): ExecResult {
             $["OPTIND"] = String(optind + 1);
             $["_OPTPOS"] = "1";
         }
-        if (optstring[0] !== ":") writeStderr(`jsh: getopts: illegal option -- ${ch}\n`);
+        if (optstring[0] !== ":") await writeStderr(`jsh: getopts: illegal option -- ${ch}\n`);
         return { exitCode: 0 };
     }
 
@@ -2362,7 +2296,7 @@ function runGetopts(args: string[]): ExecResult {
             $["OPTARG"] = ch;
             $["OPTIND"] = String(optind + 1);
             $["_OPTPOS"] = "1";
-            if (optstring[0] !== ":") writeStderr(`jsh: getopts: option requires an argument -- ${ch}\n`);
+            if (optstring[0] !== ":") await writeStderr(`jsh: getopts: option requires an argument -- ${ch}\n`);
         }
     } else {
         // No argument needed
@@ -2418,18 +2352,20 @@ function echoEscape(s: string): string {
 
 // ---- trap builtin -----------------------------------------------------------
 
-function runTrapBuiltin(args: string[]): ExecResult {
+async function runTrapBuiltin(args: string[]): Promise<ExecResult> {
     // No args: list current traps
     if (args.length === 0) {
-        for (const [sig, action] of getAllTraps()) {
-            writeStdout(`trap -- ${shellQuote(action)} ${sig}\n`);
-        }
+        await withBufferedStdout(async (bw) => {
+            for (const [sig, action] of getAllTraps()) {
+                await bw.write(`trap -- ${shellQuote(action)} ${sig}\n`);
+            }
+        });
         return { exitCode: 0 };
     }
 
     // trap -l: list signal names (not standard, but useful)
     if (args[0] === "-l") {
-        writeStdout("EXIT INT TERM HUP QUIT ERR DEBUG RETURN\n");
+        await writeStdout("EXIT INT TERM HUP QUIT ERR DEBUG RETURN\n");
         return { exitCode: 0 };
     }
 
@@ -2439,7 +2375,7 @@ function runTrapBuiltin(args: string[]): ExecResult {
         // Single arg could be a signal to display
         const action = getAllTraps().get(args[0]!.toUpperCase().replace(/^SIG/, ""));
         if (action !== undefined) {
-            writeStdout(`trap -- ${shellQuote(action)} ${args[0]}\n`);
+            await writeStdout(`trap -- ${shellQuote(action)} ${args[0]}\n`);
         }
         return { exitCode: 0 };
     }
@@ -2506,14 +2442,15 @@ function printfEscape(s: string): string {
     return result;
 }
 
-function runPrintf(args: string[]): ExecResult {
+async function runPrintf(args: string[]): Promise<ExecResult> {
     if (args.length === 0) {
-        writeStderr("printf: usage: printf format [arguments]\n");
+        await writeStderr("printf: usage: printf format [arguments]\n");
         return { exitCode: 1 };
     }
 
     const fmt = args[0]!;
     let argIdx = 1;
+    const bw = new BufferedWriter(getStdoutFd());
 
     // Process format string, reusing it if args remain (POSIX behavior).
     do {
@@ -2569,12 +2506,13 @@ function runPrintf(args: string[]): ExecResult {
             output += fmt[i]; i++;
         }
 
-        writeStdout(output);
+        await bw.write(output);
 
         // If no args were consumed this pass, stop (avoid infinite loop on format with no specifiers).
         if (argIdx === startArgIdx) break;
     } while (argIdx < args.length);
 
+    await bw.flush();
     return { exitCode: 0 };
 }
 
@@ -2605,19 +2543,27 @@ function consumeEscape(s: string, i: number): { char: string; next: number } {
     }
 }
 
+interface BuiltinCtx {
+    // Raw redirections from the parent SimpleCommand. Builtins like `read`
+    // need to peek at `<<<` here-strings and `<<` here-doc bodies that
+    // withRedirections doesn't materialize as fd-level dup2's. Optional
+    // because most builtins ignore it.
+    redirs?: Stage["redirs"];
+}
+
 interface Builtin {
-    run(args: string[]): ExecResult;
+    run(args: string[], ctx?: BuiltinCtx): Promise<ExecResult>;
     external: boolean;
 }
 
 const builtins: Record<string, Builtin> = {
-    cd: { external: false, run(args) {
+    cd: { external: false, async run(args) {
         let target = args[0] ?? String($["HOME"] ?? process.env["HOME"] ?? "/");
         if (target === "-") {
             const oldPwd = String($["OLDPWD"] ?? "");
-            if (!oldPwd) { writeStderr("cd: OLDPWD not set\n"); return { exitCode: 1 }; }
+            if (!oldPwd) { await writeStderr("cd: OLDPWD not set\n"); return { exitCode: 1 }; }
             target = oldPwd;
-            writeStdout(target + "\n");
+            await writeStdout(target + "\n");
         }
         const oldCwd = process.cwd();
         let resolved = false;
@@ -2635,14 +2581,16 @@ const builtins: Record<string, Builtin> = {
         }
         if (!resolved) { try { process.chdir(target); resolved = true; } catch {} }
         if (resolved) { $["OLDPWD"] = oldCwd; $["PWD"] = process.cwd(); return { exitCode: 0 }; }
-        writeStderr(`cd: no such file or directory: ${target}\n`);
+        await writeStderr(`cd: no such file or directory: ${target}\n`);
         return { exitCode: 1 };
     }},
-    export: { external: false, run(args) {
+    export: { external: false, async run(args) {
         if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
-            for (const [key, val] of Object.entries(process.env)) {
-                if (val !== undefined) writeStdout(`declare -x ${key}=${JSON.stringify(val)}\n`);
-            }
+            await withBufferedStdout(async (bw) => {
+                for (const [key, val] of Object.entries(process.env)) {
+                    if (val !== undefined) await bw.write(`declare -x ${key}=${JSON.stringify(val)}\n`);
+                }
+            });
             return { exitCode: 0 };
         }
         for (const arg of args) {
@@ -2652,7 +2600,7 @@ const builtins: Record<string, Builtin> = {
         }
         return { exitCode: 0 };
     }},
-    unset:    { external: false, run(args) {
+    unset:    { external: false, async run(args) {
         let mode: "v" | "f" = "v";
         let startIdx = 0;
         if (args[0] === "-f") { mode = "f"; startIdx = 1; }
@@ -2663,9 +2611,9 @@ const builtins: Record<string, Builtin> = {
         }
         return { exitCode: 0 };
     }},
-    true:     { external: true,  run() { return { exitCode: 0 }; }},
-    false:    { external: true,  run() { return { exitCode: 1 }; }},
-    echo: { external: false, run(args) {
+    true:     { external: true,  async run() { return { exitCode: 0 }; }},
+    false:    { external: true,  async run() { return { exitCode: 1 }; }},
+    echo: { external: false, async run(args) {
         let newline = true, escapes = false, startIdx = 0;
         while (startIdx < args.length) {
             const a = args[startIdx]!;
@@ -2678,18 +2626,18 @@ const builtins: Record<string, Builtin> = {
         }
         let out = args.slice(startIdx).join(" ");
         if (escapes) out = echoEscape(out);
-        writeStdout(out + (newline ? "\n" : ""));
+        await writeStdout(out + (newline ? "\n" : ""));
         return { exitCode: 0 };
     }},
     test:     { external: true,  run: (args) => runTest(args) },
-    "[":      { external: true,  run(args) {
+    "[":      { external: true,  async run(args) {
         if (args.length === 0 || args[args.length - 1] !== "]") {
-            writeStderr("[: missing ']'\n"); return { exitCode: 2 };
+            await writeStderr("[: missing ']'\n"); return { exitCode: 2 };
         }
         return runTest(args.slice(0, -1));
     }},
     set:      { external: false, run: (args) => runSet(args) },
-    local:    { external: false, run(args) {
+    local:    { external: false, async run(args) {
         for (const arg of args) {
             const eq = arg.indexOf("=");
             if (eq > 0) { declareLocal(arg.slice(0, eq)); $[arg.slice(0, eq)] = arg.slice(eq + 1); }
@@ -2697,57 +2645,64 @@ const builtins: Record<string, Builtin> = {
         }
         return { exitCode: 0 };
     }},
-    shift:    { external: false, run(args) {
+    shift:    { external: false, async run(args) {
         const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
-        if (isNaN(n) || n < 0) { writeStderr(`shift: ${args[0]}: numeric argument required\n`); return { exitCode: 1 }; }
+        if (isNaN(n) || n < 0) { await writeStderr(`shift: ${args[0]}: numeric argument required\n`); return { exitCode: 1 }; }
         return { exitCode: shiftParams(n) ? 0 : 1 };
     }},
-    exec:     { external: false, run(args) {
-        // exec with args: replace process. exec without args handled in executeSimple
-        // (redirections are applied permanently there).
-        if (args.length === 0) return { exitCode: 0 };
+    exec:     { external: false, async run(args, ctx) {
+        // No args: apply redirections permanently to the shell process. The
+        // dup2's are handled at the executeSimple level (via applyExecRedirs)
+        // so they survive after this builtin returns. With args: replace
+        // the process.
+        if (args.length === 0) {
+            if (ctx?.redirs && ctx.redirs.length > 0) await applyExecRedirs(ctx.redirs);
+            return { exitCode: 0 };
+        }
         return runExec("exec", args);
     }},
     type:     { external: false, run: (args) => runType(args) },
     which:    { external: false, run: (args) => runWhich(args) },
-    pushd:    { external: false, run(args) {
+    pushd:    { external: false, async run(args) {
         const target = args[0] ?? String($["HOME"] ?? "/");
         const cwd = process.cwd();
-        try { process.chdir(target); dirStack.push(cwd); $["PWD"] = process.cwd(); writeStdout(printDirStack() + "\n"); }
-        catch (e: unknown) { writeStderr(`pushd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
+        try { process.chdir(target); dirStack.push(cwd); $["PWD"] = process.cwd(); await writeStdout(printDirStack() + "\n"); }
+        catch (e: unknown) { await writeStderr(`pushd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
         return { exitCode: 0 };
     }},
-    popd:     { external: false, run() {
-        if (dirStack.length === 0) { writeStderr("popd: directory stack empty\n"); return { exitCode: 1 }; }
+    popd:     { external: false, async run() {
+        if (dirStack.length === 0) { await writeStderr("popd: directory stack empty\n"); return { exitCode: 1 }; }
         const target = dirStack.pop()!;
-        try { process.chdir(target); $["PWD"] = process.cwd(); writeStdout(printDirStack() + "\n"); }
-        catch (e: unknown) { writeStderr(`popd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
+        try { process.chdir(target); $["PWD"] = process.cwd(); await writeStdout(printDirStack() + "\n"); }
+        catch (e: unknown) { await writeStderr(`popd: ${e instanceof Error ? e.message : e}\n`); return { exitCode: 1 }; }
         return { exitCode: 0 };
     }},
-    dirs:     { external: false, run() { writeStdout(printDirStack() + "\n"); return { exitCode: 0 }; }},
-    basename: { external: true, run(args) {
-        if (args.length === 0) { writeStderr("basename: missing operand\n"); return { exitCode: 1 }; }
+    dirs:     { external: false, async run() { await writeStdout(printDirStack() + "\n"); return { exitCode: 0 }; }},
+    basename: { external: true, async run(args) {
+        if (args.length === 0) { await writeStderr("basename: missing operand\n"); return { exitCode: 1 }; }
         let nm = args[0]!;
         while (nm.length > 1 && nm.endsWith("/")) nm = nm.slice(0, -1);
         const sl = nm.lastIndexOf("/");
         nm = sl >= 0 ? nm.slice(sl + 1) : nm;
         if (args[1] && nm.endsWith(args[1]) && nm !== args[1]) nm = nm.slice(0, -args[1].length);
-        writeStdout(nm + "\n");
+        await writeStdout(nm + "\n");
         return { exitCode: 0 };
     }},
-    dirname:  { external: true, run(args) {
-        if (args.length === 0) { writeStderr("dirname: missing operand\n"); return { exitCode: 1 }; }
+    dirname:  { external: true, async run(args) {
+        if (args.length === 0) { await writeStderr("dirname: missing operand\n"); return { exitCode: 1 }; }
         let nm = args[0]!;
         while (nm.length > 1 && nm.endsWith("/")) nm = nm.slice(0, -1);
         const sl = nm.lastIndexOf("/");
-        writeStdout((sl > 0 ? nm.slice(0, sl) : sl === 0 ? "/" : ".") + "\n");
+        await writeStdout((sl > 0 ? nm.slice(0, sl) : sl === 0 ? "/" : ".") + "\n");
         return { exitCode: 0 };
     }},
-    readonly: { external: false, run(args) {
+    readonly: { external: false, async run(args) {
         if (args.length === 0 || (args.length === 1 && args[0] === "-p")) {
-            for (const [nm, val] of getReadonlyVars()) {
-                writeStdout(`declare -r ${nm}=${JSON.stringify(String(val ?? ""))}\n`);
-            }
+            await withBufferedStdout(async (bw) => {
+                for (const [nm, val] of getReadonlyVars()) {
+                    await bw.write(`declare -r ${nm}=${JSON.stringify(String(val ?? ""))}\n`);
+                }
+            });
             return { exitCode: 0 };
         }
         for (const arg of args) {
@@ -2764,66 +2719,249 @@ const builtins: Record<string, Builtin> = {
     hash:     { external: false, run: (args) => runHash(args) },
     let:      { external: false, run: (args) => runLet(args) },
     declare:  { external: false, run: (args) => runDeclare(args) },
-    ":"       : { external: false, run() { return { exitCode: 0 }; }},
-    pwd:      { external: true, run(args) {
+    ":"       : { external: false, async run() { return { exitCode: 0 }; }},
+    pwd:      { external: true, async run(args) {
         // -P: physical (resolve symlinks), -L: logical (default, use $PWD)
         if (args.includes("-P")) {
             try {
                 const { realpathSync } = require("node:fs") as typeof import("node:fs");
-                writeStdout(realpathSync(process.cwd()) + "\n");
+                await writeStdout(realpathSync(process.cwd()) + "\n");
             } catch {
-                writeStdout(process.cwd() + "\n");
+                await writeStdout(process.cwd() + "\n");
             }
         } else {
-            writeStdout((String($["PWD"] ?? process.cwd())) + "\n");
+            await writeStdout((String($["PWD"] ?? process.cwd())) + "\n");
         }
         return { exitCode: 0 };
     }},
-    umask:    { external: false, run(args) {
+    umask:    { external: false, async run(args) {
         if (args.length === 0) {
             const mask = process.umask();
-            writeStdout("0" + mask.toString(8).padStart(3, "0") + "\n");
+            await writeStdout("0" + mask.toString(8).padStart(3, "0") + "\n");
             // umask() with no args in Node returns current and sets to same value
             process.umask(mask);
             return { exitCode: 0 };
         }
         const val = parseInt(args[0]!, 8);
         if (isNaN(val)) {
-            writeStderr(`umask: ${args[0]}: invalid octal number\n`);
+            await writeStderr(`umask: ${args[0]}: invalid octal number\n`);
             return { exitCode: 1 };
         }
         process.umask(val);
         return { exitCode: 0 };
     }},
-    ulimit:   { external: false, run(args) {
+    ulimit:   { external: false, async run(args) {
         // Minimal ulimit — only supports -n (nofile) which is the most commonly used.
         if (args.length === 0 || args[0] === "-n") {
-            // Node doesn't expose getrlimit, report "unlimited" or use a default
-            writeStdout("unlimited\n");
+            await writeStdout("unlimited\n");
             return { exitCode: 0 };
         }
         if (args[0] === "-a") {
-            writeStdout("core file size          (blocks, -c) unlimited\n");
-            writeStdout("data seg size           (kbytes, -d) unlimited\n");
-            writeStdout("file size               (blocks, -f) unlimited\n");
-            writeStdout("max locked memory       (kbytes, -l) unlimited\n");
-            writeStdout("max memory size         (kbytes, -m) unlimited\n");
-            writeStdout("open files                      (-n) unlimited\n");
-            writeStdout("pipe size            (512 bytes, -p) 1\n");
-            writeStdout("stack size              (kbytes, -s) unlimited\n");
-            writeStdout("cpu time               (seconds, -t) unlimited\n");
-            writeStdout("max user processes              (-u) unlimited\n");
-            writeStdout("virtual memory          (kbytes, -v) unlimited\n");
+            await withBufferedStdout(async (bw) => {
+                await bw.write("core file size          (blocks, -c) unlimited\n");
+                await bw.write("data seg size           (kbytes, -d) unlimited\n");
+                await bw.write("file size               (blocks, -f) unlimited\n");
+                await bw.write("max locked memory       (kbytes, -l) unlimited\n");
+                await bw.write("max memory size         (kbytes, -m) unlimited\n");
+                await bw.write("open files                      (-n) unlimited\n");
+                await bw.write("pipe size            (512 bytes, -p) 1\n");
+                await bw.write("stack size              (kbytes, -s) unlimited\n");
+                await bw.write("cpu time               (seconds, -t) unlimited\n");
+                await bw.write("max user processes              (-u) unlimited\n");
+                await bw.write("virtual memory          (kbytes, -v) unlimited\n");
+            });
             return { exitCode: 0 };
         }
-        writeStderr(`ulimit: ${args[0]}: unsupported option\n`);
+        await writeStderr(`ulimit: ${args[0]}: unsupported option\n`);
         return { exitCode: 1 };
+    }},
+
+    // ---- Folded inline-handled builtins ----
+
+    read:     { external: false, run: (args, ctx) => runRead(args, ctx?.redirs ?? []) },
+    source:   { external: false, async run(args) {
+        if (args.length === 0) {
+            await writeStderr("source: filename argument required\n");
+            return { exitCode: 2 };
+        }
+        return runSource(args[0]!, args.slice(1));
+    }},
+    ".":      { external: false, async run(args) {
+        if (args.length === 0) {
+            await writeStderr(".: filename argument required\n");
+            return { exitCode: 2 };
+        }
+        return runSource(args[0]!, args.slice(1));
+    }},
+    alias:    { external: false, async run(args) {
+        // Display / set aliases. With no args: list. With name=value: set.
+        // With bare name: print that one (or fail).
+        const api = require("../api/index.js") as typeof import("../api/index.js");
+        if (args.length === 0) {
+            await withBufferedStdout(async (bw) => {
+                for (const [name, expansion] of api.getAllAliases()) {
+                    await bw.write(`alias ${name}=${shellQuote(expansion)}\n`);
+                }
+            });
+            return { exitCode: 0 };
+        }
+        let exitCode = 0;
+        for (const arg of args) {
+            const eq = arg.indexOf("=");
+            if (eq > 0) {
+                api.alias(arg.slice(0, eq), arg.slice(eq + 1));
+            } else {
+                const v = api.getAlias(arg);
+                if (v !== undefined) {
+                    await writeStdout(`alias ${arg}=${shellQuote(v)}\n`);
+                } else {
+                    await writeStderr(`alias: ${arg}: not found\n`);
+                    exitCode = 1;
+                }
+            }
+        }
+        return { exitCode };
+    }},
+    unalias:  { external: false, async run(args) {
+        const api = require("../api/index.js") as typeof import("../api/index.js");
+        if (args[0] === "-a") { for (const [name] of api.getAllAliases()) api.unalias(name); return { exitCode: 0 }; }
+        let exitCode = 0;
+        for (const a of args) {
+            if (api.getAlias(a) === undefined) {
+                await writeStderr(`unalias: ${a}: not found\n`);
+                exitCode = 1;
+            } else {
+                api.unalias(a);
+            }
+        }
+        return { exitCode };
+    }},
+    eval:     { external: false, async run(args) {
+        if (args.length === 0) return { exitCode: 0 };
+        const code = args.join(" ");
+        try {
+            const ast = parse(code);
+            if (!ast) return { exitCode: 0 };
+            return await executeNode(ast);
+        } catch (e: unknown) {
+            await writeStderr(`eval: ${e instanceof Error ? e.message : e}\n`);
+            return { exitCode: 1 };
+        }
+    }},
+    trap:     { external: false, run: (args) => runTrapBuiltin(args) },
+    return:   { external: false, async run(args) {
+        const code = args[0] !== undefined ? parseInt(args[0], 10) : Number($["?"] ?? 0);
+        throw new ShellReturn(isNaN(code) ? 0 : code);
+    }},
+    break:    { external: false, async run(args) {
+        const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
+        throw new ShellBreak(isNaN(n) || n < 1 ? 1 : n);
+    }},
+    continue: { external: false, async run(args) {
+        const n = args[0] !== undefined ? parseInt(args[0], 10) : 1;
+        throw new ShellContinue(isNaN(n) || n < 1 ? 1 : n);
+    }},
+    command:  { external: false, async run(args, ctx) {
+        if (args[0] === "-v" || args[0] === "-V") {
+            if (args.length < 2) return { exitCode: 1 };
+            const name = args[1]!;
+            if (isBuiltinName(name) || shellFunctions.has(name)
+                || getAlias(name) !== undefined
+                || lookupBareJsFunction(name) !== undefined) {
+                await writeStdout(name + "\n");
+                return { exitCode: 0 };
+            }
+            const resolved = findInPath(name);
+            if (resolved) { await writeStdout(resolved + "\n"); return { exitCode: 0 }; }
+            return { exitCode: 1 };
+        }
+        if (args.length > 0) {
+            const subCmd = args[0]!;
+            const subArgs = args.slice(1);
+            const builtin = builtins[subCmd];
+            if (builtin) return builtin.run(subArgs, ctx);
+            const result = await native.spawnPipeline(
+                [{ cmd: subCmd, args: subArgs, redirs: ctx?.redirs ?? [] }], [],
+                false, getStdinFd(), getStdoutFd(), getStderrFd()
+            );
+            return { exitCode: result.exitCode };
+        }
+        return { exitCode: 0 };
+    }},
+    fg:       { external: false, run: (args) => runFg(args) },
+    bg:       { external: false, run: (args) => runBg(args) },
+    jobs:     { external: false, run: () => runJobs() },
+    wait:     { external: false, run: (args) => runWait(args) },
+    time:     { external: false, async run(args) {
+        const remaining = args.join(" ");
+        if (!remaining.trim()) return { exitCode: 0 };
+        const startTime = process.hrtime.bigint();
+        const ast = parse(remaining);
+        const result = ast ? await executeNode(ast) : { exitCode: 0 };
+        const elapsed = Number(process.hrtime.bigint() - startTime) / 1e9;
+        const mins = Math.floor(elapsed / 60);
+        const secs = elapsed - mins * 60;
+        await writeStderr(`\nreal\t${mins}m${secs.toFixed(3)}s\n`);
+        await writeStderr(`user\t0m0.000s\n`);
+        await writeStderr(`sys\t0m0.000s\n`);
+        return result;
+    }},
+    exit:     { external: false, async run(args) {
+        const code = args[0] !== undefined ? parseInt(args[0], 10) : Number($["?"] ?? 0);
+        await runTrap("EXIT", executeString);
+        process.exit(isNaN(code) ? 0 : code);
     }},
 };
 
-function runBuiltin(name: string, args: string[]): ExecResult | null {
+async function runBuiltin(name: string, args: string[], ctx?: BuiltinCtx): Promise<ExecResult | null> {
     const b = builtins[name];
-    return b ? b.run(args) : null;
+    return b ? await b.run(args, ctx) : null;
+}
+
+// Apply redirections permanently to the shell process — used by `exec` with
+// no command but with redirections (e.g., `exec 3>file`, `exec >>log`). The
+// dup2's are not reverted on return.
+async function applyExecRedirs(redirs: Stage["redirs"]): Promise<void> {
+    for (const r of redirs) {
+        if (r.isHereDoc) continue;
+        switch (r.op) {
+            case ">": case ">>": {
+                const flags = r.op === ">"
+                    ? fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC
+                    : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
+                const fileFd = openSync(r.target, flags, 0o666);
+                native.dup2Fd(fileFd, r.fd >= 0 ? r.fd : 1);
+                native.closeFd(fileFd);
+                break;
+            }
+            case "<": {
+                const fileFd = openSync(r.target, fsConstants.O_RDONLY);
+                native.dup2Fd(fileFd, r.fd >= 0 ? r.fd : 0);
+                native.closeFd(fileFd);
+                break;
+            }
+            case ">&": {
+                const dstFd = parseInt(r.target, 10);
+                native.dup2Fd(dstFd, r.fd >= 0 ? r.fd : 1);
+                break;
+            }
+            case "<&": {
+                const dstFd = parseInt(r.target, 10);
+                native.dup2Fd(dstFd, r.fd >= 0 ? r.fd : 0);
+                break;
+            }
+            case "&>": case "&>>": {
+                const flags = r.op === "&>"
+                    ? fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC
+                    : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
+                const fileFd = openSync(r.target, flags, 0o666);
+                native.dup2Fd(fileFd, 1);
+                native.dup2Fd(fileFd, 2);
+                native.closeFd(fileFd);
+                break;
+            }
+        }
+    }
 }
 
 // ---- [[ conditional expression ]] -------------------------------------------
@@ -2837,7 +2975,7 @@ async function executeConditionalExpr(node: ConditionalExpr): Promise<ExecResult
     try {
         return { exitCode: evalCondExpr(args, 0, args.length)[0] ? 0 : 1 };
     } catch (e) {
-        writeStderr(`[[: ${e instanceof Error ? e.message : e}\n`);
+        await writeStderr(`[[: ${e instanceof Error ? e.message : e}\n`);
         return { exitCode: 2 };
     }
 }
@@ -2915,12 +3053,9 @@ function evalCondPrimary(args: string[], pos: number, end: number): CondResult {
 
 // ---- type / which builtins --------------------------------------------------
 
-const BUILTIN_NAMES = new Set([
-    ...Object.keys(builtins),
-    "read", "source", ".", "alias", "unalias",
-    "eval", "trap", "return", "command", "break", "continue",
-    "fg", "bg", "jobs", "wait", "select", "time",
-]);
+// "select" is a reserved word with its own AST node (SelectClause), not a
+// builtin command — but external tooling may want to treat it as builtin-ish.
+const BUILTIN_NAMES = new Set([...Object.keys(builtins), "select"]);
 
 function findInPath(cmd: string): string | null {
     if (cmd.includes("/")) {
@@ -2956,30 +3091,30 @@ function classifyCommand(name: string): { kind: string; detail: string } | null 
     return null;
 }
 
-function runType(args: string[]): ExecResult {
+async function runType(args: string[]): Promise<ExecResult> {
     let exitCode = 0;
     for (const name of args) {
         const info = classifyCommand(name);
         if (info) {
-            writeStdout(info.detail + "\n");
+            await writeStdout(info.detail + "\n");
         } else {
-            writeStderr(`type: ${name}: not found\n`);
+            await writeStderr(`type: ${name}: not found\n`);
             exitCode = 1;
         }
     }
     return { exitCode };
 }
 
-function runWhich(args: string[]): ExecResult {
+async function runWhich(args: string[]): Promise<ExecResult> {
     let exitCode = 0;
     for (const name of args) {
         const path = findInPath(name);
         if (path) {
-            writeStdout(path + "\n");
+            await writeStdout(path + "\n");
         } else if (BUILTIN_NAMES.has(name)) {
-            writeStdout(`${name}: shell built-in command\n`);
+            await writeStdout(`${name}: shell built-in command\n`);
         } else {
-            writeStderr(`which: ${name}: not found\n`);
+            await writeStderr(`which: ${name}: not found\n`);
             exitCode = 1;
         }
     }
@@ -2988,13 +3123,13 @@ function runWhich(args: string[]): ExecResult {
 
 // ---- exec builtin -----------------------------------------------------------
 
-function runExec(_name: string, args: string[]): ExecResult {
+async function runExec(_name: string, args: string[]): Promise<ExecResult> {
     const [cmd, ...rest] = args as [string, ...string[]];
     try {
         native.execvp(cmd, rest);
     } catch (e) {
         // execvp failed — print error and exit
-        writeStderr(`exec: ${cmd}: ${e instanceof Error ? e.message : e}\n`);
+        await writeStderr(`exec: ${cmd}: ${e instanceof Error ? e.message : e}\n`);
         process.exit(127);
     }
     // Unreachable on success (process replaced), but TypeScript needs a return.
@@ -3020,12 +3155,13 @@ const longOptMap: Record<string, keyof typeof shellOpts> = {
     noclobber: "noclobber",
 };
 
-function runSet(args: string[]): ExecResult {
+async function runSet(args: string[]): Promise<ExecResult> {
     if (args.length === 0) {
-        // Print all shell options
-        for (const [name, val] of Object.entries(shellOpts)) {
-            writeStdout(`${name}\t${val ? "on" : "off"}\n`);
-        }
+        await withBufferedStdout(async (bw) => {
+            for (const [name, val] of Object.entries(shellOpts)) {
+                await bw.write(`${name}\t${val ? "on" : "off"}\n`);
+            }
+        });
         return { exitCode: 0 };
     }
 
@@ -3041,7 +3177,7 @@ function runSet(args: string[]): ExecResult {
             const enable = arg[0] === "-";
             const name = args[++i];
             if (!name || !(name in longOptMap)) {
-                writeStderr(`set: ${name ?? ""}: invalid option\n`);
+                await writeStderr(`set: ${name ?? ""}: invalid option\n`);
                 return { exitCode: 1 };
             }
             shellOpts[longOptMap[name]!] = enable;
@@ -3050,7 +3186,7 @@ function runSet(args: string[]): ExecResult {
                 const ch = arg[j]!;
                 const opt = shortOptMap[ch];
                 if (!opt) {
-                    writeStderr(`set: -${ch}: invalid option\n`);
+                    await writeStderr(`set: -${ch}: invalid option\n`);
                     return { exitCode: 1 };
                 }
                 shellOpts[opt] = true;
@@ -3060,13 +3196,13 @@ function runSet(args: string[]): ExecResult {
                 const ch = arg[j]!;
                 const opt = shortOptMap[ch];
                 if (!opt) {
-                    writeStderr(`set: +${ch}: invalid option\n`);
+                    await writeStderr(`set: +${ch}: invalid option\n`);
                     return { exitCode: 1 };
                 }
                 shellOpts[opt] = false;
             }
         } else {
-            writeStderr(`set: ${arg}: invalid argument\n`);
+            await writeStderr(`set: ${arg}: invalid argument\n`);
             return { exitCode: 1 };
         }
     }

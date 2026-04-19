@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { parse } from "../parser/index.js";
 import type { ASTNode, SimpleCommand, Pipeline } from "../parser/index.js";
 import { expandWord, expandWordToStr } from "../expander/index.js";
-import { execute as executeNode } from "../executor/index.js";
+import { execute as executeNode, withIoContext } from "../executor/index.js";
 
 const fsWrite = promisify(fsWriteRaw);
 
@@ -279,22 +279,11 @@ export class ExecHandle implements PromiseLike<ExecResult> {
             [stderrR, stderrW] = native.createCloexecPipe();
         }
 
-        // Redirect stdout (and optionally stderr) to capture pipes.
-        const savedStdout = native.dupFd(1);
+        // Pipe fds will be the IO context's stdout/stderr fds — no dup2 on
+        // process fd 1/2. The clearCloexec is so children spawned by the
+        // executor (forkExec / posix_spawn) inherit them across exec.
         native.clearCloexec(stdoutW);
-        native.dup2Fd(stdoutW, 1);
-        native.closeFd(stdoutW);
-
-        let savedStderr = -1;
-        if (stderrW !== -1) {
-            savedStderr = native.dupFd(2);
-            native.clearCloexec(stderrW);
-            native.dup2Fd(stderrW, 2);
-            native.closeFd(stderrW);
-        } else if (options.stderr === "merge") {
-            savedStderr = native.dupFd(2);
-            native.dup2Fd(1, 2);
-        }
+        if (stderrW !== -1) native.clearCloexec(stderrW);
 
         // Read stdout in background. Reattach \n during accumulation (see
         // _run above for rationale).
@@ -315,20 +304,25 @@ export class ExecHandle implements PromiseLike<ExecResult> {
             native.closeFd(stderrR);
         })() : Promise.resolve();
 
-        // Execute the compound command using the main executor.
+        // Execute the compound command using the main executor inside an IO
+        // context that points stdout (and optionally stderr) at the capture
+        // pipes. Builtins, JS stages, and externals all route their output
+        // through getStdoutFd()/getStderrFd().
+        const ctxStderrFd = stderrW !== -1 ? stderrW
+                          : options.stderr === "merge" ? stdoutW
+                          : 2;
         let result: { exitCode: number };
         try {
-            result = await executeNode(ast);
+            result = await withIoContext(
+                { stdinFd: 0, stdoutFd: stdoutW, stderrFd: ctxStderrFd },
+                () => executeNode(ast),
+            );
         } catch {
             result = { exitCode: 1 };
-        }
-
-        // Restore original fds.
-        native.dup2Fd(savedStdout, 1);
-        native.closeFd(savedStdout);
-        if (savedStderr !== -1) {
-            native.dup2Fd(savedStderr, 2);
-            native.closeFd(savedStderr);
+        } finally {
+            // Close the write ends so the readers see EOF and finish.
+            native.closeFd(stdoutW);
+            if (stderrW !== -1) native.closeFd(stderrW);
         }
 
         await Promise.all([readStdout, readStderr]);
