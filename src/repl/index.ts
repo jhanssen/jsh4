@@ -31,7 +31,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputStart: (callbacks: {
         onRender: (state: { buf: string; pos: number; len: number; cols: number }) => void;
         onLine: (line: string | null, errno?: number) => void;
-        onCompletion?: (input: string) => string[] | Promise<string[]> | unknown;
+        onCompletion?: (input: string, cursor: number) => string[] | Promise<string[]> | unknown;
         onEscResponse?: (type: "DCS" | "OSC", payload: string) => void;
     }) => void;
     inputStop: () => void;
@@ -45,8 +45,9 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
     inputInsertAtCursor: (text: string) => void;
-    inputSetCompletions: (entries: string[]) => void;
+    inputSetCompletions: (entries: string[], descs?: string[], replaceStart?: number, replaceEnd?: number) => void;
     inputSetWordChars: (chars: string) => void;
+    inputSetCompletionStyle: (style: string) => void;
     inputEAGAIN: () => number;
 };
 
@@ -163,7 +164,7 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
         });
 
         // Set up tab completion.
-        ui!.setCompletion((input: string) => getCompletions(input));
+        ui!.setCompletion((input: string, cursor: number) => getCompletions(input, cursor));
 
         // Set suggestion ghost text color from theme — and refresh whenever
         // setTheme() runs (which may happen after the rc loads).
@@ -255,6 +256,10 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         // Word-boundary characters for Alt-B/F/D/Backspace and Ctrl-W (zsh's
         // WORDCHARS). Defaults to zsh's default; override from jshrc to taste.
         setWordChars: (chars: string) => native.inputSetWordChars(chars),
+        // Completion style: "cycle" (default) inserts each match in turn on
+        // repeated Tab; "menu" shows a zsh-style grid and navigates it with
+        // Tab / arrow keys.
+        setCompletionStyle: (style: "cycle" | "menu") => native.inputSetCompletionStyle(style),
         // Colors
         colors,
         makeFgColor,

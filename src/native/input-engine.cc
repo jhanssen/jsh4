@@ -1,5 +1,6 @@
 #include "input-engine.h"
 #include <uv.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <optional>
@@ -343,9 +344,36 @@ struct InputState {
     size_t completion_idx = 0;
     bool waiting_for_completions = false;
     // Cached completion state: original buffer + candidates from first Tab.
+    // The splice replaces buf[completion_start..completion_end] with the
+    // chosen entry; text outside that range is preserved. For backward-compat
+    // with the legacy string[] return, replaceStart/replaceEnd default to
+    // [0, word_end] so entries are treated as full-prefix replacements.
     std::string completion_original; // buffer before first completion applied
+    size_t completion_start = 0;
+    size_t completion_end = 0;
+    std::string completion_pre;      // buf[0..completion_start], preserved
+    std::string completion_tail;     // buf[completion_end..], preserved
     std::vector<std::string> completion_entries; // cached candidates
     std::vector<std::string> completion_descriptions; // parallel to completion_entries
+    // Menu-complete mode (zsh's `menu-select` behavior; opt-in via
+    // jsh.setCompletionStyle("menu")). State machine:
+    //   0 = inactive
+    //   1 = grid shown (first Tab surfaced candidates; no selection, buffer
+    //       unchanged)
+    //   2 = navigating (second Tab advanced to selection; buffer tentatively
+    //       holds the current match and is restored on Esc)
+    int menu_state = 0;
+    int menu_rows = 0;
+    int menu_cols = 0;
+    int menu_row = 0;           // selected cell (row)
+    int menu_col = 0;           // selected cell (col)
+    int menu_viewport_start = 0;
+    int menu_col_width = 0;     // uniform column width (longest entry + gap)
+    int menu_viewport_max = 10; // max rows rendered at once
+    size_t menu_display_prefix_len = 0; // byte-LCP across entries stripped for display
+    std::string menu_orig_buf;  // buffer to restore on Esc from state 2
+    size_t menu_orig_pos = 0;
+    size_t menu_orig_len = 0;
     // Reverse search (Ctrl-R)
     bool in_search = false;
     char search_query[256];
@@ -426,6 +454,9 @@ static void historyUpOrPrefixSearch(InputState *s, bool was_in_prefix_search);
 static void historyDownOrPrefixSearch(InputState *s, bool was_in_prefix_search);
 static int dispatchEscPrefix(InputState *s, char first, bool was_in_prefix_search,
                              bool was_kill, bool was_yank);
+static void menuNavigate(InputState *s, int dr, int dc);
+static void menuClose(InputState *s, bool restore);
+static std::vector<std::string> menuRenderLines(InputState *s);
 static size_t lineStart(const char *buf, size_t pos);
 
 static void editInsert(InputState *s, const char *c, size_t clen) {
@@ -558,6 +589,10 @@ static bool editMoveDown(InputState *s) {
 // DEFAULT_WORDCHARS = *?_-.[]~=/&;!#$%^(){}<>, so `-foo`, `path/to/file`,
 // `VAR=val` are each a single word.
 static std::string wordchars = "*?_-.[]~=/&;!#$%^(){}<>";
+
+// Menu-complete opt-in. Set via jsh.setCompletionStyle("menu" | "cycle").
+// Default is "cycle" (current behavior — Tab cycles through candidates).
+static bool g_menu_complete = false;
 
 static bool isWordCluster(const char *buf, size_t pos, size_t clen) {
     if (clen == 0) return false;
@@ -872,6 +907,17 @@ static int dispatchEscPrefix(InputState *s, char first, bool was_in_prefix_searc
                 params[n++] = ch;
             }
         } else {
+            // Menu-complete navigation takes over the arrows in state 2.
+            // State 1 (grid shown, no selection) falls through to normal
+            // arrow behavior — the user is still editing the input line.
+            if (s->menu_state == 2) {
+                switch (seq[1]) {
+                case 'A': menuNavigate(s, -1, 0); notifyRender(); return 0;
+                case 'B': menuNavigate(s, +1, 0); notifyRender(); return 0;
+                case 'C': menuNavigate(s, 0, +1); notifyRender(); return 0;
+                case 'D': menuNavigate(s, 0, -1); notifyRender(); return 0;
+                }
+            }
             switch (seq[1]) {
             case 'A':
                 historyUpOrPrefixSearch(s, was_in_prefix_search);
@@ -1224,6 +1270,14 @@ static void notifyRender() {
             state.Set("completionDesc", Napi::String::New(env, desc));
         }
     }
+    if (g_state.menu_state != 0 && g_state.menu_rows > 0) {
+        auto lines = menuRenderLines(&g_state);
+        Napi::Array arr = Napi::Array::New(env, lines.size());
+        for (size_t i = 0; i < lines.size(); i++) {
+            arr.Set(i, Napi::String::New(env, lines[i]));
+        }
+        state.Set("menuLines", arr);
+    }
     g_ctx->onRender.Call({state});
 }
 
@@ -1238,25 +1292,228 @@ static std::vector<std::string> extractCompletionArray(Napi::Array arr) {
     return entries;
 }
 
+// Splice: buf = completion_pre + entry + completion_tail. Cursor ends at
+// the end of the inserted entry (i.e., completion_pre.size() + entry.size()).
+static void spliceCompletion(InputState *s, const std::string &entry) {
+    size_t pre_len = s->completion_pre.size();
+    size_t entry_len = entry.size();
+    size_t tail_len = s->completion_tail.size();
+    size_t total = pre_len + entry_len + tail_len;
+    if (total > s->buflen) {
+        // Truncate tail first, then entry, then pre — keep what's most
+        // structurally important.
+        if (tail_len > 0) {
+            size_t drop = std::min(tail_len, total - s->buflen);
+            tail_len -= drop;
+            total -= drop;
+        }
+        if (total > s->buflen) {
+            size_t drop = std::min(entry_len, total - s->buflen);
+            entry_len -= drop;
+            total -= drop;
+        }
+    }
+    memcpy(s->buf, s->completion_pre.data(), pre_len);
+    memcpy(s->buf + pre_len, entry.data(), entry_len);
+    memcpy(s->buf + pre_len + entry_len, s->completion_tail.data(), tail_len);
+    s->buf[total] = '\0';
+    s->len = total;
+    s->pos = pre_len + entry_len;
+}
+
 // Apply current completion entry to the buffer.
 // Does NOT call bufferChanged() — completion cycling shouldn't reset the cache.
 static void applyCurrentCompletion(InputState *s) {
     s->suggestion.clear(); // Hide ghost text during completion cycling.
     if (s->completion_idx < s->completion_entries.size()) {
-        const std::string &entry = s->completion_entries[s->completion_idx];
-        strncpy(s->buf, entry.c_str(), s->buflen);
-        s->buf[s->buflen] = '\0';
-        s->len = s->pos = strlen(s->buf);
+        spliceCompletion(s, s->completion_entries[s->completion_idx]);
     } else {
         // Cycled back to original.
         strncpy(s->buf, s->completion_original.c_str(), s->buflen);
         s->buf[s->buflen] = '\0';
-        s->len = s->pos = strlen(s->buf);
+        s->len = strlen(s->buf);
+        s->pos = s->completion_end <= s->len ? s->completion_end : s->len;
     }
     notifyRender();
 }
 
-// Start completion with a set of entries and optional descriptions.
+// ---- Menu-complete helpers -------------------------------------------------
+
+// Display-width of an ASCII/UTF-8 string, ignoring ANSI escape runs. Completion
+// entries typically don't contain ANSI, but be defensive.
+static size_t entryDisplayWidth(const std::string &s) {
+    size_t w = 0;
+    for (size_t i = 0; i < s.size(); ) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == 0x1b) { // skip CSI/SS3 sequences
+            i++;
+            if (i < s.size() && (s[i] == '[' || s[i] == 'O')) i++;
+            while (i < s.size() && s[i] < 0x40) i++;
+            if (i < s.size()) i++;
+            continue;
+        }
+        size_t clen = graphemeNextLen(s.c_str(), i, s.size());
+        if (clen == 0) { i++; continue; }
+        w += graphemeClusterWidth(s.c_str() + i, clen);
+        i += clen;
+    }
+    return w;
+}
+
+// Compute grid dimensions and column width from the entry list and terminal
+// width. Uniform columns (width = longest-entry + 2 gap). Entries are bare
+// candidates (the lexer-driven completion returns just the replacement text),
+// so they render as-is — no prefix stripping.
+static void menuLayout(InputState *s) {
+    size_t n = s->completion_entries.size();
+    if (n == 0) { s->menu_rows = s->menu_cols = 0; return; }
+    s->menu_display_prefix_len = 0;
+    size_t longest = 0;
+    for (const auto &e : s->completion_entries) {
+        size_t w = entryDisplayWidth(e);
+        if (w > longest) longest = w;
+    }
+    const int gap = 2;
+    s->menu_col_width = static_cast<int>(longest) + gap;
+    int term_cols = getColumns();
+    int cols = (term_cols > 0 && s->menu_col_width > 0)
+                 ? std::max(1, term_cols / s->menu_col_width)
+                 : 1;
+    // Don't create empty trailing cells if we have fewer entries than cols.
+    if (cols > static_cast<int>(n)) cols = static_cast<int>(n);
+    s->menu_cols = cols;
+    s->menu_rows = (static_cast<int>(n) + cols - 1) / cols;
+}
+
+// Convert the grid to display-ready lines. Each line covers all visible
+// columns for one grid row. The selected cell (in state 2) is wrapped in
+// inverse video.
+static std::vector<std::string> menuRenderLines(InputState *s) {
+    std::vector<std::string> lines;
+    if (s->menu_rows == 0 || s->menu_cols == 0) return lines;
+    int viewport = std::min(s->menu_rows, s->menu_viewport_max);
+    int start = s->menu_viewport_start;
+    const int gap = 2;
+    for (int r = start; r < start + viewport && r < s->menu_rows; r++) {
+        std::string line;
+        for (int c = 0; c < s->menu_cols; c++) {
+            size_t idx = static_cast<size_t>(r) * s->menu_cols + c;
+            if (idx >= s->completion_entries.size()) break;
+            const std::string &full = s->completion_entries[idx];
+            const char *disp_ptr = full.c_str() + s->menu_display_prefix_len;
+            size_t disp_len = full.size() - s->menu_display_prefix_len;
+            std::string disp(disp_ptr, disp_len);
+            bool selected = (s->menu_state == 2 && r == s->menu_row && c == s->menu_col);
+            if (selected) line.append("\x1b[7m");
+            line.append(disp);
+            size_t ew = entryDisplayWidth(disp);
+            int pad = s->menu_col_width - gap - static_cast<int>(ew);
+            if (pad > 0) line.append(pad, ' ');
+            if (selected) line.append("\x1b[27m");
+            line.append(gap, ' ');
+        }
+        lines.push_back(std::move(line));
+    }
+    return lines;
+}
+
+// Apply the currently-selected entry to the buffer, splicing it into the
+// pre-menu position (buf[completion_start..completion_end]) and preserving
+// the surrounding text that was outside that range.
+static void menuApplySelection(InputState *s) {
+    size_t idx = static_cast<size_t>(s->menu_row) * s->menu_cols + s->menu_col;
+    if (idx >= s->completion_entries.size()) return;
+    spliceCompletion(s, s->completion_entries[idx]);
+    bufferChanged();
+}
+
+// Move the selection by (dr, dc). Wraps at edges in both directions. Adjusts
+// viewport so the new selection stays visible.
+static void menuNavigate(InputState *s, int dr, int dc) {
+    if (s->menu_rows == 0 || s->menu_cols == 0) return;
+    size_t n = s->completion_entries.size();
+    auto cellOccupied = [&](int r, int c) {
+        size_t idx = static_cast<size_t>(r) * s->menu_cols + c;
+        return idx < n;
+    };
+    int nr = s->menu_row + dr;
+    int nc = s->menu_col + dc;
+    // Horizontal wrap within the same row (left/right within the grid).
+    if (dc != 0) {
+        if (nc < 0) { nc = s->menu_cols - 1; while (!cellOccupied(nr, nc)) nc--; }
+        else if (nc >= s->menu_cols || !cellOccupied(nr, nc)) { nc = 0; }
+    }
+    // Vertical wrap.
+    if (dr != 0) {
+        if (nr < 0) {
+            // Wrap to bottom; find the last row that has a cell at nc.
+            nr = s->menu_rows - 1;
+            while (nr > 0 && !cellOccupied(nr, nc)) nr--;
+        } else if (nr >= s->menu_rows) {
+            nr = 0;
+        } else if (!cellOccupied(nr, nc)) {
+            // Last row is partial — skip empty trailing slot.
+            nr = 0;
+        }
+    }
+    s->menu_row = nr;
+    s->menu_col = nc;
+    // Scroll viewport to keep selection visible.
+    int viewport = std::min(s->menu_rows, s->menu_viewport_max);
+    if (s->menu_row < s->menu_viewport_start) {
+        s->menu_viewport_start = s->menu_row;
+    } else if (s->menu_row >= s->menu_viewport_start + viewport) {
+        s->menu_viewport_start = s->menu_row - viewport + 1;
+    }
+    menuApplySelection(s);
+}
+
+// Tab (or Shift-Tab) cycling in state 2. Advances one cell, wrapping to the
+// next row when hitting the right edge; from the last cell wraps back to
+// (0, 0).
+static void menuCycle(InputState *s, int dir) {
+    if (s->menu_rows == 0 || s->menu_cols == 0) return;
+    size_t n = s->completion_entries.size();
+    size_t idx = static_cast<size_t>(s->menu_row) * s->menu_cols + s->menu_col;
+    if (dir > 0) {
+        idx = (idx + 1) % n;
+    } else {
+        idx = (idx == 0) ? n - 1 : idx - 1;
+    }
+    s->menu_row = static_cast<int>(idx) / s->menu_cols;
+    s->menu_col = static_cast<int>(idx) % s->menu_cols;
+    int viewport = std::min(s->menu_rows, s->menu_viewport_max);
+    if (s->menu_row < s->menu_viewport_start) s->menu_viewport_start = s->menu_row;
+    else if (s->menu_row >= s->menu_viewport_start + viewport)
+        s->menu_viewport_start = s->menu_row - viewport + 1;
+    menuApplySelection(s);
+}
+
+static void menuClose(InputState *s, bool restore) {
+    if (restore && s->menu_state == 2) {
+        size_t len = s->menu_orig_len;
+        if (len > s->buflen) len = s->buflen;
+        memcpy(s->buf, s->menu_orig_buf.c_str(), len);
+        s->buf[len] = '\0';
+        s->len = len;
+        s->pos = s->menu_orig_pos <= len ? s->menu_orig_pos : len;
+        bufferChanged();
+    }
+    s->menu_state = 0;
+    s->menu_rows = s->menu_cols = 0;
+    s->menu_row = s->menu_col = 0;
+    s->menu_viewport_start = 0;
+    s->in_completion = 0;
+    s->completion_entries.clear();
+    s->completion_descriptions.clear();
+    s->completion_original.clear();
+    s->menu_orig_buf.clear();
+}
+
+// Start completion with a set of entries and optional descriptions. The
+// caller must have already set completion_start / completion_end /
+// completion_pre / completion_tail (the splice
+// boundary — typically word_end, past the word spanning the cursor).
 static void startCompletion(InputState *s, std::vector<std::string> entries, std::vector<std::string> descs = {}) {
     if (entries.empty()) return;
     s->completion_original = std::string(s->buf, s->len);
@@ -1278,33 +1535,111 @@ static int completeLine(InputState *s, char c) {
     if (!g_ctx || g_ctx->onCompletion.IsEmpty()) return c;
 
     if (c == 9) { // TAB
+        // Menu mode: Tab is the primary navigation key. State 1 (grid shown,
+        // no selection) → state 2 (select first); state 2 → cycle forward.
+        if (s->menu_state == 1) {
+            s->menu_orig_buf = std::string(s->buf, s->len);
+            s->menu_orig_len = s->len;
+            s->menu_orig_pos = s->pos;
+            s->menu_state = 2;
+            s->menu_row = 0;
+            s->menu_col = 0;
+            menuApplySelection(s);
+            notifyRender();
+            return 0;
+        }
+        if (s->menu_state == 2) {
+            menuCycle(s, +1);
+            notifyRender();
+            return 0;
+        }
         if (s->in_completion) {
-            // Already completing — cycle to next.
+            // Legacy cycle mode — advance to next candidate.
             nextCompletion(s);
             return 0;
         }
-        // First Tab — fetch completions from JS.
+        // First Tab — fetch completions from JS. Pass the full buffer + cursor
+        // position; JS uses the jsh lexer to find the token at the cursor and
+        // returns either a plain string[] (legacy: native infers word range)
+        // or { entries, replaceStart, replaceEnd } (preferred: explicit range).
         Napi::Env env = g_ctx->onCompletion.Env();
         Napi::HandleScope scope(env);
-        Napi::Value result = g_ctx->onCompletion.Call({Napi::String::New(env, s->buf)});
+        Napi::Value result = g_ctx->onCompletion.Call({
+            Napi::String::New(env, s->buf, s->len),
+            Napi::Number::New(env, static_cast<double>(s->pos)),
+        });
 
+        std::vector<std::string> entries;
+        size_t replaceStart = 0, replaceEnd = 0;
+        bool ok = false;
         if (result.IsArray()) {
-            auto entries = extractCompletionArray(result.As<Napi::Array>());
-            if (entries.empty()) return c;
-            startCompletion(s, std::move(entries));
-            return 0;
-        }
-        if (result.IsPromise()) {
-            s->waiting_for_completions = true;
-            if (g_ctx->poll) {
-                uv_poll_stop(g_ctx->poll);
+            entries = extractCompletionArray(result.As<Napi::Array>());
+            // Legacy shape: entries are full-prefix replacements covering
+            // buf[0..word_end]. Scan forward to the next whitespace.
+            replaceStart = 0;
+            replaceEnd = s->pos;
+            while (replaceEnd < s->len &&
+                   !std::isspace(static_cast<unsigned char>(s->buf[replaceEnd]))) {
+                replaceEnd++;
             }
+            ok = true;
+        } else if (result.IsObject() && !result.IsPromise()) {
+            Napi::Object obj = result.As<Napi::Object>();
+            if (obj.Has("entries") && obj.Get("entries").IsArray()) {
+                entries = extractCompletionArray(obj.Get("entries").As<Napi::Array>());
+            }
+            replaceStart = obj.Has("replaceStart") && obj.Get("replaceStart").IsNumber()
+                ? obj.Get("replaceStart").As<Napi::Number>().Uint32Value() : s->pos;
+            replaceEnd = obj.Has("replaceEnd") && obj.Get("replaceEnd").IsNumber()
+                ? obj.Get("replaceEnd").As<Napi::Number>().Uint32Value() : s->pos;
+            if (replaceStart > s->len) replaceStart = s->len;
+            if (replaceEnd > s->len) replaceEnd = s->len;
+            if (replaceEnd < replaceStart) replaceEnd = replaceStart;
+            ok = true;
+        } else if (result.IsPromise()) {
+            s->waiting_for_completions = true;
+            if (g_ctx->poll) uv_poll_stop(g_ctx->poll);
             return 0;
         }
-        return c;
+        if (!ok || entries.empty()) return c;
+
+        // Splice context (shared by cycle and menu modes).
+        s->completion_start = replaceStart;
+        s->completion_end = replaceEnd;
+        s->completion_pre = std::string(s->buf, replaceStart);
+        s->completion_tail = std::string(s->buf + replaceEnd, s->len - replaceEnd);
+        if (g_menu_complete && entries.size() >= 2) {
+            s->completion_original = std::string(s->buf, s->len);
+            s->completion_entries = std::move(entries);
+            s->completion_idx = 0;
+            s->menu_state = 1;
+            s->menu_row = 0;
+            s->menu_col = 0;
+            s->menu_viewport_start = 0;
+            menuLayout(s);
+            notifyRender();
+            return 0;
+        }
+        startCompletion(s, std::move(entries));
+        return 0;
     }
 
-    // Non-TAB while in completion: accept current completion and process char.
+    // Non-TAB while in completion / menu mode.
+    if (s->menu_state != 0) {
+        // Enter in menu mode = accept the selection and return to the prompt
+        // (don't submit the line — user hits Enter again to run the command).
+        // Swallow Enter here so the main switch's case ENTER doesn't trigger.
+        if (c == ENTER) {
+            menuClose(s, /*restore=*/false);
+            notifyRender();
+            return 0;
+        }
+        // Any other key: accept current state and dispatch the key normally.
+        // State 1 closes without touching buf; state 2 keeps the current
+        // selection in buf.
+        menuClose(s, /*restore=*/false);
+        return c;
+    }
     // If completion ends with '/' and user types '/', swallow the duplicate.
     if (c == '/' && s->len > 0 && s->buf[s->len - 1] == '/') {
         s->in_completion = 0;
@@ -1485,7 +1820,7 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
     }
 
     // Completion handling
-    if ((s->in_completion || c == 9) && !g_ctx->onCompletion.IsEmpty()) {
+    if ((s->in_completion || s->menu_state != 0 || c == 9) && !g_ctx->onCompletion.IsEmpty()) {
         int retval = completeLine(s, c);
         if (retval == 0) return 0; // Consumed by completion
         if (c == 9 && retval == 9) return 0; // Tab with no completions — don't insert literal tab
@@ -1494,6 +1829,14 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
 
     switch (c) {
     case ENTER:
+        // Menu mode: Enter accepts the current selection and stays at the
+        // prompt (buffer already holds the tentative insertion). Doesn't
+        // submit the line — user hits Enter again to run the command.
+        if (s->menu_state != 0) {
+            menuClose(s, /*restore=*/false);
+            notifyRender();
+            return 0;
+        }
         // Remove temp history entry
         if (history_len > 0) {
             history_len--;
@@ -1625,6 +1968,14 @@ static int editFeed(InputState *s, char **out_line, int *out_errno) {
         // Node event loop.
         struct pollfd pfd = { s->ifd, POLLIN, 0 };
         if (poll(&pfd, 1, 0) <= 0) {
+            // In menu mode, bare Esc cancels immediately (don't pend — user
+            // wants out now). Arrow keys still work because their ESC byte
+            // arrives together with `[A` and poll-0 sees data.
+            if (s->menu_state != 0) {
+                menuClose(s, /*restore=*/true);
+                notifyRender();
+                break;
+            }
             s->esc_pending = true;
             break;
         }
@@ -1998,27 +2349,69 @@ static Napi::Value SetWordChars(const Napi::CallbackInfo &info) {
     return env.Undefined();
 }
 
+static Napi::Value SetCompletionStyle(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() >= 1 && info[0].IsString()) {
+        std::string s = info[0].As<Napi::String>().Utf8Value();
+        g_menu_complete = (s == "menu");
+    }
+    return env.Undefined();
+}
+
 static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
     if (!g_state.waiting_for_completions) return env.Undefined();
     g_state.waiting_for_completions = false;
 
-    // Extract completion entries and optional descriptions.
+    // Args: (entries, descs, replaceStart?, replaceEnd?). replaceStart < 0
+    // means "legacy: compute word_end from buf" (current cursor forward to
+    // next whitespace).
     std::vector<std::string> entries;
     std::vector<std::string> descs;
+    int rs = -1, re_ = -1;
     if (info.Length() > 0 && info[0].IsArray()) {
         entries = extractCompletionArray(info[0].As<Napi::Array>());
     }
     if (info.Length() > 1 && info[1].IsArray()) {
         descs = extractCompletionArray(info[1].As<Napi::Array>());
     }
+    if (info.Length() > 2 && info[2].IsNumber()) rs = info[2].As<Napi::Number>().Int32Value();
+    if (info.Length() > 3 && info[3].IsNumber()) re_ = info[3].As<Napi::Number>().Int32Value();
 
-    // Apply completions.
     if (!entries.empty()) {
-        startCompletion(&g_state, std::move(entries), std::move(descs));
+        size_t replaceStart, replaceEnd;
+        if (rs < 0 || re_ < 0) {
+            replaceStart = 0;
+            replaceEnd = g_state.pos;
+            while (replaceEnd < g_state.len &&
+                   !std::isspace(static_cast<unsigned char>(g_state.buf[replaceEnd]))) {
+                replaceEnd++;
+            }
+        } else {
+            replaceStart = std::min(static_cast<size_t>(rs), g_state.len);
+            replaceEnd = std::min(static_cast<size_t>(re_), g_state.len);
+            if (replaceEnd < replaceStart) replaceEnd = replaceStart;
+        }
+        g_state.completion_start = replaceStart;
+        g_state.completion_end = replaceEnd;
+        g_state.completion_pre = std::string(g_state.buf, replaceStart);
+        g_state.completion_tail = std::string(g_state.buf + replaceEnd, g_state.len - replaceEnd);
+        if (g_menu_complete && entries.size() >= 2) {
+            g_state.completion_original = std::string(g_state.buf, g_state.len);
+            g_state.completion_entries = std::move(entries);
+            g_state.completion_descriptions = std::move(descs);
+            g_state.completion_idx = 0;
+            g_state.menu_state = 1;
+            g_state.menu_row = 0;
+            g_state.menu_col = 0;
+            g_state.menu_viewport_start = 0;
+            menuLayout(&g_state);
+            notifyRender();
+        } else {
+            startCompletion(&g_state, std::move(entries), std::move(descs));
+        }
     }
 
-    // Resume stdin polling.
     if (g_ctx && g_ctx->poll && g_state.active) {
         uv_poll_start(g_ctx->poll, UV_READABLE, pollCallback);
     }
@@ -2124,6 +2517,7 @@ Napi::Object InitInputEngine(Napi::Env env, Napi::Object exports) {
     exports.Set("inputInsertAtCursor", Napi::Function::New(env, InsertAtCursor));
     exports.Set("inputSetCompletions", Napi::Function::New(env, SetCompletions));
     exports.Set("inputSetWordChars",  Napi::Function::New(env, SetWordChars));
+    exports.Set("inputSetCompletionStyle", Napi::Function::New(env, SetCompletionStyle));
     exports.Set("inputEAGAIN",        Napi::Function::New(env, GetEAGAIN));
     // Fd utilities (previously in linenoise.cc)
     exports.Set("closeFd",            Napi::Function::New(env, CloseFd));

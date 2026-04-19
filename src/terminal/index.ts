@@ -4,7 +4,7 @@ import { Renderer } from "./renderer.js";
 import { WidgetManager } from "./widgets.js";
 import type { WidgetDef, WidgetHandle, WidgetZone, WidgetOptions } from "./widgets.js";
 import type { Frame } from "./renderer.js";
-import type { CompletionEntry } from "../completion/index.js";
+import type { CompletionEntry, CompletionResult } from "../completion/index.js";
 import { normalizeEntries } from "../completion/index.js";
 import { displayWidth, truncateToWidth } from "./ansi.js";
 
@@ -21,6 +21,7 @@ interface InputState {
     searchMatch?: boolean;
     lineSearchQuery?: string; // Ctrl-S inline forward search
     completionDesc?: string;  // description of current completion entry
+    menuLines?: string[];     // menu-complete grid rows (when enabled)
 }
 
 interface RenderLineResult {
@@ -32,7 +33,7 @@ interface NativeInputEngine {
     inputStart: (callbacks: {
         onRender: (state: InputState) => void;
         onLine: (line: string | null, errno?: number) => void;
-        onCompletion?: (input: string) => string[] | Promise<string[]> | unknown;
+        onCompletion?: (input: string, cursor: number) => string[] | Promise<string[]> | unknown;
         onEscResponse?: (type: "DCS" | "OSC", payload: string) => void;
     }) => void;
     inputStop: () => void;
@@ -46,7 +47,7 @@ interface NativeInputEngine {
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
     inputInsertAtCursor: (text: string) => void;
-    inputSetCompletions: (entries: string[], descs: string[]) => void;
+    inputSetCompletions: (entries: string[], descs: string[], replaceStart?: number, replaceEnd?: number) => void;
     inputEAGAIN: () => number;
 }
 
@@ -56,7 +57,8 @@ export class TerminalUI {
     private widgets: WidgetManager;
 
     private colorizeFn: ((input: string, context?: string) => string) | null = null;
-    private completionFn: ((input: string) => CompletionEntry[] | Promise<CompletionEntry[]>) | null = null;
+    private completionFn: ((input: string, cursor: number) =>
+        CompletionEntry[] | Promise<CompletionEntry[]> | CompletionResult | Promise<CompletionResult>) | null = null;
     private suggestionFn: ((input: string) => string | null | Promise<string | null>) | null = null;
     private lastState: InputState | null = null;
     private lineCallback: ((line: string | null, errno?: number) => void) | null = null;
@@ -111,24 +113,35 @@ export class TerminalUI {
             onRender: (state: InputState) => this.onRender(state),
             onLine: (line: string | null, errno?: number) => this.onLine(line, errno),
             onCompletion: this.completionFn
-                ? (input: string) => {
-                    const result = this.completionFn!(input);
-                    if (result && typeof (result as Promise<CompletionEntry[]>).then === "function") {
-                        // Async: C++ will detect the promise and stop polling.
-                        // Chain .then to deliver results when ready.
-                        (result as Promise<CompletionEntry[]>).then(
-                            entries => {
-                                const { texts, descs } = normalizeEntries(entries);
-                                this.native.inputSetCompletions(texts, descs);
+                ? (input: string, cursor: number) => {
+                    const result = this.completionFn!(input, cursor);
+                    // Normalize shape: legacy string[] | CompletionResult,
+                    // possibly inside a Promise.
+                    const normalize = (r: CompletionEntry[] | CompletionResult) => {
+                        if (Array.isArray(r)) {
+                            const { texts, descs } = normalizeEntries(r);
+                            return { texts, descs, replaceStart: -1, replaceEnd: -1 };
+                        }
+                        const { texts, descs } = normalizeEntries(r.entries);
+                        return { texts, descs, replaceStart: r.replaceStart, replaceEnd: r.replaceEnd };
+                    };
+                    if (result && typeof (result as Promise<unknown>).then === "function") {
+                        (result as Promise<CompletionEntry[] | CompletionResult>).then(
+                            r => {
+                                const n = normalize(r);
+                                this.native.inputSetCompletions(n.texts, n.descs, n.replaceStart, n.replaceEnd);
                             },
-                            () => this.native.inputSetCompletions([], []),
+                            () => this.native.inputSetCompletions([], [], -1, -1),
                         );
-                        return result; // Return the promise so C++ sees IsPromise()
+                        return result; // C++ sees IsPromise()
                     }
-                    // Sync: normalize and return texts only (C++ reads directly).
-                    // Sync completions (file/command) are plain strings without descriptions.
-                    const { texts } = normalizeEntries(result as CompletionEntry[]);
-                    return texts;
+                    const n = normalize(result as CompletionEntry[] | CompletionResult);
+                    // Sync: return an object C++ inspects. Legacy callers that
+                    // returned string[] get replaceStart/replaceEnd = -1 which
+                    // C++ interprets as "compute word_end yourself".
+                    return n.replaceStart >= 0
+                        ? { entries: n.texts, replaceStart: n.replaceStart, replaceEnd: n.replaceEnd }
+                        : n.texts;
                 }
                 : undefined,
             onEscResponse: this.escResponseFn
@@ -181,7 +194,8 @@ export class TerminalUI {
         this.colorizeFn = fn;
     }
 
-    setCompletion(fn: ((input: string) => CompletionEntry[] | Promise<CompletionEntry[]>) | null): void {
+    setCompletion(fn: ((input: string, cursor: number) =>
+        CompletionEntry[] | Promise<CompletionEntry[]> | CompletionResult | Promise<CompletionResult>) | null): void {
         this.completionFn = fn;
     }
 
@@ -465,11 +479,19 @@ export class TerminalUI {
             inputLines.push(searchIndicatorPrefix + "_" + searchIndicatorSuffix);
         }
 
+        // Menu-complete grid (opt-in via jsh.setCompletionStyle("menu")). Each
+        // line is pre-composed by the native engine — columns padded, selected
+        // cell wrapped in inverse video — so we just append them below the
+        // input. Cursor stays on the input line (no override).
+        if (state.menuLines && state.menuLines.length > 0) {
+            for (const ln of state.menuLines) inputLines.push(ln);
+        }
+
         // Append ghost text to display (not cached — so it doesn't appear in frozen lines).
         // Truncate so the rendered line + suggestion fits in (cols - 1) cells —
         // reserving the last column avoids the xenl pending-wrap glitch that
         // would otherwise wrap the prompt.
-        if (searchIndicatorPrefix === null && state.suggestion && state.pos === state.len && inputLines.length > 0) {
+        if (searchIndicatorPrefix === null && !(state.menuLines && state.menuLines.length > 0) && state.suggestion && state.pos === state.len && inputLines.length > 0) {
             const lastIdx = inputLines.length - 1;
             const used = displayWidth(inputLines[lastIdx]!);
             const budget = Math.max(0, state.cols - 1 - used);
@@ -492,7 +514,7 @@ export class TerminalUI {
 
         // Append completion description (dimmed, after cursor on the input line).
         // Same width budget as the ghost-text path above.
-        if (searchIndicatorPrefix === null && state.completionDesc && inputLines.length > 0) {
+        if (searchIndicatorPrefix === null && !(state.menuLines && state.menuLines.length > 0) && state.completionDesc && inputLines.length > 0) {
             const lastIdx = inputLines.length - 1;
             const used = displayWidth(inputLines[lastIdx]!);
             const budget = Math.max(0, state.cols - 1 - used - 1); // -1 for leading space

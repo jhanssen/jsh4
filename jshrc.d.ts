@@ -402,6 +402,15 @@ declare const jsh: {
      */
     setWordChars(chars: string): void;
 
+    /**
+     * Completion-on-Tab behavior.
+     *  - `"cycle"` (default): repeated Tab inserts each candidate in turn.
+     *  - `"menu"`: zsh-style — first Tab shows a grid of matches below the
+     *    input; second Tab enters navigation mode (Tab / arrow keys move the
+     *    selection, Enter accepts, Esc cancels).
+     */
+    setCompletionStyle(style: "cycle" | "menu"): void;
+
     // ---- Aliases ----
 
     alias(name: string, expansion: string): void;
