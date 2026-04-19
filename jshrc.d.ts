@@ -169,6 +169,18 @@ interface MbApi {
      * no-op while the WS is not connected.
      */
     selectCommand(id: number | null): void;
+    /**
+     * Fetch the Nth most recently completed OSC 133 command on this pane.
+     * `index` 0 is the most recent, 1 the previous, and so on. Resolves with
+     * `null` if `index` is out of range. Requires the mb-applet to have been
+     * loaded with the `shell.commands` permission.
+     */
+    getCommand(index: number): Promise<MbCommandRecord | null>;
+    /**
+     * Number of completed commands currently retained in the pane's bounded
+     * ring (the upper bound for `getCommand`). Requires `shell.commands`.
+     */
+    numCommands(): Promise<number>;
     /** True while the WS connection to the applet is live. */
     readonly connected: boolean;
     /**

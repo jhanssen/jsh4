@@ -138,6 +138,27 @@ function handleMessage(conn: MbWsConnection, state: ConnState, raw: string | Arr
             state.pane.selectCommand(msg.id);
             break;
         }
+        case "getCommand": {
+            // pane.commands is oldest-first; index 0 = most recent.
+            const cmds = state.pane.commands;
+            const cmd = msg.index >= 0 && msg.index < cmds.length
+                ? cmds[cmds.length - 1 - msg.index]
+                : null;
+            send(conn, {
+                type: "commandResult",
+                reqId: msg.reqId,
+                command: cmd ? wireCommand(cmd) : null,
+            });
+            break;
+        }
+        case "getCommandCount": {
+            send(conn, {
+                type: "commandCountResult",
+                reqId: msg.reqId,
+                count: state.pane.commands.length,
+            });
+            break;
+        }
         case "getSelection": {
             const sel = state.pane.selection;
             if (!sel) {

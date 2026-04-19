@@ -34,6 +34,8 @@ export interface MbApi {
     createPopup(opts: CreatePopupOptions): Promise<PopupHandle>;
     getSelectedCommand(): Promise<MbCommandRecord | null>;
     selectCommand(id: number | null): void;
+    getCommand(index: number): Promise<MbCommandRecord | null>;
+    numCommands(): Promise<number>;
     getSelection(): Promise<string | null>;
     getClipboard(source?: ClipboardSource): Promise<string>;
     setClipboard(text: string, source?: ClipboardSource): Promise<void>;
@@ -214,6 +216,22 @@ class MbClient implements MbApi {
             }
             return;
         }
+        if (msg.type === "commandResult") {
+            const p = this.pending.get(msg.reqId);
+            if (p) {
+                this.pending.delete(msg.reqId);
+                p.resolve(msg.command);
+            }
+            return;
+        }
+        if (msg.type === "commandCountResult") {
+            const p = this.pending.get(msg.reqId);
+            if (p) {
+                this.pending.delete(msg.reqId);
+                p.resolve(msg.count);
+            }
+            return;
+        }
         if (msg.type === "selectionResult") {
             const p = this.pending.get(msg.reqId);
             if (p) {
@@ -291,6 +309,32 @@ class MbClient implements MbApi {
     selectCommand(id: number | null): void {
         if (!this.ready) return;
         this.send({ type: "selectCommand", id });
+    }
+
+    async getCommand(index: number): Promise<MbCommandRecord | null> {
+        await this.awaitReady();
+        const reqId = this.nextReqId++;
+        const p = new Promise<MbCommandRecord | null>((resolve, reject) => {
+            this.pending.set(reqId, {
+                resolve: (v) => resolve(v as MbCommandRecord | null),
+                reject,
+            });
+        });
+        this.send({ type: "getCommand", reqId, index });
+        return p;
+    }
+
+    async numCommands(): Promise<number> {
+        await this.awaitReady();
+        const reqId = this.nextReqId++;
+        const p = new Promise<number>((resolve, reject) => {
+            this.pending.set(reqId, {
+                resolve: (v) => resolve(v as number),
+                reject,
+            });
+        });
+        this.send({ type: "getCommandCount", reqId });
+        return p;
     }
 
     async getSelection(): Promise<string | null> {

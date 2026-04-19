@@ -23,6 +23,8 @@ export type ClientMessage =
     | { type: "closePopup"; id: string }
     | { type: "getSelectedCommand"; reqId: number }
     | { type: "selectCommand"; id: number | null }
+    | { type: "getCommand"; reqId: number; index: number }
+    | { type: "getCommandCount"; reqId: number }
     | { type: "getSelection"; reqId: number }
     | { type: "getClipboard"; reqId: number; source?: ClipboardSource }
     | { type: "setClipboard"; reqId: number; text: string; source?: ClipboardSource };
@@ -34,6 +36,8 @@ export type ServerMessage =
     | { type: "createPopupResult"; reqId: number; id: string }
     | { type: "popupClosed"; id: string }
     | { type: "selectedCommandResult"; reqId: number; command: MbCommandRecord | null }
+    | { type: "commandResult"; reqId: number; command: MbCommandRecord | null }
+    | { type: "commandCountResult"; reqId: number; count: number }
     | { type: "selectionResult"; reqId: number; text: string | null }
     | { type: "clipboardResult"; reqId: number; text: string }
     | { type: "setClipboardResult"; reqId: number };
