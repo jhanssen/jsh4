@@ -281,8 +281,7 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         for (const [name, value] of Object.entries(rc)) {
             if (name === "default") continue;
             if (typeof value === "function") {
-                const fn = value as JsPipelineFunction & { atOnly?: boolean };
-                registerJsFunction(name, fn, { atOnly: fn.atOnly === true });
+                registerJsFunction(name, value as JsPipelineFunction);
             }
         }
     } catch (e: unknown) {

@@ -35,6 +35,15 @@ type JsPipelineFunction = (
     stdin: AsyncIterable<string> | string | null
 ) => unknown;
 
+interface JsFunctionOptions {
+    /**
+     * When true, the function is callable only via `@name`. Bare-name
+     * resolution skips it, so an alias, shell function, builtin, or PATH
+     * command with the same name still wins for unprefixed invocation.
+     */
+    atOnly?: boolean;
+}
+
 // ---- Exec -------------------------------------------------------------------
 
 interface ExecResult {
@@ -443,7 +452,7 @@ declare const jsh: {
     // ---- Functions ----
 
     /** Register a JS function as an @ pipeline function. */
-    registerJsFunction(name: string, fn: JsPipelineFunction): void;
+    registerJsFunction(name: string, fn: JsPipelineFunction, opts?: JsFunctionOptions): void;
 
     // ---- Completion ----
 
