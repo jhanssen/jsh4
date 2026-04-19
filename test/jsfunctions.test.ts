@@ -393,31 +393,27 @@ export async function emit(args, stdin) {
         assert.match(stderr, /error-msg/);
     });
 
-    it("should preserve write order when many concurrent writers target the same fd", () => {
-        // Fire 100 echo-via-builtin writes to stderr from concurrent async
-        // chains (Promise.all over a JS function that calls jsh.exec on
-        // builtins). Per-fd queue must serialize them in enqueue order.
-        // Using stderr because pipelines don't redirect it, so all writers
-        // share fd 2.
+    it("should preserve write order across concurrent writers to the same fd", () => {
+        // Fire many writes from independent async chains via jsh.stdout.write.
+        // Each write is enqueued before any awaits the prior, so without the
+        // per-fd queue they could interleave in arbitrary order.
         const rc = `
 export async function fanout() {
     const tasks = [];
-    for (let i = 0; i < 100; i++) {
-        tasks.push(jsh.exec("printf 'line%03d\\n' " + i, { stderr: "merge" }));
+    for (let i = 0; i < 200; i++) {
+        const tag = "line" + String(i).padStart(3, "0") + "\\n";
+        tasks.push(jsh.stdout.write(tag));
     }
-    const results = await Promise.all(tasks);
-    return results.map(r => r.stdout).join("\\n") + "\\n";
+    await Promise.all(tasks);
 }
 `;
         const { stdout } = withRc(rc, "fanout");
         const lines = stdout.split("\n").filter(Boolean);
-        assert.strictEqual(lines.length, 100);
-        // All 100 lines present (no drops, no duplicates).
-        const seen = new Set(lines);
-        assert.strictEqual(seen.size, 100);
-        for (let i = 0; i < 100; i++) {
-            assert.ok(seen.has(`line${String(i).padStart(3, "0")}`),
-                `missing line${String(i).padStart(3, "0")}`);
+        assert.strictEqual(lines.length, 200);
+        // Per-fd queue guarantees enqueue order.
+        for (let i = 0; i < 200; i++) {
+            assert.strictEqual(lines[i], `line${String(i).padStart(3, "0")}`,
+                `mismatch at index ${i}: got ${lines[i]}`);
         }
     });
 });
