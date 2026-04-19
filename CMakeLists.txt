@@ -26,6 +26,7 @@ add_subdirectory(3rdparty)
 set(ADDON_SRC
   ${CMAKE_SOURCE_DIR}/src/native/addon.cc
   ${CMAKE_SOURCE_DIR}/src/native/executor.cc
+  ${CMAKE_SOURCE_DIR}/src/native/history-writer.cc
   ${CMAKE_SOURCE_DIR}/src/native/input-engine.cc
 )
 

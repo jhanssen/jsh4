@@ -42,7 +42,7 @@ interface NativeInputEngine {
     inputRenderLine: (prompt: string, colorized: string, rprompt: string, cols: number, rawBuf: string, rawPos: number) => RenderLineResult;
     inputHistoryAdd: (line: string) => void;
     inputHistorySetMaxLen: (len: number) => void;
-    inputHistorySave: (path: string) => number;
+    inputHistorySave: () => void;
     inputHistoryLoad: (path: string) => number;
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
@@ -236,7 +236,7 @@ export class TerminalUI {
 
     historyAdd(line: string): void { this.native.inputHistoryAdd(line); }
     historySetMaxLen(len: number): void { this.native.inputHistorySetMaxLen(len); }
-    historySave(path: string): number { return this.native.inputHistorySave(path); }
+    historySave(): void { this.native.inputHistorySave(); }
     historyLoad(path: string): number { return this.native.inputHistoryLoad(path); }
 
     // ---- Repaint ----

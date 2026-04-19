@@ -40,7 +40,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputRenderLine: (prompt: string, colorized: string, rprompt: string, cols: number, rawBuf: string, rawPos: number) => { line: string; cursorCol: number };
     inputHistoryAdd: (line: string) => void;
     inputHistorySetMaxLen: (len: number) => void;
-    inputHistorySave: (path: string) => number;
+    inputHistorySave: () => void;
     inputHistoryLoad: (path: string) => number;
     inputSetSuggestion: (id: number, text: string) => void;
     inputSetInput: (text: string) => void;
@@ -184,7 +184,7 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
             await runTrap("EXIT", executeString);
         });
         process.on("exit", () => {
-            ui!.historySave(historyFile);
+            ui!.historySave();
             popTitle();
         });
 

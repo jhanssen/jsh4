@@ -1,4 +1,5 @@
 #include "input-engine.h"
+#include "history-writer.h"
 #include <uv.h>
 #include <algorithm>
 #include <cerrno>
@@ -226,13 +227,17 @@ static char **history = nullptr;
 static int history_len = 0;
 static int history_max_len = 100;
 
-int historyAdd(const char *line) {
+// True while historyLoad() is populating the in-memory array from disk.
+// Suppresses the persist-on-add path so we don't re-append entries we're
+// currently reading.
+static bool history_loading = false;
+
+static int historyAddInMemory(const char *line) {
     if (history_max_len == 0) return 0;
     if (!history) {
         history = (char **)calloc(history_max_len, sizeof(char*));
         if (!history) return 0;
     }
-    // Don't add duplicates
     if (history_len > 0 && !strcmp(history[history_len-1], line)) return 0;
     char *copy = strdup(line);
     if (!copy) return 0;
@@ -243,6 +248,14 @@ int historyAdd(const char *line) {
     }
     history[history_len++] = copy;
     return 1;
+}
+
+int historyAdd(const char *line) {
+    int added = historyAddInMemory(line);
+    if (added && !history_loading) {
+        jsh::hist_writer::enqueue(std::string(line));
+    }
+    return added;
 }
 
 int historySetMaxLen(int len) {
@@ -264,68 +277,29 @@ int historySetMaxLen(int len) {
     return 1;
 }
 
-int historySave(const char *filename) {
-    FILE *fp = fopen(filename, "w");
-    if (!fp) return -1;
-    for (int j = 0; j < history_len; j++) {
-        const char *entry = history[j];
-        // Multi-line entries: write each line with trailing backslash for continuation.
-        const char *p = entry;
-        while (*p) {
-            const char *nl = strchr(p, '\n');
-            if (nl) {
-                fwrite(p, 1, nl - p, fp);
-                fputs("\\\n", fp); // trailing \ indicates continuation
-                p = nl + 1;
-            } else {
-                fputs(p, fp);
-                fputc('\n', fp);
-                break;
-            }
-        }
-        if (entry[0] == '\0' || (strlen(entry) > 0 && entry[strlen(entry)-1] == '\n')) {
-            fputc('\n', fp);
-        }
-    }
-    fclose(fp);
-    return 0;
-}
+// History persistence is delegated to the async writer in history-writer.cc:
+//  - Load reads the file once and invokes historyAddInMemory for each entry.
+//    A failed load marks the append path disabled so we never risk
+//    overwriting a file we couldn't parse.
+//  - Every successful historyAdd() queues the new entry for append on a
+//    dedicated worker thread — no in-place truncation, no event-loop block.
+//  - Save (called on exit) just drains the writer; the file itself has been
+//    kept up-to-date incrementally.
 
 int historyLoad(const char *filename) {
-    FILE *fp = fopen(filename, "r");
-    if (!fp) return -1;
-    char buf[4096];
-    std::string entry;
-    bool continuation = false;
-    while (fgets(buf, sizeof(buf), fp)) {
-        // Strip trailing \n and \r.
-        size_t len = strlen(buf);
-        while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) len--;
-        buf[len] = '\0';
-        // Check for continuation (trailing backslash).
-        if (len > 0 && buf[len-1] == '\\') {
-            buf[len-1] = '\0';
-            if (continuation) entry += '\n';
-            entry += buf;
-            continuation = true;
-        } else {
-            if (continuation) {
-                entry += '\n';
-                entry += buf;
-                historyAdd(entry.c_str());
-                entry.clear();
-                continuation = false;
-            } else {
-                historyAdd(buf);
-            }
-        }
-    }
-    // Flush any trailing continuation.
-    if (continuation && !entry.empty()) {
-        historyAdd(entry.c_str());
-    }
-    fclose(fp);
-    return 0;
+    history_loading = true;
+    auto status = jsh::hist_writer::load(filename, [](const std::string &entry) {
+        historyAddInMemory(entry.c_str());
+    });
+    history_loading = false;
+    return status == jsh::hist_writer::LoadStatus::Ok ? 0 : -1;
+}
+
+void historySave() {
+    // Writer has been appending commands as they were accepted; nothing to
+    // do here besides flushing pending entries and joining the thread.
+    // Bounded at 1s so a foreign-held flock doesn't hang the shell exit.
+    jsh::hist_writer::shutdown(1000);
 }
 
 // ---- Input state -----------------------------------------------------------
@@ -2383,10 +2357,8 @@ static Napi::Value HistorySetMaxLen(const Napi::CallbackInfo &info) {
 }
 
 static Napi::Value HistorySave(const Napi::CallbackInfo &info) {
-    if (info.Length() > 0 && info[0].IsString())
-        return Napi::Number::New(info.Env(),
-            historySave(info[0].As<Napi::String>().Utf8Value().c_str()));
-    return Napi::Number::New(info.Env(), -1);
+    historySave();
+    return info.Env().Undefined();
 }
 
 static Napi::Value HistoryLoad(const Napi::CallbackInfo &info) {
