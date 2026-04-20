@@ -302,6 +302,173 @@ The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction
 - [ ] **DESIGN.md** — Document the object channel architecture, schema cache layout, sink/formatter pattern.
 - [ ] **`@xattr`** — User-level access to extended attributes (read/list/set), mirroring the macOS `xattr` command. Native bindings already include `hasXattr`; add `listxattr` + `getxattr`.
 
+#### MasterBandit applet host (jsh `@table` as first applet)
+
+Generalize MB into an **applet host**: any program can ship a JS applet bundle that renders interactive UI inline at scrollback anchor points. jsh's `@table` is the first applet; future ones (htop replacement, db client, jq UI, image viewer, etc.) follow the same protocol. The `mb-applet/` package skeleton already exists (`src/applet.ts`, `src/protocol.ts`) — this work formalizes its contract.
+
+**Architecture:**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ MB host                                                      │
+│   ├─ Applet registry (loaded JS bundles per OSC namespace)   │
+│   ├─ Per-anchor widget surface (TerminalEmulator-like)       │
+│   └─ WS multiplexer (data channels keyed by UUID)            │
+└──────────────────────────────────────────────────────────────┘
+        ▲                         ▲
+        │ OSC anchors             │ data channels
+        │ (PTY)                   │ (WS)
+┌───────┴────────┐        ┌───────┴──────────┐
+│ jsh            │        │ Other host app   │
+│  emits @table  │        │  emits its OSC   │
+│  ships its     │        │  ships its       │
+│  applet bundle │        │  applet bundle   │
+└────────────────┘        └──────────────────┘
+```
+
+**Applet contract (running on the MB side):**
+```ts
+// Shipped by each host program; loaded by MB at startup.
+export interface Applet {
+    namespace: string;                                     // e.g. "jsh-table"
+    onAnchor(anchor: Anchor, channel: WsChannel): Lifecycle;
+}
+export interface Anchor {
+    surface: TerminalEmulator;     // bounded virtual terminal at the row
+    onResize(cb: (cols: number, rows: number) => void): void;
+    onFocus(cb: () => void): void;
+    onBlur(cb: () => void): void;
+    onClose(cb: () => void): void;
+    setHeight(rows: number): void; // applet-driven sizing
+}
+export interface Lifecycle { dispose(): void; }
+```
+
+The applet writes TUI escapes to the surface as if it's a small terminal. Same model as ncurses, but rendered inline at a fixed scrollback row instead of full-screen. Navigation, search, filter, sort — all standard TUI patterns. Applets can use existing TUI libraries (blessed, ink, etc.) if desired.
+
+**Wire format (PTY OSC anchor + WS data channel):**
+```
+\e]7777;<namespace>;<uuid>;begin\x07
+... applet runs ...
+\e]7777;<namespace>;<uuid>;end\x07
+```
+- `<namespace>` selects the applet (`jsh-table`, `jsh-chart`, `othervendor-foo`, ...).
+- `<uuid>` keys the WS data channel for this anchor.
+- MB looks up the applet by namespace, instantiates it at the anchor, and routes a WS channel to it.
+- `cancel` instead of `end` invalidates the anchor on failure.
+
+**Capability detection.** New `supports-applets` bit in the existing MB handshake (cached). Each emission also re-checks `mb.connected`. Without the cap or with WS down, the host emits its plain text fallback.
+
+**Applet discovery / loading.** Three options to settle:
+- **Filesystem**: `~/.config/mb/applets/<namespace>/dist/applet.js` — discovered at MB startup.
+- **Per-app advertise**: at handshake the connected app sends `applets: [{namespace, bundleUrl}]`; MB fetches.
+- **Hybrid**: filesystem-installed for trusted/preinstalled, advertise for ephemeral.
+
+Security note: loading JS from an attached program is dangerous. Probably default to filesystem-only; advertise mode requires explicit user opt-in.
+
+**jsh's `@table` applet (the first concrete instance):**
+- Lives in `mb-applet/src/` (skeleton already there).
+- Namespace: `jsh-table`.
+- Renders the table grid in a bounded TerminalEmulator surface. Arrow / `j`/`k` to scroll, `/` for incremental fuzzy filter, `s` to sort by column, Enter to copy a cell value back to the shell prompt.
+- Schema-aware rendering: numbers right-align, dates as relative time, booleans as ✓/✗, file modes symbolic.
+- Rows streamed in over the WS channel, applet renders incrementally.
+
+**Failure path (mid-stream WS drop)** — same as before:
+- **Default (buffered)** `@table`: keeps a row buffer; on cancel, jsh emits the full text fallback inline. No data loss. Bound = total table size; fine for `@ls`/`@ps`/finite results.
+- **`@table --stream`**: opt-in for unbounded sources (`tail -f | @from-jsonl | @table`). Rows go straight to WS, no buffer. On cancel: emit a one-line notice; pushed data is lost.
+
+**Open questions to settle on the protocol:**
+- OSC namespace number (pick something safe / unassigned, vendor-prefix like `\e]7777;jsh-table` or split: `\e]7777;<vendor>;<applet>`).
+- UUID provenance — pure client-random, or salted with a per-session secret exchanged at handshake (defends against external programs spoofing anchors).
+- Anchor sizing model — applet-driven `setHeight(n)`, or MB allocates a fixed window and applet must fit?
+- Anchor lifecycle when scrolled out of viewport — keep alive (memory cost), unmount + replay from cached data on scroll-back, or freeze rendered text only?
+- Versioning — `\e]7777;v1;table;...` vs cap bits per version.
+- Applet sandboxing — full WebView, isolated JS realm, vm context? Trade-off between expressivity and trust.
+
+**User interaction model.** Reuses the existing OSC 133 navigation primitive in MB — widget anchors fold into the same "previous/next block" list as command-output blocks, no parallel selection model. Three states:
+
+```
+NORMAL         scrollback nav (Tab / arrow / mouse), no widget special
+   │ select an anchor (existing OSC 133 nav)
+   ▼
+SELECTED       anchor highlighted, keys still go to host shell
+   │ Enter (or dedicated keybind) to focus
+   ▼
+FOCUSED        keystrokes routed to the applet's TerminalEmulator surface;
+               applet handles its own UI (arrows, /, expand/collapse, etc.)
+   │ Esc / Ctrl-Esc / dedicated MB key
+   ▼
+NORMAL
+```
+
+Per-applet UX (illustrative; applets choose their own bindings inside FOCUSED state):
+- `@table`: arrows scroll, `/` fuzzy-filter, `s` sort by column, Enter copy cell back to prompt.
+- `@to-jsonl` JSON tree: arrows navigate, Tab/Enter expand/collapse, `/` key+value search, `n`/`N` next/prev match, `y` copy value, `p` copy path (`.users[3].email`) back to prompt.
+
+**Open interaction questions to settle:**
+- Focus-leave keybind — `Esc` is conventional but heavily overloaded; `Ctrl-Esc`, a dedicated MB key (`F12`?), or tmux-prefix style.
+- Output arriving while focused — keep focus on current widget, queue new output below, don't auto-steal focus.
+- Visual differentiation — border color for SELECTED, mode-line indicator (`-- WIDGET --` vim-style) for FOCUSED, ideally both.
+- Mouse model — click anchor = select, double-click = focus, click outside = blur. Optional but expected.
+- Modal-key conflicts when focused — applet wins for everything inside the surface; MB wins outside. Same model as tmux pane.
+
+**Selection / clipboard ownership** — model C (hybrid):
+- **Default (NORMAL / SELECTED state):** host owns mouse selection across pre-widget text → through widget cells → post-widget text. Cross-boundary drag-select works for free. Copy reads the visible rendered text from each region.
+- **FOCUSED state:** applet can opt in to handle mouse + copy itself. Lets `@to-jsonl` select a JSON subtree, `@table` select a row, image viewer select a region. Applet exposes `getClipboardContent()` returning multi-format (`{plain, json, path, ...}`); host picks the best format the destination accepts.
+- Selection ownership flips at the same boundary as keyboard ownership — applets opt in once, get both.
+
+**Open clipboard / search questions:**
+- Multi-format clipboard contract (`{plain, json, path, ...}`) and which platforms / native clipboards / OSC 52 paths support which formats.
+- Selection rendering inside widget cells when host owns it — host inverts pixels uniformly, vs ask the applet to draw its own highlight (lets applets show semantic-shaped highlights).
+- Cross-widget search (host-level Cmd-F) — does it dive into widget contents via an applet `searchableText()` hook, or stop at widget boundaries? Probably dive in.
+- OSC 52 fallback — multi-format doesn't survive; remote sessions degrade to plain text only.
+
+**Nested sub-TerminalEmulators.** Surfaces are recursive: an applet can host its own applet anchors inside its surface (a JSON tree applet embeds `@table` for array nodes; a chart applet embeds a data-preview table). State machine generalizes to a stack: each Esc pops one level (`NORMAL → SELECTED A → FOCUSED A → SELECTED B (inside A) → FOCUSED B → ...`). Selection / clipboard ownership applies recursively at the focused level (Model C, scoped per surface).
+
+**Bounds on nesting (to keep it tractable):**
+- **Depth cap** — e.g. max 4 levels. Each surface costs state + reflowable buffer; cap prevents runaway and buggy cycles.
+- **Cycle detection** — *stack-scoped* on UUID. Each anchor's instantiation walks its own ancestor chain (parent → grandparent → ...); if its UUID matches one already on that chain, refuse and render an error placeholder ("cycle detected: anchor `<uuid>`"). Two cases that look superficially similar but are fine:
+  - **Sibling same-UUID anchors** (two anchors with the same UUID, neither inside the other) — legitimate: the same data set rendered in two places in scrollback, or two applets sharing one dataset (cross-applet data sharing). They aren't on each other's stack, so the check passes.
+  - **Same-namespace nesting** (e.g. a JSON tree containing another JSON tree for a subtree) — legitimate: different instances, different UUIDs, different stacks. Namespace-only detection would wrongly reject this.
+  Only stack-self-recursion (same UUID literally appearing inside itself) is the real cycle.
+
+  GC implication: when sibling same-UUID is allowed, MB's data store must refcount UUIDs by live-anchor count — single-owner GC would drop data while a sibling anchor still references it.
+- **Resource budget** — per-surface memory / CPU quota; nested surfaces inherit a fraction or a flat per-surface cap.
+- **Hosting API for applets** — outer applet calls `surface.spawnSub(namespace, uuid, channel)`; same loader machinery MB uses for top-level applets, exposed as a sub-API. Trust model is recursive: outer applet chose to host inner, so it's responsible for it.
+- **UUIDs stay globally unique** (no nesting in ID structure); each parent surface tracks its child anchors so MB keeps a flat GC list.
+- **Cross-level selection** — stays scoped to the currently-focused level; can't drag-select from outer through inner. Same logic as host↔widget, recursive. Fewer edge cases than allowing cross-level selection.
+
+**Per-anchor offscreen textures (rendering optimization).** Render each anchor's surface into its own offscreen texture (GPU texture or bitmap). Scrollback paint becomes "walk anchors in viewport, blit each one's texture." Useful properties:
+- **Sibling same-UUID = blit, not re-render.** Render once, blit anywhere the UUID appears; cost of duplicates approaches zero. Pairs naturally with the refcount-by-anchor-count GC for shared data sets.
+- **Dirty tracking per-anchor.** Static widgets (e.g. an `@ls` output sitting in scrollback) don't repaint when nothing changed; host just re-blits cached texture. Only widgets with new data, focus transitions, or selection updates pay re-render cost.
+- **Animation is localized.** Live `@chart` updates touch only its own texture; rest of scrollback is unaffected.
+- **Selection overlays composited at blit time** (separate alpha layer) so the cached widget texture stays reusable across selection states.
+
+Texture-model details to settle:
+- Visible-portion + overscan for tall widgets (don't render 10,000 rows to a giant texture; GPU max is ~8k × 8k — tile or window).
+- LRU cache eviction bounded by VRAM / RAM budget; re-render on next paint after eviction.
+- Damage regions inside a texture (re-render only changed rows/cells, not the whole surface) for cheap animation.
+- Texture-cache keying when sibling anchors differ in size — `(UUID, size)` variants, or one canonical texture scaled at blit (loses text crispness — likely use the variant cache).
+
+**Per-anchor scroll capability (three flavors, applet-declared):**
+1. **Bounded, no scroll** *(default)* — applet declares its size and handles its own navigation (table jumps row-to-row, tree expands/collapses). User scroll-wheel inside the widget routes to the applet's keymap, not to a built-in scroll. Right default for the common structured-data case.
+2. **Scrollable surface** — applet writes to a buffer; surface clips to a fixed window with built-in scroll. User scroll-wheel inside the widget moves the view. Opt-in via `{ scrollable: true, maxHeight: N }`. Right for log tails, man pages, file previews — "stream of text" applets.
+3. **Auto-grow surface** — surface grows to fit content. Functionally identical to "no widget at all"; if you want this, don't use a widget. Don't ship as a mode.
+
+Interaction model with the pane refactor: NORMAL state scroll-wheel = host scrollback as today (moves past widgets like normal text); FOCUSED state with scrollable surface = surface's internal scroll; FOCUSED state with bounded surface = applet's keymap. Nested: focused level wins, same as keyboard.
+
+**Dependency: this entire applet host work depends on the MB pane / overlay refactor.** Sub-terminal surfaces are most cleanly built as instances of the unified pane component (which provides scroll, focus, sizing, etc. as built-in capabilities). Sequencing assumes that refactor lands first; without it, every per-anchor surface needs ad-hoc plumbing.
+
+Side benefit of doing the refactor right: **popups also gain independent scroll** for free (completion menu, search results popup, help overlay, command palette, etc.) — every bounded surface in MB becomes a uniformly-behaving pane. Same focus/selection/clipboard semantics apply to all of them, no special cases.
+
+**Sequencing:**
+0. *(MB side, prerequisite)* Land the pane / overlay refactor — sub-terminal surfaces become instances of the unified pane component.
+1. Settle the protocol (OSC shape, applet contract, WS framing, interaction state machine).
+2. Build the MB-side applet host + loader + per-anchor TerminalEmulator surface + selection/focus integration with existing OSC 133 nav.
+3. Build jsh's `@table` applet against the contract (the existing `mb-applet/` package).
+4. Wire jsh's `@table` operator to emit the OSC + push data over WS when the cap is set.
+5. Add a second applet (`@to-jsonl` JSON tree, or `@chart`) to validate the contract is genuinely reusable across very different UIs.
+
 ### Terminal / Input
 
 - [ ] **Keybind system** — C++ action table indexed by key enum, JS sets bindings via `jsh.bindKey("ctrl-a", "move-home")`. Custom JS callbacks for `"custom"` action. Default bindings built-in, user-overridable.
