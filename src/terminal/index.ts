@@ -365,14 +365,16 @@ export class TerminalUI {
         // Reverse-search (Ctrl-R) and inline forward-search (Ctrl-S) indicators
         // both render on their own line below the input (see after the bufLines
         // loop). Split into prefix (text before the insertion point) and suffix
-        // ("': ") so the indicator can show a subcursor marking where the next
-        // keystroke lands in the query.
+        // ("'") so the indicator can show a subcursor marking where the next
+        // keystroke lands in the query. bash readline appends ": <matched line>"
+        // here, but jsh shows the match in the editable buffer above, so the
+        // ": " separator would point at nothing.
         const searchIndicatorPrefix = state.searchQuery !== undefined
             ? `(${state.searchMatch === false && state.searchQuery.length > 0 ? "failing " : ""}reverse-i-search)\`${state.searchQuery}`
             : state.lineSearchQuery !== undefined
                 ? `(i-search)\`${state.lineSearchQuery}`
                 : null;
-        const searchIndicatorSuffix = "': ";
+        const searchIndicatorSuffix = "'";
         const displayPrompt = prompt;
         const displayRightPrompt = rprompt;
 

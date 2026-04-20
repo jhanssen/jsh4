@@ -3,11 +3,11 @@
 // downstream byte fd, so this works as the boundary between an object
 // pipeline and a byte-mode consumer (grep, file redirection, etc.).
 //
-//   @ls | @to-jsonl > files.jsonl
+//   @ls | @to-jsonl > files.json
 //   @ps | @to-jsonl | grep firefox
 
 export async function* toJsonl(
-    _args: string[],
+    _args: unknown[],
     stdin: AsyncIterable<unknown>,
 ): AsyncGenerator<string> {
     for await (const row of stdin) {

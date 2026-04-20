@@ -13,7 +13,7 @@
 //     fn(args: string[], stdin: AsyncIterable<unknown>) => AsyncIterable<unknown>
 //     Adjacent object-mode stages share the iterable directly — no fd, no
 //     serialization. Crossing to a byte-mode neighbor requires an explicit
-//     adapter (@jsonl / @to-jsonl) until auto-insertion lands.
+//     adapter (@from-jsonl / @to-jsonl) until auto-insertion lands.
 //
 // Return types handled by the byte-mode executor:
 //   string | Buffer       → written to stdout
@@ -80,9 +80,8 @@ export interface JsFunctionOptions {
     // formatters opt in.
     isSink?: boolean;
 
-    // Hide from tab completion + `type` listings. Useful for sinks that
-    // are usually only invoked indirectly via defaultSink. If left
-    // unset, isSink === true implies hidden === true.
+    // Hide from tab completion + `type` listings. Useful for formatters
+    // that are usually only invoked indirectly via `defaultSink`.
     hidden?: boolean;
 }
 
@@ -137,8 +136,7 @@ export function registerJsFunction(
     }
 
     const isSink = opts.isSink === true;
-    // isSink defaults hidden to true unless explicitly overridden.
-    const hidden = opts.hidden ?? isSink;
+    const hidden = opts.hidden === true;
     registry.set(name, {
         fn,
         atOnly: opts.atOnly === true,

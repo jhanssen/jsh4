@@ -19,7 +19,7 @@ import { ls } from "./ls.js";
 import { lsFormat } from "./ls_format.js";
 import { ps } from "./ps.js";
 import { count } from "./count.js";
-import { jsonl } from "./jsonl.js";
+import { fromJsonl } from "./from_jsonl.js";
 import { toJsonl } from "./to_jsonl.js";
 
 interface BuiltinSpec {
@@ -43,11 +43,11 @@ const BUILTINS: BuiltinSpec[] = [
     { name: "ls",     fn: ls     as unknown as JsPipelineFunction, schemaKey: "ls",     atOnly: true,
                                                                    defaultSink: "ls-format" },
     { name: "ls-format", fn: lsFormat as unknown as JsPipelineFunction, schemaKey: "ls_format",
-                                                                   atOnly: true, isSink: true },
+                                                                   atOnly: true, isSink: true, hidden: true },
     { name: "ps",     fn: ps     as unknown as JsPipelineFunction, schemaKey: "ps",     atOnly: true },
     { name: "count",  fn: count  as unknown as JsPipelineFunction, schemaKey: "count",  atOnly: true },
-    { name: "jsonl",    fn: jsonl   as unknown as JsPipelineFunction, schemaKey: "jsonl",    atOnly: true },
-    { name: "to-jsonl", fn: toJsonl as unknown as JsPipelineFunction, schemaKey: "to_jsonl", atOnly: true, isSink: true },
+    { name: "from-jsonl", fn: fromJsonl as unknown as JsPipelineFunction, schemaKey: "from_jsonl", atOnly: true },
+    { name: "to-jsonl",   fn: toJsonl   as unknown as JsPipelineFunction, schemaKey: "to_jsonl",   atOnly: true, isSink: true },
 ];
 
 let registered = false;

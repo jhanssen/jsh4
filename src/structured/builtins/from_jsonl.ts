@@ -1,13 +1,13 @@
-// Parse NDJSON (one JSON value per line) from upstream into objects.
+// Parse line-delimited JSON (NDJSON / JSONL) from upstream bytes into objects.
 //
 // Stdin is treated as `AsyncIterable<string>` of lines (the executor wires
-// `fdLineReader(fd)` when @jsonl follows a byte-mode stage). Empty/whitespace
+// `fdLineReader(fd)` when this stage follows a byte-mode stage). Blank
 // lines are skipped. Parse errors throw, terminating the pipeline.
 //
-//   cat events.json | @jsonl | @where 'e => e.level === "error"' | @table
+//   cat events.json | @from-jsonl | @where @{ e => e.level === "error" } | @table
 
-export async function* jsonl(
-    _args: string[],
+export async function* fromJsonl(
+    _args: unknown[],
     stdin: AsyncIterable<unknown>,
 ): AsyncGenerator<unknown> {
     for await (const raw of stdin) {

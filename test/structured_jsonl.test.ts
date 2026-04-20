@@ -1,7 +1,11 @@
 // Stage 6 tests: NDJSON adapters and cross-process boundary support.
 //
 // Pipelines mix object-mode @-fns with byte-mode external commands, with
-// @jsonl / @to-jsonl serving as the bytes↔objects bridges.
+// @from-jsonl / @to-jsonl serving as the bytes↔objects bridges.
+//
+// (`@from-jsonl` / `@to-jsonl` were renamed from `@jsonl` / `@to-jsonl` —
+//  symmetric `from-X` / `to-X` matches the convention used by other
+//  format adapters as they ship.)
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -35,10 +39,10 @@ describe("@to-jsonl: object → bytes boundary", () => {
     });
 });
 
-describe("@jsonl: bytes → object boundary", () => {
+describe("@from-jsonl: bytes → object boundary", () => {
     it("should parse one JSON value per line into objects", () => {
         const r = spawnJsh({
-            input: 'printf \'{"a":1}\\n{"a":2}\\n{"a":3}\\n\' | @jsonl | @where @{ r => r.a > 1 } | @to-jsonl\nexit\n',
+            input: 'printf \'{"a":1}\\n{"a":2}\\n{"a":3}\\n\' | @from-jsonl | @where @{ r => r.a > 1 } | @to-jsonl\nexit\n',
             jshrc: "/dev/null",
         });
         const rows = jsonLines(r.stdout) as Array<{ a: number }>;
@@ -47,7 +51,7 @@ describe("@jsonl: bytes → object boundary", () => {
 
     it("should skip blank lines", () => {
         const r = spawnJsh({
-            input: 'printf \'{"x":1}\\n\\n{"x":2}\\n\' | @jsonl | @count\nexit\n',
+            input: 'printf \'{"x":1}\\n\\n{"x":2}\\n\' | @from-jsonl | @count\nexit\n',
             jshrc: "/dev/null",
         });
         const out = jsonLines(r.stdout)[0] as { count: number };
@@ -56,7 +60,7 @@ describe("@jsonl: bytes → object boundary", () => {
 
     it("should error on malformed JSON", () => {
         const r = spawnJsh({
-            input: 'printf \'not-json\\n\' | @jsonl | @count\nexit\n',
+            input: 'printf \'not-json\\n\' | @from-jsonl | @count\nexit\n',
             jshrc: "/dev/null",
         });
         assert.match(r.stderr, /jsh: @\w+:/);
@@ -64,9 +68,9 @@ describe("@jsonl: bytes → object boundary", () => {
 });
 
 describe("sandwich pipelines: bytes → object → bytes", () => {
-    it("should support cat | @jsonl | @select | @to-jsonl | sort", () => {
+    it("should support cat | @from-jsonl | @select | @to-jsonl | sort", () => {
         const r = spawnJsh({
-            input: 'printf \'{"n":3}\\n{"n":1}\\n{"n":2}\\n\' | @jsonl | @select n | @to-jsonl | sort\nexit\n',
+            input: 'printf \'{"n":3}\\n{"n":1}\\n{"n":2}\\n\' | @from-jsonl | @select n | @to-jsonl | sort\nexit\n',
             jshrc: "/dev/null",
         });
         const rows = jsonLines(r.stdout) as Array<{ n: number }>;

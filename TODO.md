@@ -131,12 +131,12 @@
 
 ### Structured pipelines
 - [x] Object-mode `@`-fns with in-process `AsyncIterable<unknown>` channels between adjacent stages (no fd/serialization)
-- [x] Mixed bytes/objects pipelines via `@jsonl` / `@to-jsonl` adapters with fd boundaries
+- [x] Mixed bytes/objects pipelines via `@from-jsonl` / `@to-jsonl` adapters with fd boundaries
 - [x] Type IR + schema extractor (TypeScript compiler API) extracted at build time for built-ins, on cache miss for user `.ts` jshrcs
 - [x] Schema cache under `$XDG_CACHE_HOME/jsh/types/v1/` with atomic-rename writes, content-hash invalidation
 - [x] Loader prologue auto-binds module-local `jsh._withSource(import.meta.url)` for `.ts`/`.mts` user files — registrations carry source URL automatically
 - [x] `defaultSink` / `isSink` / `hidden` registry plumbing: source operators ship their own preferred formatter (e.g. `@ls` → `@ls-format`), executor auto-inserts when stdout is a tty
-- [x] Built-ins shipped: `@ls`/`@ls-format` (BSD `ls -la` parity, NSS-backed uid/gid, LS_COLORS, xattr `@` marker), `@ps`, `@where`, `@select`, `@take`, `@count`, `@table`, `@jsonl`, `@to-jsonl`
+- [x] Built-ins shipped: `@ls`/`@ls-format` (BSD `ls -la` parity, NSS-backed uid/gid, LS_COLORS, xattr `@` marker), `@ps`, `@where`, `@select`, `@take`, `@count`, `@table`, `@from-jsonl`, `@to-jsonl`
 - [x] Native bindings: `getpwuid_r` / `getgrgid_r` / `listxattr` for the formatter
 
 ### REPL / Terminal UI
@@ -257,7 +257,7 @@
 
 ### Structured pipelines
 
-The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction + cache, loader prologue auto-mode for `.ts` rcs, `defaultSink`/`isSink`/`hidden`, `@{...}` as inline-JS arg form). Built-ins so far: `@ls`/`@ls-format`, `@ps`, `@where`, `@select`, `@take`, `@count`, `@table`, `@jsonl`, `@to-jsonl`. Open work:
+The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction + cache, loader prologue auto-mode for `.ts` rcs, `defaultSink`/`isSink`/`hidden`, `@{...}` as inline-JS arg form). Built-ins so far: `@ls`/`@ls-format`, `@ps`, `@where`, `@select`, `@take`, `@count`, `@table`, `@from-jsonl`, `@to-jsonl`. Open work:
 
 #### Ergonomics
 
@@ -287,7 +287,7 @@ The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction
 
 - [ ] `@csv` / `@to-csv`
 - [ ] `@yaml` / `@to-yaml`
-- [ ] **Auto-adapter insertion** — `cat foo.json | @where ...` automatically inserts `@jsonl` at the bytes/objects boundary. Today rejected with an error. Use `defaultSink`-shaped declaration on common shapes, or a `from`/`to` registry per format.
+- [ ] **Auto-adapter insertion** — `cat foo.json | @where ...` automatically inserts `@from-jsonl` at the bytes/objects boundary. Today rejected with an error. Use `defaultSink`-shaped declaration on common shapes, or a `from`/`to` registry per format.
 
 #### Robustness / control
 

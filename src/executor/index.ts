@@ -786,7 +786,7 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
     //   1. all-object → runObjectPipeline directly.
     //   2. one object segment surrounded by byte segments → split into
     //      segments connected by fd pipes. Boundary stages are typically
-    //      @jsonl (byte→object) and @to-jsonl (object→byte).
+    //      @from-jsonl (byte→object) and @to-jsonl (object→byte).
     //   3. interleaved → error.
     const objIdx: number[] = [];
     for (let i = 0; i < n; i++) if (isObjectModeStage(node.commands[i]!)) objIdx.push(i);
