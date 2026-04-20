@@ -205,9 +205,49 @@ static bool stagesCanPosixSpawn(const std::vector<StageSpec>& stages) {
 
 // ---- Pid tracking ---------------------------------------------------------
 
+// Refcount of pids we still need SIGCHLD for. The signal watcher is
+// uv_unref'd by default so the steady "no children" state doesn't keep the
+// loop alive — but while we have at least one pending pid that some Promise
+// is awaiting, the watcher must be ref'd. Otherwise the loop can drain
+// (capture-pipe handle closes on EOF, Promise still pending), Node enters
+// cleanup, the SIGCHLD finally fires during cleanup-drain, and
+// resolveCtxPromise crashes calling napi on a dying env.
+//
+// Background pids (ctx == nullptr) deliberately do NOT acquire — script-mode
+// `cmd &` should orphan to init when the script exits, matching bash. Their
+// SIGCHLD is best-effort recorded by reapChildren when the loop is alive
+// for other reasons (interactive input handle, etc.).
+static int g_sigchldRefcount = 0;
+
+static void sigchldRefAcquire() {
+    if (g_sigchldRefcount++ == 0) {
+        uv_ref(reinterpret_cast<uv_handle_t*>(&g_sigchld));
+    }
+}
+
+static void sigchldRefRelease() {
+    if (g_sigchldRefcount > 0 && --g_sigchldRefcount == 0) {
+        uv_unref(reinterpret_cast<uv_handle_t*>(&g_sigchld));
+    }
+}
+
 static void registerPid(pid_t pid, SpawnCtx* ctx, size_t stageIdx) {
     g_pending[pid] = PendingChild { ctx, stageIdx };
-    if (ctx) ctx->pendingPids++;
+    if (ctx) {
+        ctx->pendingPids++;
+        sigchldRefAcquire();
+    }
+}
+
+// Erase a g_pending entry; release the SIGCHLD ref iff it was ctx-bound
+// (since only ctx-bound registerPid calls acquire). Use this in code paths
+// that don't already know whether the entry was foreground or background.
+static void erasePending(pid_t pid) {
+    auto it = g_pending.find(pid);
+    if (it == g_pending.end()) return;
+    bool wasCtx = it->second.ctx != nullptr;
+    g_pending.erase(it);
+    if (wasCtx) sigchldRefRelease();
 }
 
 // Called from the SIGCHLD handler when a foreground pid reports stopped.
@@ -227,6 +267,7 @@ static void handleStopped(SpawnCtx* ctx, int status) {
         if (it->second.ctx == ctx) {
             remaining.push_back(it->first);
             it = g_pending.erase(it);
+            sigchldRefRelease();
         } else {
             ++it;
         }
@@ -339,6 +380,7 @@ static void onSigChld(uv_signal_t*, int /*signum*/) {
         SpawnCtx* ctx = it->second.ctx;
         size_t idx = it->second.stageIdx;
         g_pending.erase(it);
+        if (ctx) sigchldRefRelease();
 
         if (!ctx) {
             // Background job — record for reapChildren drain.
@@ -946,17 +988,25 @@ static Napi::Value WaitForPids(const Napi::CallbackInfo& info) {
         pid_t p = pids[i];
         auto oit = g_orphans.find(p);
         if (oit != g_orphans.end() && oit->second.reaped) {
-            // Process already exited between forkExec and this call — pull
-            // the parked status.
+            // SIGCHLD parked a status before this waitForPids call. Pull it.
             int s = oit->second.status;
-            g_orphans.erase(oit);
             if (WIFSTOPPED(s)) {
+                // Process is stopped, not gone. Keep the orphan entry alive
+                // and reset reaped=false so the eventual resume+exit SIGCHLD
+                // (after `fg` or `bg`) can park its status here for the next
+                // waitForPids. Without this, the second-state-change SIGCHLD
+                // finds the pid in neither g_pending nor g_orphans and the
+                // zombie leaks. Window is small but the leak is permanent.
+                oit->second.reaped = false;
+                oit->second.status = 0;
                 ctx->stopped = true;
                 ctx->stoppedSignal = WSTOPSIG(s);
                 int code = 128 + WSTOPSIG(s);
                 ctx->pipeStatus[i] = code;
                 if (i + 1 == pids.size()) ctx->exitCode = code;
             } else {
+                // True termination (exit or fatal signal) — entry can go.
+                g_orphans.erase(oit);
                 int code = WIFEXITED(s)   ? WEXITSTATUS(s)
                          : WIFSIGNALED(s) ? 128 + WTERMSIG(s) : 1;
                 ctx->pipeStatus[i] = code;
@@ -964,9 +1014,10 @@ static Napi::Value WaitForPids(const Napi::CallbackInfo& info) {
             }
         } else {
             // Still alive (or never forkExec'd). Drop stale orphan entry
-            // and any stale pending entry, then register under this ctx.
+            // and any stale pending entry (releasing its sigchld ref if it
+            // had one), then register under this ctx.
             g_orphans.erase(p);
-            g_pending.erase(p);
+            erasePending(p);
             registerPid(p, ctx, i);
         }
     }
@@ -1095,6 +1146,22 @@ static Napi::Value TcsetpgrpShell(const Napi::CallbackInfo& info) {
     return info.Env().Undefined();
 }
 
+// Returns the controlling-terminal foreground pgid, or -1 if there is no
+// controlling terminal (e.g., script mode). Used by the shell-exit signal
+// handler to forward SIGTERM/SIGHUP to whatever currently owns the TTY.
+static Napi::Value TcgetpgrpFg(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    pid_t pgid = tcgetpgrp(STDIN_FILENO);
+    return Napi::Number::New(env, pgid);
+}
+
+// Returns this process's pgid. Compared against tcgetpgrpFg to decide
+// whether the FG group is the shell or a child.
+static Napi::Value Getpgrp(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    return Napi::Number::New(env, getpgrp());
+}
+
 Napi::Object InitExecutor(Napi::Env env, Napi::Object exports) {
     exports.Set("initExecutor",     Napi::Function::New(env, InitExecutor_));
     exports.Set("spawnPipeline",    Napi::Function::New(env, SpawnPipeline));
@@ -1111,6 +1178,10 @@ Napi::Object InitExecutor(Napi::Env env, Napi::Object exports) {
     exports.Set("reapChildren",     Napi::Function::New(env, ReapChildren));
     exports.Set("tcsetpgrpFg",      Napi::Function::New(env, TcsetpgrpFg));
     exports.Set("tcsetpgrpShell",   Napi::Function::New(env, TcsetpgrpShell));
+    exports.Set("tcgetpgrpFg",      Napi::Function::New(env, TcgetpgrpFg));
+    exports.Set("getpgrp",          Napi::Function::New(env, Getpgrp));
+    exports.Set("SIGHUP",           Napi::Number::New(env, SIGHUP));
+    exports.Set("SIGINT",           Napi::Number::New(env, SIGINT));
     exports.Set("SIGCONT",          Napi::Number::New(env, SIGCONT));
     exports.Set("SIGTSTP",          Napi::Number::New(env, SIGTSTP));
     exports.Set("SIGTERM",          Napi::Number::New(env, SIGTERM));

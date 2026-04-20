@@ -1,33 +1,12 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { spawnSync } from "node:child_process";
 import { parse } from "../src/parser/index.js";
 import type { JsFunction } from "../src/parser/index.js";
 import { registerJsFunction, lookupJsFunction } from "../src/jsfunctions/index.js";
+import { run, runFull, spawnJsh, withRc } from "./helpers.js";
 
 const require = createRequire(import.meta.url);
-
-// No before hook needed — tests spawn jsh subprocesses.
-
-// Run commands through jsh subprocess and return trimmed stdout.
-function run(cmd: string): string {
-    const r = spawnSync("node", ["dist/index.js"], {
-        input: cmd + "\nexit\n",
-        encoding: "utf8",
-        cwd: process.cwd(),
-    });
-    return r.stdout.trim();
-}
-
-function runFull(cmd: string): { stdout: string; stderr: string } {
-    const r = spawnSync("node", ["dist/index.js"], {
-        input: cmd + "\nexit\n",
-        encoding: "utf8",
-        cwd: process.cwd(),
-    });
-    return { stdout: r.stdout.trim(), stderr: r.stderr.trim() };
-}
 
 describe("@ syntax — parser", () => {
     it("should parse @name as JsFunction node", () => {
@@ -117,18 +96,12 @@ describe("@ syntax — inline execution", () => {
 
     it("should add newline to terminal output from function return", () => {
         // Use raw stdout (no trim) to verify trailing newline is present.
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: '@{ () => "hello" }\nexit\n',
-            encoding: "utf8",
-        });
+        const r = spawnJsh({ input: '@{ () => "hello" }\nexit\n' });
         assert.strictEqual(r.stdout, "hello\n");
     });
 
     it("should add newline to terminal output from expression", () => {
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: '@{ "world" }\nexit\n',
-            encoding: "utf8",
-        });
+        const r = spawnJsh({ input: '@{ "world" }\nexit\n' });
         assert.strictEqual(r.stdout, "world\n");
     });
 
@@ -151,22 +124,13 @@ describe("@ syntax — named functions via .jshrc", () => {
     });
 
     it("should work with named function via temp file", () => {
-        const rc = `/tmp/jsh_test_rc_${Date.now()}.mjs`;
-        require("fs").writeFileSync(rc, `
-export async function* upper2(args, stdin) {
-    for await (const l of stdin) yield l.trimEnd().toUpperCase() + '\\n';
-}
-`);
-        try {
-            const r = spawnSync("node", ["dist/index.js", "--jshrc", rc], {
-                input: "echo hello | @upper2\nexit\n",
-                encoding: "utf8",
-                cwd: process.cwd(),
-            });
-            assert.strictEqual(r.stdout.trim(), "HELLO");
-        } finally {
-            try { require("fs").unlinkSync(rc); } catch {}
-        }
+        const { stdout } = withRc(
+            `export async function* upper2(args, stdin) {
+                for await (const l of stdin) yield l.trimEnd().toUpperCase() + '\\n';
+            }`,
+            "echo hello | @upper2",
+        );
+        assert.strictEqual(stdout, "HELLO");
     });
 });
 
@@ -184,21 +148,6 @@ describe("@ syntax — buffered mode", () => {
 // mirroring bash function semantics. @name remains as an explicit-force form.
 // Functions marked `atOnly = true` (or wrapped in jsh.atOnly) skip bare-name
 // resolution so a same-named alias / builtin / PATH command wins.
-
-function withRc(rcBody: string, input: string): { stdout: string; stderr: string } {
-    const rc = `/tmp/jsh_test_rc_${Date.now()}_${Math.random().toString(36).slice(2)}.mjs`;
-    require("fs").writeFileSync(rc, rcBody);
-    try {
-        const r = spawnSync("node", ["dist/index.js", "--jshrc", rc], {
-            input: input + "\nexit\n",
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
-        return { stdout: r.stdout.trim(), stderr: r.stderr.trim() };
-    } finally {
-        try { require("fs").unlinkSync(rc); } catch {}
-    }
-}
 
 describe("bare-name JS function calls", () => {
     it("should call a JS function via bare name", () => {

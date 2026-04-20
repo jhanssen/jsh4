@@ -53,7 +53,47 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputSetWordChars: (chars: string) => void;
     inputSetCompletionStyle: (style: string) => void;
     inputEAGAIN: () => number;
+    sendSignal: (pid: number, signal: number) => number;
+    tcgetpgrpFg: () => number;
+    getpgrp: () => number;
+    SIGTERM: number;
+    SIGHUP: number;
+    SIGINT: number;
 };
+
+import { getAllJobs } from "../jobs/index.js";
+
+// Forward a fatal signal to all known children before exiting. Without this,
+// `kill -TERM <jsh-pid>` (or any non-terminal-close SIGTERM/SIGHUP) leaves
+// foreground and background children orphaned to init/launchd, and they
+// keep running. Terminal-close SIGHUP is delivered to all session members
+// by the kernel, so this is mostly a defense for explicit kills.
+function forwardAndExit(signal: number, signalName: string): void {
+    const myPgid = native.getpgrp();
+    const fgPgid = native.tcgetpgrpFg();
+
+    // Forward to foreground pgrp if it isn't the shell itself.
+    if (fgPgid > 0 && fgPgid !== myPgid) {
+        try { native.sendSignal(-fgPgid, signal); } catch {}
+    }
+    // Forward to every running background job's pgrp.
+    for (const job of getAllJobs()) {
+        if (job.status === "running" && job.pgid > 0 && job.pgid !== myPgid) {
+            try { native.sendSignal(-job.pgid, signal); } catch {}
+        }
+    }
+
+    // Run the EXIT trap, then exit. Best-effort: if the trap throws or
+    // hangs, the timeout below forces exit so jsh doesn't become a zombie
+    // holding the terminal.
+    let trapDone = false;
+    setTimeout(() => { if (!trapDone) process.exit(128 + signal); }, 250).unref();
+    runTrap("EXIT", executeString).finally(() => {
+        trapDone = true;
+        process.exit(128 + signal);
+    });
+    void signalName;
+}
 
 let ui: TerminalUI | null = null;
 let mbApi: MbApi | null = null;
@@ -64,6 +104,13 @@ export interface ReplOptions {
 
 export async function startRepl(opts?: ReplOptions): Promise<void> {
     native.initExecutor();
+
+    // Forward SIGTERM/SIGHUP to children before exiting, so `kill -TERM <jsh>`
+    // or a stray SIGHUP doesn't orphan running foreground/background jobs.
+    // Terminal-close SIGHUP already reaches all session members via the
+    // kernel; this catches the explicit-kill case.
+    process.on("SIGTERM", () => forwardAndExit(native.SIGTERM, "SIGTERM"));
+    process.on("SIGHUP",  () => forwardAndExit(native.SIGHUP,  "SIGHUP"));
 
     // Register command-exists check for the colorizer (breaks circular import).
     registerCommandExists((name: string) => {

@@ -1,17 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { parse } from "../src/parser/index.js";
 import type { CaseClause } from "../src/parser/index.js";
-
-function run(cmd: string): string {
-    const r = spawnSync("node", ["dist/index.js"], {
-        input: cmd + "\nexit\n",
-        encoding: "utf8",
-        cwd: process.cwd(),
-    });
-    return r.stdout.trim();
-}
+import { run, spawnJsh } from "./helpers.js";
 
 describe("case/esac — parser", () => {
     it("should parse a simple case statement", () => {
@@ -53,11 +44,7 @@ describe("case/esac — execution", () => {
     });
 
     it("should return exit code 0 when no pattern matches", () => {
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: "case foo in bar) echo no;; esac\necho $?\nexit\n",
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
+        const r = spawnJsh({ input: "case foo in bar) echo no;; esac\necho $?\nexit\n" });
         assert.strictEqual(r.stdout.trim(), "0");
     });
 

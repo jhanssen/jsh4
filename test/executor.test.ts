@@ -1,40 +1,9 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-// Run commands through jsh and return trimmed stdout.
-function run(cmd: string): string {
-    const r = spawnSync("node", ["dist/index.js"], {
-        input: cmd + "\nexit\n",
-        encoding: "utf8",
-        cwd: process.cwd(),
-    });
-    return r.stdout.trim();
-}
-
-// Run command and return both stdout and stderr.
-function runFull(cmd: string): { stdout: string; stderr: string } {
-    const r = spawnSync("node", ["dist/index.js"], {
-        input: cmd + "\nexit\n",
-        encoding: "utf8",
-        cwd: process.cwd(),
-    });
-    return { stdout: r.stdout.trim(), stderr: r.stderr.trim() };
-}
-
-function ec(cmd: string): number {
-    // Use $? to capture exit code from the command.
-    const r = spawnSync("node", ["dist/index.js"], {
-        input: `${cmd}\necho $?\nexit\n`,
-        encoding: "utf8",
-        cwd: process.cwd(),
-    });
-    const lines = r.stdout.trim().split("\n");
-    return parseInt(lines[lines.length - 1]!, 10);
-}
+import { run, runFull, ec, spawnJsh } from "./helpers.js";
 
 describe("executor — simple commands", () => {
     it("should run a command and capture stdout", () => {
@@ -310,21 +279,15 @@ describe("executor — source / . builtin", () => {
 
     it("should execute file in current context", () => {
         const f = join(tmp, "vars.sh");
-        const r = spawnSync("node", ["dist/index.js"], {
+        const r = spawnJsh({
             input: `echo 'MYVAR=hello' > ${f}\nsource ${f}\necho $MYVAR\nexit\n`,
-            encoding: "utf8",
-            cwd: process.cwd(),
         });
         assert.ok(r.stdout.includes("hello"), `expected hello, got: ${r.stdout}`);
     });
 
     it("should support . as alias for source", () => {
         const f = join(tmp, "dot.sh");
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: `echo 'DOTVAR=world' > ${f}\n. ${f}\necho $DOTVAR\nexit\n`,
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
+        const r = spawnJsh({ input: `echo 'DOTVAR=world' > ${f}\n. ${f}\necho $DOTVAR\nexit\n` });
         assert.ok(r.stdout.includes("world"), `expected world, got: ${r.stdout}`);
     });
 
@@ -334,21 +297,13 @@ describe("executor — source / . builtin", () => {
 
     it("should execute functions defined in sourced file", () => {
         const f = join(tmp, "func.sh");
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: `echo 'greet() { echo hi $1; }' > ${f}\nsource ${f}\ngreet world\nexit\n`,
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
+        const r = spawnJsh({ input: `echo 'greet() { echo hi $1; }' > ${f}\nsource ${f}\ngreet world\nexit\n` });
         assert.ok(r.stdout.includes("hi world"), `expected "hi world", got: ${r.stdout}`);
     });
 
     it("should set positional params from extra args", () => {
         const f = join(tmp, "params.sh");
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: `echo 'echo $1 $2' > ${f}\nsource ${f} foo bar\nexit\n`,
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
+        const r = spawnJsh({ input: `echo 'echo $1 $2' > ${f}\nsource ${f} foo bar\nexit\n` });
         assert.ok(r.stdout.includes("foo bar"), `expected "foo bar", got: ${r.stdout}`);
     });
 });
@@ -382,19 +337,11 @@ describe("executor — exec builtin", () => {
         assert.strictEqual(run("exec echo hello"), "hello");
     });
     it("should exit with command exit code", () => {
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: "exec true\n",
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
+        const r = spawnJsh({ input: "exec true\n" });
         assert.strictEqual(r.status, 0);
     });
     it("should exit 127 for missing command", () => {
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: "exec __no_such_cmd_jsh__\n",
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
+        const r = spawnJsh({ input: "exec __no_such_cmd_jsh__\n" });
         assert.strictEqual(r.status, 127);
     });
 });
@@ -425,11 +372,7 @@ describe("executor — local builtin", () => {
         );
     });
     it("should warn when used outside function", () => {
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: "local X=1\n",
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
+        const r = spawnJsh({ input: "local X=1\n" });
         assert.ok(r.stderr.includes("can only be used in a function"));
     });
 });
@@ -442,20 +385,12 @@ describe("executor — set builtin", () => {
         assert.strictEqual(run("set -e\nset +e\nfalse\necho ok"), "ok");
     });
     it("should enable xtrace with set -x", () => {
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: "set -x\necho hello\n",
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
+        const r = spawnJsh({ input: "set -x\necho hello\n" });
         assert.ok(r.stderr.includes("+ echo hello"), `expected trace, got stderr: ${r.stderr}`);
         assert.ok(r.stdout.includes("hello"));
     });
     it("should error on unset variable with set -u", () => {
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: "set -u\necho $UNSETVAR_JSH_TEST\n",
-            encoding: "utf8",
-            cwd: process.cwd(),
-        });
+        const r = spawnJsh({ input: "set -u\necho $UNSETVAR_JSH_TEST\n" });
         assert.ok(r.stderr.includes("unbound variable"), `expected error, got stderr: ${r.stderr}`);
     });
     it("should enable pipefail with set -o pipefail", () => {
@@ -1566,18 +1501,12 @@ describe("executor — arithmetic == vs =", () => {
 
 describe("executor — exit uses $?", () => {
     it("should exit with last command status", () => {
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: "false\nexit\n",
-            encoding: "utf8",
-        });
+        const r = spawnJsh({ input: "false\nexit\n" });
         assert.strictEqual(r.status, 1);
     });
 
     it("should exit with explicit code", () => {
-        const r = spawnSync("node", ["dist/index.js"], {
-            input: "exit 42\n",
-            encoding: "utf8",
-        });
+        const r = spawnJsh({ input: "exit 42\n" });
         assert.strictEqual(r.status, 42);
     });
 });
