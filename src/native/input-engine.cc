@@ -13,6 +13,8 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <poll.h>
+#include <pwd.h>
+#include <grp.h>
 
 extern "C" {
 #include <grapheme.h>
@@ -2472,6 +2474,53 @@ static Napi::Value SetListColors(const Napi::CallbackInfo &info) {
     return env.Undefined();
 }
 
+// POSIX uid → username via getpwuid_r. Returns the username, or "" if the
+// uid isn't resolvable (no such user / NSS lookup failed). Resolves through
+// the platform's NSS chain (Open Directory on macOS, /etc/passwd + LDAP/NIS
+// on Linux), so works for users not in /etc/passwd.
+static Napi::Value GetpwuidName(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) return Napi::String::New(env, "");
+    const uid_t uid = static_cast<uid_t>(info[0].As<Napi::Number>().Int64Value());
+    struct passwd pwd;
+    struct passwd *result = nullptr;
+    char buf[4096];
+    if (getpwuid_r(uid, &pwd, buf, sizeof(buf), &result) != 0 || result == nullptr) {
+        return Napi::String::New(env, "");
+    }
+    return Napi::String::New(env, pwd.pw_name ? pwd.pw_name : "");
+}
+
+// POSIX gid → group name via getgrgid_r. Same NSS-aware semantics.
+static Napi::Value GetgrgidName(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) return Napi::String::New(env, "");
+    const gid_t gid = static_cast<gid_t>(info[0].As<Napi::Number>().Int64Value());
+    struct group grp;
+    struct group *result = nullptr;
+    char buf[4096];
+    if (getgrgid_r(gid, &grp, buf, sizeof(buf), &result) != 0 || result == nullptr) {
+        return Napi::String::New(env, "");
+    }
+    return Napi::String::New(env, grp.gr_name ? grp.gr_name : "");
+}
+
+// Look up the SGR parameter string ("01;34") for a file. Args:
+//   typeHint: "dir" | "exec" | "link" | "file" | ""
+//   name:     the display name (used for *.ext rules when typeHint == "file")
+// Returns the SGR string, or "" if no rule matches. Used by @ls-format
+// (and any other JS-side renderer) to colorize names per LS_COLORS.
+static Napi::Value ColorForFile(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsString()) {
+        return Napi::String::New(env, "");
+    }
+    const auto type_hint = info[0].As<Napi::String>().Utf8Value();
+    const auto name      = info[1].As<Napi::String>().Utf8Value();
+    const std::string *sgr = lookupLsColor(type_hint, name);
+    return Napi::String::New(env, sgr ? *sgr : "");
+}
+
 static Napi::Value SetCompletions(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
     if (!g_state.waiting_for_completions) return env.Undefined();
@@ -2659,6 +2708,9 @@ Napi::Object InitInputEngine(Napi::Env env, Napi::Object exports) {
     exports.Set("inputSetWordChars",  Napi::Function::New(env, SetWordChars));
     exports.Set("inputSetCompletionStyle", Napi::Function::New(env, SetCompletionStyle));
     exports.Set("inputSetListColors", Napi::Function::New(env, SetListColors));
+    exports.Set("inputColorForFile",  Napi::Function::New(env, ColorForFile));
+    exports.Set("getpwuidName",       Napi::Function::New(env, GetpwuidName));
+    exports.Set("getgrgidName",       Napi::Function::New(env, GetgrgidName));
     exports.Set("inputEAGAIN",        Napi::Function::New(env, GetEAGAIN));
     // Fd utilities (previously in linenoise.cc)
     exports.Set("closeFd",            Napi::Function::New(env, CloseFd));

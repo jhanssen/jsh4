@@ -61,6 +61,25 @@ export interface JsFunctionOptions {
     input?: TypeIR;
     output?: TypeIR;
     args?: TypeIR;
+
+    // Name of another registered @-fn to use as the implicit sink when this
+    // function is the last stage of an interactive (tty) pipeline. Late-bound
+    // by name — the named function need not be registered yet at the time
+    // this option is set; the lookup happens at pipeline-execution time. If
+    // the named function isn't registered when the pipeline runs, the
+    // executor falls back to @table.
+    defaultSink?: string;
+
+    // True if this function emits its own formatted output (strings/bytes).
+    // The executor never auto-wraps a sink in another sink. Defaults to
+    // `true` for the built-in @table / @to-jsonl / etc.; user-defined
+    // formatters opt in.
+    isSink?: boolean;
+
+    // Hide from tab completion + `type` listings. Useful for sinks that
+    // are usually only invoked indirectly via defaultSink. If left
+    // unset, isSink === true implies hidden === true.
+    hidden?: boolean;
 }
 
 interface RegistryEntry {
@@ -71,6 +90,9 @@ interface RegistryEntry {
     input?: TypeIR;
     output?: TypeIR;
     args?: TypeIR;
+    defaultSink?: string;
+    isSink: boolean;
+    hidden: boolean;
 }
 
 const registry = new Map<string, RegistryEntry>();
@@ -110,12 +132,18 @@ export function registerJsFunction(
         }
     }
 
+    const isSink = opts.isSink === true;
+    // isSink defaults hidden to true unless explicitly overridden.
+    const hidden = opts.hidden ?? isSink;
     registry.set(name, {
         fn,
         atOnly: opts.atOnly === true,
         mode,
         source: opts.source,
         input, output, args,
+        defaultSink: opts.defaultSink,
+        isSink,
+        hidden,
     });
 }
 
@@ -171,12 +199,24 @@ export function listJsFunctions(): string[] {
     return [...registry.keys()];
 }
 
-// List function names that are callable via bare-name (excludes atOnly).
-// Used by tab completion and `type`.
+// List function names that are callable via bare-name (excludes atOnly
+// and hidden entries).
 export function listBareJsFunctions(): string[] {
     const out: string[] = [];
     for (const [name, entry] of registry) {
-        if (!entry.atOnly) out.push(name);
+        if (entry.atOnly) continue;
+        if (entry.hidden) continue;
+        out.push(name);
+    }
+    return out;
+}
+
+// List @-callable function names, excluding hidden entries (formatters etc.
+// registered as sinks). Used by @-prefix tab completion.
+export function listVisibleJsFunctions(): string[] {
+    const out: string[] = [];
+    for (const [name, entry] of registry) {
+        if (!entry.hidden) out.push(name);
     }
     return out;
 }

@@ -51,6 +51,7 @@ const native = require("../../build/Release/jsh_native.node") as {
     inputInsertAtCursor: (text: string) => void;
     inputSetCompletions: (entries: string[], descs?: string[], replaceStart?: number, replaceEnd?: number, displays?: string[], ambiguous?: boolean, types?: string[]) => void;
     inputSetListColors: (value: string) => void;
+    inputColorForFile: (typeHint: "dir" | "exec" | "link" | "file" | "", name: string) => string;
     inputSetWordChars: (chars: string) => void;
     inputSetCompletionStyle: (style: string) => void;
     inputEAGAIN: () => number;
@@ -189,6 +190,12 @@ export async function startRepl(opts?: ReplOptions): Promise<void> {
 
     // Register ESM loader hook so jshrc files can `import ... from 'jsh/...'`.
     register('../loader-hooks.js', import.meta.url);
+
+    // Register structured-pipeline built-ins (@where, @select, @take, ...)
+    // before the user rc loads so the rc can override any of them by
+    // re-registering the same name.
+    const { registerStructuredBuiltins } = await import("../structured/builtins/index.js");
+    registerStructuredBuiltins();
 
     await loadRc(opts?.jshrc);
 

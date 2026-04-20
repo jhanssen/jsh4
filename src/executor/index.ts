@@ -781,22 +781,94 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
 async function executeMixedPipeline(node: Pipeline): Promise<number> {
     const n = node.commands.length;
 
-    // Object-mode pipeline detection. If any stage is an object-mode @-fn,
-    // every stage in the pipeline must also be one — adapters across the
-    // bytes/objects boundary aren't auto-inserted yet (stage 6). Until then,
-    // a mixed pipeline errors with a hint.
-    let objectStageCount = 0;
-    for (const cmd of node.commands) if (isObjectModeStage(cmd)) objectStageCount++;
-    if (objectStageCount > 0) {
-        if (objectStageCount !== n) {
-            await writeStderr(
-                "jsh: object-mode @-fn cannot pipe to a byte-mode stage; " +
-                "insert an explicit adapter (@to-jsonl / @jsonl) at the boundary\n"
-            );
-            return 1;
+    // Object-mode segment detection. Object-mode stages must form a single
+    // contiguous run. Three patterns:
+    //   1. all-object → runObjectPipeline directly.
+    //   2. one object segment surrounded by byte segments → split into
+    //      segments connected by fd pipes. Boundary stages are typically
+    //      @jsonl (byte→object) and @to-jsonl (object→byte).
+    //   3. interleaved → error.
+    const objIdx: number[] = [];
+    for (let i = 0; i < n; i++) if (isObjectModeStage(node.commands[i]!)) objIdx.push(i);
+
+    if (objIdx.length > 0) {
+        const objStart = objIdx[0]!;
+        const objEnd   = objIdx[objIdx.length - 1]!;
+        for (let i = objStart; i <= objEnd; i++) {
+            if (!isObjectModeStage(node.commands[i]!)) {
+                await writeStderr(
+                    "jsh: object-mode @-fn stages must be contiguous in a pipeline\n"
+                );
+                return 1;
+            }
         }
-        const stages = node.commands.map(promoteBareJsToJsFunction);
-        return runObjectPipeline(stages, getStdoutFd());
+
+        const objStages = node.commands.slice(objStart, objEnd + 1).map(promoteBareJsToJsFunction);
+        const ctxStdin  = getStdinFd();
+        const ctxStdout = getStdoutFd();
+        const ctxStderr = getStderrFd();
+
+        if (objStart === 0 && objEnd === n - 1) {
+            return runObjectPipeline(objStages, ctxStdout);
+        }
+
+        const inputPipe  = objStart > 0     ? native.createCloexecPipe() : null;
+        const outputPipe = objEnd   < n - 1 ? native.createCloexecPipe() : null;
+
+        const objStdinIter: ObjectIterable = inputPipe
+            ? (fdLineReader(inputPipe[0]) as unknown as ObjectIterable)
+            : EMPTY_OBJECT_ITERABLE;
+        const objStdoutFd = outputPipe ? outputPipe[1] : ctxStdout;
+
+        const promises: Promise<number>[] = [];
+
+        if (objStart > 0) {
+            const subBefore: Pipeline = {
+                type: "Pipeline",
+                commands: node.commands.slice(0, objStart),
+                pipeOps: node.pipeOps?.slice(0, objStart - 1) ?? [],
+                negated: false,
+            } as unknown as Pipeline;
+            const ip = inputPipe!;
+            promises.push((async () => {
+                try {
+                    return await withIoContext(
+                        { stdinFd: ctxStdin, stdoutFd: ip[1], stderrFd: ctxStderr },
+                        () => executeMixedPipeline(subBefore),
+                    );
+                } finally { try { native.closeFd(ip[1]); } catch {} }
+            })());
+        }
+
+        promises.push((async () => {
+            try {
+                return await runObjectPipeline(objStages, objStdoutFd, objStdinIter);
+            } finally {
+                if (outputPipe) { try { native.closeFd(outputPipe[1]); } catch {} }
+                if (inputPipe)  { try { native.closeFd(inputPipe[0]);  } catch {} }
+            }
+        })());
+
+        if (objEnd < n - 1) {
+            const subAfter: Pipeline = {
+                type: "Pipeline",
+                commands: node.commands.slice(objEnd + 1),
+                pipeOps: node.pipeOps?.slice(objEnd + 1) ?? [],
+                negated: false,
+            } as unknown as Pipeline;
+            const op = outputPipe!;
+            promises.push((async () => {
+                try {
+                    return await withIoContext(
+                        { stdinFd: op[0], stdoutFd: ctxStdout, stderrFd: ctxStderr },
+                        () => executeMixedPipeline(subAfter),
+                    );
+                } finally { try { native.closeFd(op[0]); } catch {} }
+            })());
+        }
+
+        const codes = await Promise.all(promises);
+        return codes[codes.length - 1] ?? 0;
     }
 
     const stageExitCodes = new Array<number>(n).fill(0);
@@ -1153,13 +1225,48 @@ async function executeObjectStageRaw(node: JsFunction, stdin: ObjectIterable): P
     return { [Symbol.asyncIterator]: async function* () { yield ret; } };
 }
 
-async function runObjectPipeline(stages: JsFunction[], stdoutFd: number): Promise<number> {
-    let current: ObjectIterable = EMPTY_OBJECT_ITERABLE;
-    let lastErrIdx = -1;
-    let lastErr: unknown = null;
+function isTtyFd(fd: number): boolean {
+    try {
+        // Lazy require to avoid pulling node:tty into hot paths that don't need it.
+        const tty = require("node:tty") as { isatty(fd: number): boolean };
+        return tty.isatty(fd);
+    } catch { return false; }
+}
 
-    for (let i = 0; i < stages.length; i++) {
-        const stage = stages[i]!;
+async function runObjectPipeline(
+    stages: JsFunction[],
+    stdoutFd: number,
+    inputIter: ObjectIterable = EMPTY_OBJECT_ITERABLE,
+): Promise<number> {
+    // Implicit sink insertion when output is a tty and the last stage isn't
+    // itself a sink. Sink choice priority:
+    //   1. last stage's defaultSink (a registered function name)
+    //   2. fallback to @table
+    let effectiveStages = stages;
+    const last = stages[stages.length - 1];
+    const lastEntry = last ? lookupJsFunctionEntry(last.name) : undefined;
+    const lastIsSink = lastEntry?.isSink === true;
+    if (last && !lastIsSink && isTtyFd(stdoutFd)) {
+        const sinkName = lastEntry?.defaultSink && lookupJsFunctionEntry(lastEntry.defaultSink)
+            ? lastEntry.defaultSink
+            : (lookupJsFunctionEntry("table") ? "table" : null);
+        if (sinkName) {
+            const sinkStage: JsFunction = {
+                type: "JsFunction",
+                name: sinkName,
+                // defaultSink stages receive the source stage's args so
+                // formatters can react to user flags (e.g. @ls -la → @ls-format -la).
+                args: sinkName === lastEntry?.defaultSink ? last.args : [],
+                buffered: false,
+                redirections: [],
+            };
+            effectiveStages = [...stages, sinkStage];
+        }
+    }
+
+    let current: ObjectIterable = inputIter;
+    for (let i = 0; i < effectiveStages.length; i++) {
+        const stage = effectiveStages[i]!;
         try {
             current = await executeObjectStageRaw(stage, current);
         } catch (e) {
@@ -1169,23 +1276,26 @@ async function runObjectPipeline(stages: JsFunction[], stdoutFd: number): Promis
         }
     }
 
-    // Drain the terminal iterable. Errors thrown during iteration come from
-    // any stage in the chain (lazy pull) — attribute to the last stage as a
-    // best-effort default. JSON serialization of the row is the v1 sink;
-    // @table replaces this in stage 4.
+    // Drain the terminal iterable.
+    //   - string row → write raw (formatted output from @table / serializer)
+    //   - Buffer row → write raw
+    //   - other     → JSON-serialize one per line (placeholder when no sink)
     try {
         for await (const row of current) {
-            const line = JSON.stringify(row) + "\n";
-            await writeAll(stdoutFd, line);
+            if (typeof row === "string") {
+                await writeAll(stdoutFd, row);
+            } else if (Buffer.isBuffer(row) || row instanceof Uint8Array) {
+                await writeAll(stdoutFd, Buffer.isBuffer(row) ? row : Buffer.from(row));
+            } else {
+                await writeAll(stdoutFd, JSON.stringify(row) + "\n");
+            }
         }
         return 0;
     } catch (e) {
         const code = (e as NodeJS.ErrnoException)?.code;
         if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return 141;
-        lastErrIdx = stages.length - 1;
-        lastErr = e;
-        const name = stages[lastErrIdx]?.name || "{}";
-        await writeStderr(`jsh: @${name}: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}\n`);
+        const name = effectiveStages[effectiveStages.length - 1]?.name || "{}";
+        await writeStderr(`jsh: @${name}: ${e instanceof Error ? e.message : String(e)}\n`);
         return 1;
     }
 }

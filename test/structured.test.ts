@@ -57,14 +57,18 @@ describe("structured pipelines — channel", () => {
         assert.deepStrictEqual(JSON.parse(r.stdout), { total: 30 });
     });
 
-    it("should reject mixing object-mode and byte-mode in same pipeline", () => {
+    it("should reject non-contiguous object-mode segments", () => {
         const rc = `
-            jsh.registerJsFunction("obj", () => (async function*() {
+            jsh.registerJsFunction("obj1", () => (async function*() {
                 yield { x: 1 };
             })(), { mode: "object" });
+            jsh.registerJsFunction("obj2", (_a, s) => (async function*() {
+                for await (const r of s) yield r;
+            })(), { mode: "object" });
         `;
-        const r = withRc(rc, "@obj | cat");
-        assert.match(r.stderr, /object-mode @-fn cannot pipe to a byte-mode stage/);
+        // obj1 → cat → obj2 = object-mode stages with a byte stage between them.
+        const r = withRc(rc, "@obj1 | cat | @obj2");
+        assert.match(r.stderr, /object-mode @-fn stages must be contiguous/);
     });
 
     it("should support bare-name resolution for object-mode fns", () => {
