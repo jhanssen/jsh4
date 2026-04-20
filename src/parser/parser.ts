@@ -9,7 +9,7 @@ import type { Token } from "./lexer.js";
 
 export { ParseError, IncompleteInputError } from "./errors.js";
 import { ParseError, IncompleteInputError } from "./errors.js";
-import type { JsFunction } from "./ast.js";
+import type { JsFunction, JsArg } from "./ast.js";
 
 // Keywords that terminate a compound command body.
 const COMPOUND_TERMINATORS = new Set(["then", "elif", "else", "fi", "do", "done", "esac", "in"]);
@@ -225,7 +225,7 @@ export class Parser {
         const buffered = nameWithAt.startsWith("@!");
         const name = buffered ? nameWithAt.slice(2) : nameWithAt.slice(1);
 
-        const args: Word[] = [];
+        const args: JsArg[] = [];
         const redirections: Redirection[] = [];
 
         while (true) {
@@ -234,9 +234,21 @@ export class Parser {
                 redirections.push(this.parseOneRedirection());
                 continue;
             }
-            if (tok.type !== TokenType.Word) break;
-            args.push(tok.word!);
-            this.lexer.next();
+            if (tok.type === TokenType.Word) {
+                args.push({ kind: "word", word: tok.word! });
+                this.lexer.next();
+                continue;
+            }
+            // `@{ ... }` mid-arg-list is an inline JS expression, evaluated
+            // to a value (function, object, number, ...) and passed as that
+            // arg's value. Lets `@where @{ f => f.size > 10 }` write the
+            // predicate as real JS instead of a quoted string.
+            if (tok.type === TokenType.JsInline) {
+                args.push({ kind: "js", body: tok.value });
+                this.lexer.next();
+                continue;
+            }
+            break;
         }
 
         return { type: "JsFunction", name, args, buffered, redirections };

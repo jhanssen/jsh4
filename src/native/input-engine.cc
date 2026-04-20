@@ -15,6 +15,9 @@
 #include <poll.h>
 #include <pwd.h>
 #include <grp.h>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/xattr.h>
+#endif
 
 extern "C" {
 #include <grapheme.h>
@@ -2491,6 +2494,24 @@ static Napi::Value GetpwuidName(const Napi::CallbackInfo &info) {
     return Napi::String::New(env, pwd.pw_name ? pwd.pw_name : "");
 }
 
+// Returns true if `path` has at least one extended attribute, false otherwise.
+// Uses the no-follow variant so symlinks report on themselves, matching how
+// `ls -l` decides whether to print the `@` marker. Returns false on platforms
+// without xattr support (and on macOS / Linux when listxattr fails).
+static Napi::Value HasXattr(const Napi::CallbackInfo &info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString()) return Napi::Boolean::New(env, false);
+    const std::string path = info[0].As<Napi::String>().Utf8Value();
+#if defined(__APPLE__)
+    const ssize_t n = listxattr(path.c_str(), nullptr, 0, XATTR_NOFOLLOW);
+#elif defined(__linux__)
+    const ssize_t n = llistxattr(path.c_str(), nullptr, 0);
+#else
+    const ssize_t n = -1;
+#endif
+    return Napi::Boolean::New(env, n > 0);
+}
+
 // POSIX gid → group name via getgrgid_r. Same NSS-aware semantics.
 static Napi::Value GetgrgidName(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
@@ -2711,6 +2732,7 @@ Napi::Object InitInputEngine(Napi::Env env, Napi::Object exports) {
     exports.Set("inputColorForFile",  Napi::Function::New(env, ColorForFile));
     exports.Set("getpwuidName",       Napi::Function::New(env, GetpwuidName));
     exports.Set("getgrgidName",       Napi::Function::New(env, GetgrgidName));
+    exports.Set("hasXattr",           Napi::Function::New(env, HasXattr));
     exports.Set("inputEAGAIN",        Napi::Function::New(env, GetEAGAIN));
     // Fd utilities (previously in linenoise.cc)
     exports.Set("closeFd",            Napi::Function::New(env, CloseFd));

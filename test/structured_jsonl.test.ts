@@ -38,7 +38,7 @@ describe("@to-jsonl: object → bytes boundary", () => {
 describe("@jsonl: bytes → object boundary", () => {
     it("should parse one JSON value per line into objects", () => {
         const r = spawnJsh({
-            input: 'printf \'{"a":1}\\n{"a":2}\\n{"a":3}\\n\' | @jsonl | @where \'r => r.a > 1\' | @to-jsonl\nexit\n',
+            input: 'printf \'{"a":1}\\n{"a":2}\\n{"a":3}\\n\' | @jsonl | @where @{ r => r.a > 1 } | @to-jsonl\nexit\n',
             jshrc: "/dev/null",
         });
         const rows = jsonLines(r.stdout) as Array<{ a: number }>;

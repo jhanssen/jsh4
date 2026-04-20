@@ -9,7 +9,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 const fsReadAsync = promisify(fsRead);
 import type {
     ASTNode, SimpleCommand, Pipeline, AndOr, List, BraceGroup, Subshell, Redirection,
-    IfClause, WhileClause, ForClause, ArithmeticFor, SelectClause, FunctionDef, JsFunction, CaseClause,
+    IfClause, WhileClause, ForClause, ArithmeticFor, SelectClause, FunctionDef, JsFunction, JsArg, CaseClause,
     ConditionalExpr,
 } from "../parser/index.js";
 import { parse } from "../parser/index.js";
@@ -621,7 +621,7 @@ async function executeSimple(cmd: SimpleCommand): Promise<ExecResult> {
         const synthetic: JsFunction = {
             type: "JsFunction",
             name: command,
-            args: cmd.words.slice(1),
+            args: cmd.words.slice(1).map(w => ({ kind: "word" as const, word: w })),
             buffered: false,
             redirections: cmd.redirections,
         };
@@ -993,7 +993,7 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
                 jsNode = {
                     type: "JsFunction",
                     name,
-                    args: sc.words.slice(1),
+                    args: sc.words.slice(1).map(w => ({ kind: "word" as const, word: w })),
                     buffered: false,
                     redirections: sc.redirections,
                 };
@@ -1042,6 +1042,32 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
 }
 
 // ---- JS stage execution -----------------------------------------------------
+
+// Expand the args of an @-fn call. `{ kind: "word" }` args go through the
+// usual shell word-expansion (yielding string[]), `{ kind: "js" }` args
+// (`@{...}`) are evaluated as JS expressions and passed as their result
+// value (function, object, number — whatever the expression produced).
+// Returns mixed `unknown[]` so the receiving fn sees real values, not
+// stringified ones.
+async function expandJsArgs(args: JsArg[]): Promise<unknown[]> {
+    const out: unknown[] = [];
+    for (const a of args) {
+        if (a.kind === "word") {
+            const expanded = await expandWord(a.word);
+            for (const s of expanded) out.push(s);
+            continue;
+        }
+        // a.kind === "js" — evaluate `@{ expr }` as an expression.
+        try {
+            // eslint-disable-next-line no-new-func
+            const v = new Function(`"use strict"; return (${a.body})`)();
+            out.push(v);
+        } catch (e) {
+            throw new Error(`@{}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    }
+    return out;
+}
 
 async function executeJsStage(node: JsFunction, stdinFd: number, stdoutFd: number): Promise<ExecResult> {
     if (isObjectModeStage(node)) {
@@ -1092,7 +1118,7 @@ async function executeJsStageRaw(node: JsFunction, stdinFd: number, stdoutFd: nu
         fn = found;
     }
 
-    const args = (await Promise.all(node.args.map(expandWord))).flat();
+    const args = await expandJsArgs(node.args);
 
     // Build stdin iterable — line-by-line reader from a raw fd.
     // When not in a pipeline (stdinFd === 0), provide an empty async iterable
@@ -1212,7 +1238,7 @@ async function executeObjectStageRaw(node: JsFunction, stdin: ObjectIterable): P
         fn = found;
     }
 
-    const args = (await Promise.all(node.args.map(expandWord))).flat();
+    const args = await expandJsArgs(node.args);
 
     const userCtx: IoContext = { stdinFd: getStdinFd(), stdoutFd: getStdoutFd(), stderrFd: getStderrFd() };
     const ret = await withIoContext(userCtx, () => Promise.resolve(fn(args, stdin)));
@@ -1332,7 +1358,7 @@ function promoteBareJsToJsFunction(node: ASTNode): JsFunction {
     return {
         type: "JsFunction",
         name: firstWord.value,
-        args: sc.words.slice(1),
+        args: sc.words.slice(1).map(w => ({ kind: "word" as const, word: w })),
         buffered: false,
         redirections: sc.redirections,
     };

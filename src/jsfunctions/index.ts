@@ -31,8 +31,12 @@ import type { TypeIR } from "../structured/ir.js";
 import { cacheLookup, cacheStore } from "../structured/cache.js";
 import { fileURLToPath } from "node:url";
 
+// Args are a mixed array. Word-shaped args (`@where foo`) arrive as strings;
+// `@{...}` inline-JS args arrive as their evaluated value (function, object,
+// number, ...). Receivers that expect a specific shape (e.g. @where wants
+// args[0] to be a function) check `typeof` and throw on mismatch.
 export type JsPipelineFunction = (
-    args: string[],
+    args: unknown[],
     stdin: AsyncIterable<string> | AsyncIterable<unknown> | null
 ) => unknown;
 

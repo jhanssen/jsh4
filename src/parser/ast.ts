@@ -183,11 +183,19 @@ export interface ConditionalExpr extends ASTNode {
     words: Word[];  // tokens between [[ and ]]
 }
 
+// Argument to a JS pipeline call. Either a regular shell word (expanded to
+// a string at execution time) or a `@{...}` inline JS expression (evaluated
+// to whatever value the expression produces — function, object, number, ...).
+// The receiving @-fn sees the args as a mixed `unknown[]`.
+export type JsArg =
+    | { kind: "word"; word: Word }
+    | { kind: "js"; body: string };
+
 export interface JsFunction extends ASTNode {
     type: "JsFunction";
     name: string;           // function name (empty for inline @{ })
     inlineBody?: string;    // raw JS expression for @{ expr }
-    args: Word[];
+    args: JsArg[];
     buffered: boolean;      // true for @! mode
     redirections: Redirection[];
 }

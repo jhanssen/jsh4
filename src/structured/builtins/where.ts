@@ -1,27 +1,22 @@
-// Filter rows by a predicate. The predicate is supplied as a JS expression
-// in args[0..] (joined by spaces) and evaluated to a function once at stage
-// start. Each row that returns truthy passes through.
+// Filter rows by a predicate function. The predicate is the first arg and
+// is expected to be a JS function value — typically supplied via the inline
+// JS arg form `@{...}`:
 //
-//   @ls | @where 'f => f.size > 1024'
-//   @ps | @where 'p => p.user === "root"'
+//   @ls | @where @{ f => f.size > 1024 }
+//   @ps | @where @{ p => p.user === "root" }
+//
+// Word-shaped args (e.g. `@where foo`) arrive as strings and are rejected.
 
 export async function* where(
-    args: string[],
+    args: unknown[],
     stdin: AsyncIterable<unknown>,
 ): AsyncGenerator<unknown> {
-    if (args.length === 0) throw new Error("@where: predicate required");
-    const src = args.join(" ");
-    let predicate: (row: unknown) => unknown;
-    try {
-        // eslint-disable-next-line no-new-func
-        predicate = new Function(`"use strict"; return (${src})`)() as (row: unknown) => unknown;
-    } catch (e) {
-        throw new Error(`@where: bad predicate: ${e instanceof Error ? e.message : e}`);
-    }
+    if (args.length === 0) throw new Error("@where: predicate required (use @{ row => ... })");
+    const predicate = args[0];
     if (typeof predicate !== "function") {
-        throw new Error(`@where: predicate is not a function: ${src}`);
+        throw new Error("@where: predicate must be a function — wrap the lambda in @{ ... }");
     }
     for await (const row of stdin) {
-        if (predicate(row)) yield row;
+        if ((predicate as (r: unknown) => unknown)(row)) yield row;
     }
 }

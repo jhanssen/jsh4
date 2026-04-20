@@ -20,7 +20,7 @@ describe("@where built-in", () => {
                 yield { n: 1 }; yield { n: 2 }; yield { n: 3 };
             })());
         `;
-        const r = withRcTs(rc, "@src | @where 'r => r.n >= 2'");
+        const r = withRcTs(rc, "@src | @where @{ r => r.n >= 2 }");
         assert.deepStrictEqual(jsonLines(r.stdout), [{ n: 2 }, { n: 3 }]);
     });
 
@@ -36,8 +36,8 @@ describe("@where built-in", () => {
         const rc = `
             jsh.registerJsFunction("src", () => (async function*() { yield {n:1}; })());
         `;
-        const r = withRcTs(rc, "@src | @where '42'");
-        assert.match(r.stderr, /@where: predicate is not a function/);
+        const r = withRcTs(rc, "@src | @where @{ 42 }");
+        assert.match(r.stderr, /@where: predicate must be a function/);
     });
 });
 
@@ -62,7 +62,7 @@ describe("@select built-in", () => {
                 yield { first: "Jan", last: "Doe" };
             })());
         `;
-        const r = withRcTs(rc, "@src | @select 'r => ({full: r.first + \" \" + r.last})'");
+        const r = withRcTs(rc, "@src | @select @{ r => ({full: r.first + ' ' + r.last}) }");
         assert.deepStrictEqual(jsonLines(r.stdout), [{ full: "Jan Doe" }]);
     });
 });
@@ -164,7 +164,7 @@ describe("composed pipelines", () => {
                 for (let i = 1; i <= 100; i++) yield { i, big: i > 50 };
             })());
         `;
-        const r = withRcTs(rc, "@src | @where 'r => r.big' | @select i | @take 3");
+        const r = withRcTs(rc, "@src | @where @{ r => r.big } | @select i | @take 3");
         assert.deepStrictEqual(jsonLines(r.stdout), [{ i: 51 }, { i: 52 }, { i: 53 }]);
     });
 });

@@ -82,7 +82,7 @@ describe("@count built-in", () => {
             writeFileSync(join(dir, "small"), "x");
             writeFileSync(join(dir, "big"), "x".repeat(100));
             const r = spawnJsh({
-                input: `@ls ${dir} | @where 'f => f.size >= 100' | @count\nexit\n`,
+                input: `@ls ${dir} | @where @{ f => f.size >= 100 } | @count\nexit\n`,
                 jshrc: "/dev/null",
             });
             const out = jsonLines(r.stdout)[0] as { count: number };
@@ -105,7 +105,7 @@ describe("@ps built-in", () => {
 
     it("should support filtering by user", () => {
         const r = spawnJsh({
-            input: "@ps | @where 'p => p.pid === 1' | @select pid,user\nexit\n",
+            input: "@ps | @where @{ p => p.pid === 1 } | @select pid,user\nexit\n",
             jshrc: "/dev/null",
         });
         const rows = jsonLines(r.stdout) as Array<{ pid: number; user: string }>;

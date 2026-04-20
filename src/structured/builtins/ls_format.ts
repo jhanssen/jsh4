@@ -48,14 +48,21 @@ function gidName(gid: number): string {
 }
 
 // ---- mtime → ls-style date -------------------------------------------------
+// Matches BSD/OpenBSD print.c:
+//   recent (within ~6 months and not in the future): "%b %e %H:%M"
+//   else:                                            "%b %e  %Y"  (note the
+//                                                     double space)
+// strftime's %e is the day-of-month, space-padded for single digits.
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-const HALF_YEAR_MS = 1000 * 60 * 60 * 24 * 180;
+const SIX_MONTHS_MS = 1000 * 60 * 60 * 24 * 30 * 6;
 
 function mtimeString(d: Date): string {
     const month = MONTHS[d.getMonth()]!;
     const day = String(d.getDate()).padStart(2, " ");
-    if (Date.now() - d.getTime() < HALF_YEAR_MS) {
+    const now = Date.now();
+    const t = d.getTime();
+    if (t > now - SIX_MONTHS_MS && t <= now) {
         const hh = String(d.getHours()).padStart(2, "0");
         const mm = String(d.getMinutes()).padStart(2, "0");
         return `${month} ${day} ${hh}:${mm}`;
@@ -149,17 +156,29 @@ export async function* lsFormat(
         return { f, u, g, sz };
     });
 
-    const total = rows.reduce((acc, f) => acc + Math.ceil(f.size / 1024) * 2, 0);
+    // `total N` where N is the sum of st_blocks (512-byte units), matching
+    // BSD/OpenBSD `ls`'s default blocksize.
+    const total = rows.reduce((acc, f) => acc + (f.blocks ?? 0), 0);
     yield `total ${total}\n`;
+    // Per OpenBSD print.c printlong():
+    //   "%s %*u "       mode SP nlink_right SP
+    //   "%-*s  "        user_left SP SP
+    //   "%-*s  "        group_left SP SP
+    //   "%*lld "        size_right SP
+    //   "<date> "       date SP
+    //   name\n
     for (const { f, u, g, sz } of sized) {
-        yield [
-            modeString(f.mode, f.isDir, f.isSymlink),
-            padLeft(String(f.nlink), wNlink),
-            padRight(u, wUser),
-            padRight(g, wGroup),
-            padLeft(sz, wSize),
-            mtimeString(f.mtime),
-            colorize(f.name, colorForFile(f)),
-        ].join(" ") + "\n";
+        // Trailing `@` after the mode marks the presence of extended
+        // attributes — same as macOS `ls -l`. Space if absent so columns
+        // still line up.
+        const xattr = f.hasXattr ? "@" : " ";
+        yield modeString(f.mode, f.isDir, f.isSymlink) + xattr
+            + " " + padLeft(String(f.nlink), wNlink)
+            + " " + padRight(u, wUser)
+            + "  " + padRight(g, wGroup)
+            + "  " + padLeft(sz, wSize)
+            + " " + mtimeString(f.mtime)
+            + " " + colorize(f.name, colorForFile(f))
+            + "\n";
     }
 }
