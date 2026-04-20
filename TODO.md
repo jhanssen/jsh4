@@ -127,6 +127,17 @@
 - [x] Async generator functions (yield lines to downstream)
 - [x] Return type dispatch: string, Buffer, Generator, AsyncGenerator, Promise, `{ exitCode }`, void
 - [x] Automatic pipe close on function completion (finally block)
+- [x] `@{ expr }` as inline-JS argument to other `@`-fns (`@where @{ f => f.size > 1024 }`) — argument is the evaluated value, not a string
+
+### Structured pipelines
+- [x] Object-mode `@`-fns with in-process `AsyncIterable<unknown>` channels between adjacent stages (no fd/serialization)
+- [x] Mixed bytes/objects pipelines via `@jsonl` / `@to-jsonl` adapters with fd boundaries
+- [x] Type IR + schema extractor (TypeScript compiler API) extracted at build time for built-ins, on cache miss for user `.ts` jshrcs
+- [x] Schema cache under `$XDG_CACHE_HOME/jsh/types/v1/` with atomic-rename writes, content-hash invalidation
+- [x] Loader prologue auto-binds module-local `jsh._withSource(import.meta.url)` for `.ts`/`.mts` user files — registrations carry source URL automatically
+- [x] `defaultSink` / `isSink` / `hidden` registry plumbing: source operators ship their own preferred formatter (e.g. `@ls` → `@ls-format`), executor auto-inserts when stdout is a tty
+- [x] Built-ins shipped: `@ls`/`@ls-format` (BSD `ls -la` parity, NSS-backed uid/gid, LS_COLORS, xattr `@` marker), `@ps`, `@where`, `@select`, `@take`, `@count`, `@table`, `@jsonl`, `@to-jsonl`
+- [x] Native bindings: `getpwuid_r` / `getgrgid_r` / `listxattr` for the formatter
 
 ### REPL / Terminal UI
 - [x] Custom InputEngine (replaced linenoise) with non-blocking uv_poll
@@ -243,6 +254,53 @@
 - [ ] **`$(@func)`** — command substitution from JS function (in-process, no fork)
 - [ ] **AbortSignal on pipe close** — propagate EPIPE to JS generator as cancellation
 - [ ] **Command-line module import** — Today JS module imports are jshrc-only (via the Node loader hooks registered in `src/repl/index.ts`). A command like `import ./completion.jsm` or `@import ./completion.jsm` should do what jshrc's top-of-file `import` does: dynamically load a module, register its exports as `@`-functions, and make any defined builtins / `complete` specs active in the current session. Unblocks users from packaging completion shims and other @-function libraries as reusable modules instead of pasting everything into jshrc.
+
+### Structured pipelines
+
+The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction + cache, loader prologue auto-mode for `.ts` rcs, `defaultSink`/`isSink`/`hidden`, `@{...}` as inline-JS arg form). Built-ins so far: `@ls`/`@ls-format`, `@ps`, `@where`, `@select`, `@take`, `@count`, `@table`, `@jsonl`, `@to-jsonl`. Open work:
+
+#### Ergonomics
+
+- [ ] **Path B — schema-driven unquoted lambda args.** `@where f => f.x > 10` without `@{...}`. Parser consults the registry at parse time; if the arg slot's schema declares a function type, switch lexer mode and read forward as a JS expression until an unbracketed `|`/`;`/`\n`. ~400-500 LOC: schema annotation for lambda arg slots, JS sub-lexer respecting `()`/`[]`/`{}`/strings/template-literals, parser-registry coupling, AST node, executor wiring, backward-compat with `@{...}` form.
+- [ ] **Tab completion against schemas** — Tier 0: chain walk (~100 LOC) for `f.foo.<tab>` against the upstream stage's output schema. Argument-name completion (`@select <tab>` → field names from upstream). Defer nested-expression support (`f => arr.find(x => x.|)`) until TS 7's Go port lands and we can use live `getQuickInfoAtPosition`.
+- [ ] **Pipeline construction-time validation** — Catch `@select cput` typos before the pipeline runs. The unifier already has the data; nothing reads it yet. Built on the same parser-registry coupling as Path B.
+
+#### Operator stdlib gaps
+
+- [ ] `@sort` (buffered) — by key or lambda
+- [ ] `@group` / `@group-by` — buffered aggregation
+- [ ] `@uniq` (with optional key)
+- [ ] `@map` — generic T→U transform via lambda
+- [ ] `@drop`, `@first`, `@last`
+- [ ] `@sum` / `@avg` / `@min` / `@max`
+- [ ] `@find` — recursive walk
+- [ ] `@du`, `@env`, `@hist`, `@stat`
+
+#### Visual / formatter parity
+
+- [ ] **`@ps-format`** — mimic `ps aux` like `@ls-format` mimics `ls -l`.
+- [ ] **Per-field display formatters in generic `@table`** — date → relative time, mode → octal/symbolic, big numbers → human-readable. Type-driven, so user objects benefit too.
+- [ ] **Wider LS_COLORS coverage** — symlink targets, char/block devices, fifos, sockets.
+- [ ] **`@ls-format` short (non-`-l`) form** — currently always shows just the name when `-l` is absent. Match BSD `ls`'s columnar layout (multiple names per line, terminal-width-aware).
+
+#### Cross-format adapters
+
+- [ ] `@csv` / `@to-csv`
+- [ ] `@yaml` / `@to-yaml`
+- [ ] **Auto-adapter insertion** — `cat foo.json | @where ...` automatically inserts `@jsonl` at the bytes/objects boundary. Today rejected with an error. Use `defaultSink`-shaped declaration on common shapes, or a `from`/`to` registry per format.
+
+#### Robustness / control
+
+- [ ] **AbortSignal for cancellation** — Plumb through the IO context so buffered ops (`@sort`, `@group`) bail mid-run on Ctrl-C instead of running to completion before honoring it.
+- [ ] **Per-row error policy** — `--on-error=fail|skip` flag on operators. Today a lambda throw kills the stage.
+- [ ] **Synchronous schema extraction on cache miss** — Today extraction is fire-and-forget; the schema lands on the *next* shell run. Optionally await the extraction so first-run users get completion + validation immediately. Cost is the ~1s tsc cold start the first time the rc loads.
+
+#### Polish
+
+- [ ] **Tests for the `@{...}` arg form** — Migrated existing tests when adding it; needs explicit coverage for the new feature itself (mixing word + js args, errors on bad expressions, JS scope, etc.).
+- [ ] **`jshrc.d.ts` updates** — Document the new contracts: `mode`, `isSink`, `hidden`, `defaultSink`, `JsArg`, the unknown-args signature.
+- [ ] **DESIGN.md** — Document the object channel architecture, schema cache layout, sink/formatter pattern.
+- [ ] **`@xattr`** — User-level access to extended attributes (read/list/set), mirroring the macOS `xattr` command. Native bindings already include `hasXattr`; add `listxattr` + `getxattr`.
 
 ### Terminal / Input
 
