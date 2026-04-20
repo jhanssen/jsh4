@@ -64,3 +64,15 @@ export function withRc(rcBody: string, input: string): { stdout: string; stderr:
         try { unlinkSync(rc); } catch {}
     }
 }
+
+/** Same as withRc but writes a .ts/.mts file so the loader prologue fires. */
+export function withRcTs(rcBody: string, input: string, ext: "ts" | "mts" = "ts"): { stdout: string; stderr: string } {
+    const rc = `/tmp/jsh_test_rc_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+    writeFileSync(rc, rcBody);
+    try {
+        const r = spawnJsh({ jshrc: rc, input: input + "\nexit\n" });
+        return { stdout: r.stdout.trim(), stderr: r.stderr.trim() };
+    } finally {
+        try { unlinkSync(rc); } catch {}
+    }
+}

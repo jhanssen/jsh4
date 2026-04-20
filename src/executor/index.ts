@@ -16,7 +16,8 @@ import { parse } from "../parser/index.js";
 import { expandWord, expandWordToStr, registerCaptureImpl, registerProcessSubstImpl, evalArithmetic } from "../expander/index.js";
 import { $, pushScope, popScope, declareLocal, pushSnapshot, popSnapshot, declareReadonly, isReadonly, getReadonlyVars } from "../variables/index.js";
 import { pushParams, popParams, shiftParams, setParams, snapshotParams, restoreParams, getAllParams } from "../variables/positional.js";
-import { lookupJsFunction, lookupBareJsFunction } from "../jsfunctions/index.js";
+import { lookupJsFunction, lookupBareJsFunction, lookupJsFunctionEntry } from "../jsfunctions/index.js";
+import { EMPTY_OBJECT_ITERABLE, toObjectIterable, type ObjectIterable } from "../structured/channel.js";
 import { getAlias } from "../api/index.js";
 import { shellOpts, saveShellOpts, restoreShellOpts } from "../shellopts/index.js";
 
@@ -779,6 +780,25 @@ async function executePipeline(node: Pipeline): Promise<ExecResult> {
 
 async function executeMixedPipeline(node: Pipeline): Promise<number> {
     const n = node.commands.length;
+
+    // Object-mode pipeline detection. If any stage is an object-mode @-fn,
+    // every stage in the pipeline must also be one — adapters across the
+    // bytes/objects boundary aren't auto-inserted yet (stage 6). Until then,
+    // a mixed pipeline errors with a hint.
+    let objectStageCount = 0;
+    for (const cmd of node.commands) if (isObjectModeStage(cmd)) objectStageCount++;
+    if (objectStageCount > 0) {
+        if (objectStageCount !== n) {
+            await writeStderr(
+                "jsh: object-mode @-fn cannot pipe to a byte-mode stage; " +
+                "insert an explicit adapter (@to-jsonl / @jsonl) at the boundary\n"
+            );
+            return 1;
+        }
+        const stages = node.commands.map(promoteBareJsToJsFunction);
+        return runObjectPipeline(stages, getStdoutFd());
+    }
+
     const stageExitCodes = new Array<number>(n).fill(0);
 
     // Create cloexec pipes between all adjacent stages.
@@ -952,6 +972,10 @@ async function executeMixedPipeline(node: Pipeline): Promise<number> {
 // ---- JS stage execution -----------------------------------------------------
 
 async function executeJsStage(node: JsFunction, stdinFd: number, stdoutFd: number): Promise<ExecResult> {
+    if (isObjectModeStage(node)) {
+        const exitCode = await runObjectPipeline([node], stdoutFd);
+        return { exitCode };
+    }
     const exitCode = await executeJsStageRaw(node, stdinFd, stdoutFd);
     return { exitCode };
 }
@@ -1090,6 +1114,118 @@ function isAsyncGenerator(v: unknown): v is AsyncGenerator {
 function isGenerator(v: unknown): v is Generator {
     return v != null && typeof (v as Generator)[Symbol.iterator] === "function"
         && typeof (v as Generator).next === "function";
+}
+
+// ---- Object-mode stage execution -------------------------------------------
+// Adjacent object-mode @-fn stages share an AsyncIterable<unknown> channel
+// directly — no fd, no serialization. Pull-based iteration provides natural
+// backpressure. The terminal stage's iterable is drained by the executor and
+// (until @table lands in stage 4) JSON-stringified per row to stdoutFd.
+
+async function executeObjectStageRaw(node: JsFunction, stdin: ObjectIterable): Promise<ObjectIterable> {
+    let fn: Function;
+    if (node.inlineBody !== undefined) {
+        // eslint-disable-next-line no-new-func
+        const evaluated = new Function(`"use strict"; return (${node.inlineBody})`)();
+        if (typeof evaluated !== "function") {
+            // A non-function inline body in object position is wrapped as a
+            // single-row iterable. Lets `@{ 42 }` participate as a constant
+            // source.
+            return { [Symbol.asyncIterator]: async function* () { yield evaluated; } };
+        }
+        fn = evaluated;
+    } else {
+        const found = lookupJsFunction(node.name);
+        if (!found) throw new Error(`@${node.name}: function not found`);
+        fn = found;
+    }
+
+    const args = (await Promise.all(node.args.map(expandWord))).flat();
+
+    const userCtx: IoContext = { stdinFd: getStdinFd(), stdoutFd: getStdoutFd(), stderrFd: getStderrFd() };
+    const ret = await withIoContext(userCtx, () => Promise.resolve(fn(args, stdin)));
+
+    const iter = toObjectIterable(ret);
+    if (iter) return iter;
+    if (ret === null || ret === undefined) return EMPTY_OBJECT_ITERABLE;
+    // Single non-iterable return value — wrap as a single-row iterable so
+    // reducers like `@count` can `return n`.
+    return { [Symbol.asyncIterator]: async function* () { yield ret; } };
+}
+
+async function runObjectPipeline(stages: JsFunction[], stdoutFd: number): Promise<number> {
+    let current: ObjectIterable = EMPTY_OBJECT_ITERABLE;
+    let lastErrIdx = -1;
+    let lastErr: unknown = null;
+
+    for (let i = 0; i < stages.length; i++) {
+        const stage = stages[i]!;
+        try {
+            current = await executeObjectStageRaw(stage, current);
+        } catch (e) {
+            const name = stage.name || "{}";
+            await writeStderr(`jsh: @${name}: ${e instanceof Error ? e.message : String(e)}\n`);
+            return 1;
+        }
+    }
+
+    // Drain the terminal iterable. Errors thrown during iteration come from
+    // any stage in the chain (lazy pull) — attribute to the last stage as a
+    // best-effort default. JSON serialization of the row is the v1 sink;
+    // @table replaces this in stage 4.
+    try {
+        for await (const row of current) {
+            const line = JSON.stringify(row) + "\n";
+            await writeAll(stdoutFd, line);
+        }
+        return 0;
+    } catch (e) {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return 141;
+        lastErrIdx = stages.length - 1;
+        lastErr = e;
+        const name = stages[lastErrIdx]?.name || "{}";
+        await writeStderr(`jsh: @${name}: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}\n`);
+        return 1;
+    }
+}
+
+// Determine whether a pipeline stage is an object-mode @-function. Returns
+// false for inline @{ } (no schema, defaults to byte) and for stages whose
+// resolved JS function is not registered with mode === "object".
+function isObjectModeStage(node: ASTNode): boolean {
+    if (node.type === "JsFunction") {
+        const jf = node as JsFunction;
+        if (jf.inlineBody !== undefined) return false;
+        const entry = lookupJsFunctionEntry(jf.name);
+        return entry?.mode === "object";
+    }
+    if (node.type === "SimpleCommand") {
+        const sc = node as SimpleCommand;
+        if (sc.words.length === 0) return false;
+        const firstWord = sc.words[0]!.segments[0];
+        if (!firstWord || firstWord.type !== "Literal") return false;
+        const name = (firstWord as { value: string }).value;
+        const entry = lookupJsFunctionEntry(name);
+        return entry?.mode === "object" && !entry.atOnly;
+    }
+    return false;
+}
+
+// Promote a SimpleCommand bare-name JS-function call to a JsFunction node
+// (used when an object-mode pipeline contains a stage written as `name args`
+// rather than `@name args`).
+function promoteBareJsToJsFunction(node: ASTNode): JsFunction {
+    if (node.type === "JsFunction") return node as JsFunction;
+    const sc = node as SimpleCommand;
+    const firstWord = sc.words[0]!.segments[0] as { value: string };
+    return {
+        type: "JsFunction",
+        name: firstWord.value,
+        args: sc.words.slice(1),
+        buffered: false,
+        redirections: sc.redirections,
+    };
 }
 
 // Async line reader from a raw file descriptor — avoids stream lifecycle issues.

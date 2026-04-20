@@ -1,4 +1,5 @@
 import { createRequire, register } from "node:module";
+import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { readFileSync, existsSync } from "node:fs";
@@ -269,7 +270,7 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         }
     }
 
-    const jshApi = {
+    const jshApi: Record<string, unknown> = {
         $, setColorize, setTheme,
         alias, unalias, registerJsFunction, exec,
         // Mark an exported JS function as callable only via the @-prefixed
@@ -328,6 +329,16 @@ async function loadRc(customPath: string | undefined): Promise<void> {
         stdout: jshStdout,
         stderr: jshStderr,
     };
+    // Bound per-module variant: returned by the loader prologue so each
+    // .ts/.mts module's `jsh.registerJsFunction(...)` carries its own
+    // import.meta.url as the source for mode inference + schema cache lookup.
+    jshApi["_withSource"] = (url: string) => Object.assign({}, jshApi, {
+        registerJsFunction: (
+            name: string,
+            fn: JsPipelineFunction,
+            opts: Parameters<typeof registerJsFunction>[2] = {},
+        ) => registerJsFunction(name, fn, { ...opts, source: opts.source ?? url }),
+    });
     (globalThis as Record<string, unknown>)["jsh"] = jshApi;
 
     // Take over console.* so jshrc / dependency / @-function code that
@@ -346,6 +357,7 @@ async function loadRc(customPath: string | undefined): Promise<void> {
 
     try {
         const rc = await import(rcPath);
+        const rcSourceUrl = pathToFileURL(rcPath).href;
         for (const [name, value] of Object.entries(rc)) {
             if (name === "default") continue;
             if (typeof value === "function") {
@@ -354,7 +366,10 @@ async function loadRc(customPath: string | undefined): Promise<void> {
                 // exported functions can opt out of bare-name resolution
                 // without a separate registration call.
                 const fn = value as JsPipelineFunction & { atOnly?: boolean };
-                registerJsFunction(name, fn, { atOnly: fn.atOnly === true });
+                registerJsFunction(name, fn, {
+                    atOnly: fn.atOnly === true,
+                    source: rcSourceUrl,
+                });
             }
         }
     } catch (e: unknown) {

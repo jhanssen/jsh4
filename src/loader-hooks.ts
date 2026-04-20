@@ -1,8 +1,13 @@
-// ESM loader hook:
-//   1. Resolves `jsh` / `jsh/...` specifiers to this install's dist tree.
-//   2. Falls back to `$XDG_DATA_HOME/jsh/node_modules/` when a bare specifier
-//      can't be found via the default walk-up. This lets ~/.jshrc[.ts|.js]
-//      import packages that aren't installed next to the home dir.
+// ESM loader hooks:
+//   1. resolve(): maps `jsh` / `jsh/...` specifiers to this install's dist
+//      tree; falls back to `$XDG_DATA_HOME/jsh/node_modules/` when a bare
+//      specifier can't be found via the default walk-up.
+//   2. load(): for user-side `.ts`/`.mts` modules, prepends a one-line
+//      prologue that binds the module's `jsh` to a wrapped variant carrying
+//      `import.meta.url` as the `source` for any `registerJsFunction` call.
+//      This lets the registry default to object-mode and look up the schema
+//      cache without per-call ceremony. Modules under the jsh install dir
+//      (dist/) and inside node_modules are skipped.
 
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -39,6 +44,46 @@ function isBareSpecifier(spec: string): boolean {
     if (spec.startsWith('file:')) return false;
     if (/^[a-z]+:/i.test(spec)) return false;
     return true;
+}
+
+interface LoadContext {
+    format?: string | null;
+    importAttributes?: Record<string, string>;
+    conditions: string[];
+}
+interface LoadResult {
+    format: string;
+    source?: string | ArrayBuffer | NodeJS.ArrayBufferView;
+    shortCircuit?: boolean;
+}
+type NextLoad = (url: string, context: LoadContext) => LoadResult | Promise<LoadResult>;
+
+const PROLOGUE = `const jsh = (globalThis.jsh && globalThis.jsh._withSource) ? globalThis.jsh._withSource(import.meta.url) : globalThis.jsh;\n`;
+
+function shouldInjectPrologue(url: string): boolean {
+    if (!url.startsWith('file://')) return false;
+    if (!url.endsWith('.ts') && !url.endsWith('.mts')) return false;
+    if (url.startsWith(jshRoot)) return false;
+    if (url.includes('/node_modules/')) return false;
+    return true;
+}
+
+export async function load(url: string, context: LoadContext, nextLoad: NextLoad): Promise<LoadResult> {
+    if (!shouldInjectPrologue(url)) return nextLoad(url, context);
+
+    // Force module-typescript: jshrc + user-imported .ts files are always
+    // ESM. Without this hint, Node falls back to nearest package.json which
+    // for a stray /tmp/foo.ts means commonjs-typescript and breaks import.meta.
+    const result = await nextLoad(url, { ...context, format: 'module-typescript' });
+    let src: string;
+    if (typeof result.source === 'string') {
+        src = result.source;
+    } else if (result.source) {
+        src = Buffer.from(result.source as Uint8Array).toString('utf8');
+    } else {
+        return result;
+    }
+    return { ...result, format: 'module-typescript', source: PROLOGUE + src, shortCircuit: true };
 }
 
 export async function resolve(specifier: string, context: ResolveContext, nextResolve: NextResolve): Promise<ResolveResult> {
