@@ -34,3 +34,6 @@ set_target_properties(grapheme PROPERTIES
 # Ensure generated header exists before compiling
 add_custom_target(grapheme_gen DEPENDS ${LIBGRAPHEME_DIR}/gen/character.h)
 add_dependencies(grapheme grapheme_gen)
+
+# ---- jinput (line editing library) ----
+add_subdirectory(jinput)
