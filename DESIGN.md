@@ -352,13 +352,47 @@ ls -la | @{ async function*(args, stdin) { for await (const l of stdin) if (l.in
 
 # Buffered — receives all stdin as a single string
 cat data.json | @!{ (args, text) => JSON.stringify(JSON.parse(text), null, 2) }
+
+# Unquoted lambda — when the @-fn declares an arg slot as a function type
+@ls | @where f => f.size > 1024
+@ls | @where @{ f => f.size > 1024 }    # equivalent
 ```
 
 ### Calling convention
 
-- `args`: `string[]` — shell words after the function name
-- `stdin`: `AsyncIterable<string>` (streaming) or `string` (buffered `@!`) or `null` (standalone)
-- Lines yielded/returned are written to stdout
+- `args`: `unknown[]` — mixed array. Word args arrive as strings; `@{...}` and unquoted-lambda args arrive as their evaluated JS values.
+- `stdin`: `AsyncIterable<string>` (streaming bytes) or `AsyncIterable<unknown>` (object mode) or `string` (buffered `@!`) or `null` (standalone)
+- Lines yielded/returned are written to stdout (byte mode) or piped as objects (object mode)
+
+### Schema-driven unquoted lambdas
+
+When an `@`-function declares an arg slot with a function type in its
+TypeScript signature — e.g. `args: [(row: T) => boolean]` — the schema
+extractor records that slot as `FunctionIR` and the parser consults the
+registry at parse time. If the upcoming arg slot is function-typed, the
+lexer switches to JS-expression mode for that arg only, so users can
+write `@where f => f.x > 10` without the explicit `@{...}` wrapper.
+
+This is the one place in the parser where parsing is context-dependent:
+the AST for `@somefn x => y` depends on whether `@somefn` is registered
+with a function-typed slot 0. The `@{...}` form always works regardless
+and is the safe fallback when schemas aren't yet extracted (e.g. first
+run on a `.ts` jshrc before the cache populates).
+
+**Termination rules** (at bracket depth 0, outside string/template state):
+- `\n`, `;`, `|`, `&`, EOF
+- `>>`, `<<` redirections
+- Whitespace-preceded numbered fd redirections (` 2>err`, ` 1<x`)
+- `)`, `]`, `}` at depth 0 — closing of an outer shell construct
+
+Bare `>` and `<` do **not** terminate; they stay as JS comparisons inside
+the lambda. To stdout-redirect a `@`-fn that takes a lambda, use a numbered
+fd (`1>file`) or wrap the lambda in `@{...}`.
+
+The same parser-registry hookup is the foundation for two adjacent
+roadmap items: schema-aware tab completion (`@select <Tab>` → upstream
+field names) and pipeline construction-time validation (`@select cput`
+typo caught before execution).
 
 ### Return type dispatch
 

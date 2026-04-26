@@ -1049,6 +1049,166 @@ export class Lexer {
         throw new IncompleteInputError("Unclosed template literal in @{");
     }
 
+    // ---- JS-expr-with-shell-terminators mode ---------------------------------
+    //
+    // When the parser knows from the registry that an @-fn's next arg slot is
+    // a function-typed slot (see TypeIR FunctionIR), it calls consumeJsArg()
+    // instead of taking the next pre-lexed token. This re-lexes the tail of
+    // input as a JS expression starting at the current token's byte offset,
+    // synthesizes a JsInline token in its place, then re-tokenizes from the
+    // expression's end.
+    //
+    // Termination at bracket depth 0 (and outside string/template state):
+    //   - newline, semicolon, EOF
+    //   - unbracketed `|` (pipe; covers `||`, `|&`)
+    //   - unbracketed `&` (background, covers `&&`, `&>`)
+    //   - `>>`, `<<` (unambiguous redirections; bare `>` and `<` stay as JS comparisons)
+    //   - whitespace-preceded numbered fd redirections (e.g. ` 2>err`, ` 1<x`)
+    //   - closing `)`, `]`, `}` at depth 0 (outer shell construct boundary)
+    //
+    // Strings (`'…'`, `"…"`) and template literals (` `…` ` with `${}`
+    // interpolation) are consumed atomically.
+
+    public consumeJsArg(): string {
+        const tok = this.tokens[this.tokenIndex];
+        if (!tok || tok.type === TokenType.EOF) {
+            throw new LexerError("expected JS expression for function-typed arg slot", tok?.start ?? this.pos);
+        }
+        const start = tok.start;
+        const { body, end } = this.scanJsArg(start);
+
+        // Drop tokens at and after the current cursor; insert a synthetic
+        // JsInline token carrying the JS body, then resume tokenization
+        // from `end`.
+        this.tokens = this.tokens.slice(0, this.tokenIndex);
+        this.tokens.push({
+            type: TokenType.JsInline,
+            value: body,
+            start,
+            end,
+            jsBuffered: false,
+        });
+        this.pos = end;
+        this.tokenize();
+
+        // Advance the cursor past the synthetic so the caller sees the
+        // following token on its next peek/next.
+        this.tokenIndex++;
+        return body;
+    }
+
+    private scanJsArg(start: number): { body: string; end: number } {
+        let i = start;
+        let depth = 0; // ()/[]/{} depth
+        let body = "";
+
+        while (i < this.input.length) {
+            const ch = this.input[i]!;
+
+            if (ch === "'" || ch === '"') {
+                const r = this.scanJsArgString(i, ch);
+                body += r.text;
+                i = r.end;
+                continue;
+            }
+            if (ch === "`") {
+                const r = this.scanJsArgTemplate(i);
+                body += r.text;
+                i = r.end;
+                continue;
+            }
+
+            if (ch === "(" || ch === "[" || ch === "{") {
+                depth++;
+                body += ch;
+                i++;
+                continue;
+            }
+            if (ch === ")" || ch === "]" || ch === "}") {
+                if (depth === 0) break;
+                depth--;
+                body += ch;
+                i++;
+                continue;
+            }
+
+            if (depth === 0) {
+                if (ch === "\n" || ch === ";") break;
+                if (ch === "|") break;
+                if (ch === "&") break;
+                if (ch === ">" && this.input[i + 1] === ">") break;
+                if (ch === "<" && this.input[i + 1] === "<") break;
+                if (ch === " " || ch === "\t") {
+                    let j = i;
+                    while (j < this.input.length && (this.input[j] === " " || this.input[j] === "\t")) j++;
+                    if (j < this.input.length && this.input[j]! >= "0" && this.input[j]! <= "9") {
+                        let k = j;
+                        while (k < this.input.length && this.input[k]! >= "0" && this.input[k]! <= "9") k++;
+                        if (k < this.input.length && (this.input[k] === ">" || this.input[k] === "<")) {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            body += ch;
+            i++;
+        }
+
+        return { body: body.replace(/[\s]+$/, ""), end: i };
+    }
+
+    private scanJsArgString(start: number, quote: string): { text: string; end: number } {
+        let i = start + 1;
+        let text = quote;
+        while (i < this.input.length) {
+            const ch = this.input[i]!;
+            if (ch === "\\") {
+                text += ch + (this.input[i + 1] ?? "");
+                i += 2;
+                continue;
+            }
+            if (ch === quote) {
+                return { text: text + ch, end: i + 1 };
+            }
+            text += ch;
+            i++;
+        }
+        throw new IncompleteInputError("Unclosed JS string in @-fn arg");
+    }
+
+    private scanJsArgTemplate(start: number): { text: string; end: number } {
+        let i = start + 1;
+        let text = "`";
+        while (i < this.input.length) {
+            const ch = this.input[i]!;
+            if (ch === "\\") {
+                text += ch + (this.input[i + 1] ?? "");
+                i += 2;
+                continue;
+            }
+            if (ch === "`") {
+                return { text: text + ch, end: i + 1 };
+            }
+            if (ch === "$" && this.input[i + 1] === "{") {
+                text += "${";
+                i += 2;
+                let bdepth = 1;
+                while (i < this.input.length && bdepth > 0) {
+                    const c = this.input[i]!;
+                    if (c === "{") bdepth++;
+                    else if (c === "}") bdepth--;
+                    text += c;
+                    i++;
+                }
+                continue;
+            }
+            text += ch;
+            i++;
+        }
+        throw new IncompleteInputError("Unclosed template literal in @-fn arg");
+    }
+
     // ---- Public API ---------------------------------------------------------
 
     peekAt(offset: number): Token {

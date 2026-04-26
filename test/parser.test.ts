@@ -245,6 +245,75 @@ describe("parser", () => {
         });
     });
 
+    describe("@-fn unquoted lambda args (schema-driven)", () => {
+        // The parse(input) default uses the global registry, which won't be
+        // populated in this test file. We pass an explicit lookup that
+        // reports slot 0 of "where" as a function-typed slot.
+        const lookupWhereSlot0Fn = (name: string, idx: number) =>
+            (name === "where" && idx === 0) ? { kind: "function" as const, params: [], returns: { kind: "unknown" as const } } : null;
+
+        function parseWith(input: string) {
+            // Locally import to avoid leaking parser internals; default
+            // option signature accepts the lookup directly.
+            return parse(input, { lookupSlotType: lookupWhereSlot0Fn });
+        }
+
+        it("should lex an unquoted lambda body as a JS arg", () => {
+            const ast = parseWith("@where f => f.x > 10") as any;
+            assert.strictEqual(ast.type, "JsFunction");
+            assert.strictEqual(ast.name, "where");
+            assert.deepStrictEqual(ast.args, [{ kind: "js", body: "f => f.x > 10" }]);
+        });
+
+        it("should terminate the lambda at an unbracketed pipe", () => {
+            const ast = parseWith("@where f => f.x > 10 | cat") as any;
+            assert.strictEqual(ast.type, "Pipeline");
+            assert.deepStrictEqual(ast.commands[0].args, [{ kind: "js", body: "f => f.x > 10" }]);
+        });
+
+        it("should terminate at && (via the & terminator)", () => {
+            const ast = parseWith("@where f => f.x > 10 && echo done") as any;
+            assert.strictEqual(ast.type, "AndOr");
+            assert.deepStrictEqual(ast.left.args, [{ kind: "js", body: "f => f.x > 10" }]);
+        });
+
+        it("should terminate at a numbered fd redirection", () => {
+            const ast = parseWith("@where f => f.x > 10 2>err.log") as any;
+            assert.deepStrictEqual(ast.args, [{ kind: "js", body: "f => f.x > 10" }]);
+            assert.strictEqual(ast.redirections.length, 1);
+            assert.strictEqual(ast.redirections[0].fd, 2);
+        });
+
+        it("should respect parens, brackets, braces in the body", () => {
+            const ast = parseWith("@where (a, b) => (a + b) > [10, 20].length") as any;
+            assert.deepStrictEqual(ast.args, [{ kind: "js", body: "(a, b) => (a + b) > [10, 20].length" }]);
+        });
+
+        it("should consume template literals atomically", () => {
+            const ast = parseWith("@where f => `${f.name}` === \"foo\"") as any;
+            assert.deepStrictEqual(ast.args, [{ kind: "js", body: "f => `${f.name}` === \"foo\"" }]);
+        });
+
+        it("should leave the explicit @{...} form unchanged", () => {
+            const ast = parseWith("@where @{ f => f.x > 10 }") as any;
+            assert.deepStrictEqual(ast.args, [{ kind: "js", body: " f => f.x > 10 " }]);
+        });
+
+        it("should fall back to word args when no schema is available", () => {
+            const ast = parse("@where foo bar") as any;
+            assert.strictEqual(ast.args.length, 2);
+            assert.strictEqual(ast.args[0].kind, "word");
+            assert.strictEqual(ast.args[1].kind, "word");
+        });
+
+        it("should fall back to word args for non-function slot types", () => {
+            const lookup = () => ({ kind: "primitive" as const, name: "string" as const });
+            const ast = parse("@unk foo bar", { lookupSlotType: lookup }) as any;
+            assert.strictEqual(ast.args.length, 2);
+            assert.strictEqual(ast.args[0].kind, "word");
+        });
+    });
+
     describe("error cases", () => {
         it("should throw on unclosed quotes", () => {
             assert.throws(() => parse('"unclosed'), IncompleteInputError);

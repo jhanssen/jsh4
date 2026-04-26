@@ -11,7 +11,8 @@ import {
 } from "../executor/index.js";
 
 export { $ } from "../variables/index.js";
-export { registerJsFunction } from "../jsfunctions/index.js";
+export { registerJsFunction, onSchemaLoaded, awaitSchema } from "../jsfunctions/index.js";
+export type { SchemaLoadedEvent } from "../jsfunctions/index.js";
 export { exec } from "../exec/index.js";
 export type { ExecResult, ExecOptions } from "../exec/index.js";
 export { registerCompletion } from "../completion/index.js";

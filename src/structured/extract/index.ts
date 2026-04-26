@@ -210,6 +210,24 @@ function typeToIR(ctx: ExtractCtx, t: ts.Type): TypeIR {
         return { kind: "tuple", elements: targs.map(a => typeToIR(ctx, a)) };
     }
 
+    // Callable types (functions / callable objects). Tested before the
+    // generic Object branch since functions are objects in TS's type system.
+    // Used by the parser to decide whether an @-fn arg slot should be lexed
+    // as a JS expression instead of a shell word.
+    const callSigs = t.getCallSignatures();
+    if (callSigs.length > 0) {
+        const sig = callSigs[0]!;
+        const params: TypeIR[] = sig.getParameters().map(p => {
+            const decl = p.valueDeclaration ?? p.declarations?.[0];
+            const pt = decl
+                ? ctx.checker.getTypeOfSymbolAtLocation(p, decl)
+                : null;
+            return pt ? typeToIR(ctx, pt) : UNKNOWN;
+        });
+        const returns = typeToIR(ctx, sig.getReturnType());
+        return { kind: "function", params, returns };
+    }
+
     // Object literal / interface — extract structural fields.
     if (t.flags & ts.TypeFlags.Object) {
         // Reuse via ref if we've seen this type already (handles cycles + shared types).

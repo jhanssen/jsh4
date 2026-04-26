@@ -169,11 +169,77 @@ async function scheduleExtract(absPath: string): Promise<void> {
         const { extractSchemas } = await import("../structured/extract/index.js");
         const { schemaFile } = extractSchemas(absPath);
         await cacheStore(absPath, schemaFile);
+        // Patch any registry entries that were registered against this source
+        // before the schema was available. Without this, async extraction only
+        // takes effect on the *next* jsh start (when registerJsFunction reads
+        // the cache); same-session invocations would all miss.
+        for (const [fnName, fnSchema] of Object.entries(schemaFile.functions)) {
+            const entry = registry.get(fnName);
+            if (!entry?.source) continue;
+            if (sourceToAbsPath(entry.source) !== absPath) continue;
+            entry.input  = entry.input  ?? fnSchema.input;
+            entry.output = entry.output ?? fnSchema.output;
+            entry.args   = entry.args   ?? fnSchema.args;
+            emitSchemaLoaded({
+                name: fnName,
+                source: entry.source,
+                args: entry.args,
+                input: entry.input,
+                output: entry.output,
+            });
+        }
     } catch {
         // Extraction failures are non-fatal — registry just keeps no-schema entry.
     } finally {
         extractInFlight.delete(absPath);
     }
+}
+
+// Schema-loaded event. Fires after `scheduleExtract` populates a registry
+// entry's schemas. Listeners can react to schema arrival mid-session
+// (e.g. refresh a status widget, awaitSchema-style gating).
+export interface SchemaLoadedEvent {
+    name: string;
+    source: string;
+    args?: TypeIR;
+    input?: TypeIR;
+    output?: TypeIR;
+}
+
+const schemaListeners = new Set<(e: SchemaLoadedEvent) => void>();
+
+export function onSchemaLoaded(listener: (e: SchemaLoadedEvent) => void): () => void {
+    schemaListeners.add(listener);
+    return () => { schemaListeners.delete(listener); };
+}
+
+function emitSchemaLoaded(e: SchemaLoadedEvent): void {
+    for (const l of schemaListeners) {
+        try { l(e); } catch { /* listener errors are non-fatal */ }
+    }
+}
+
+// Resolve when the named @-fn has its schema loaded, or to null on timeout.
+// Returns immediately if the schema is already present. Useful for scripts
+// that want to gate on schema readiness (e.g. construction-time validation
+// in a one-shot run).
+export function awaitSchema(name: string, timeoutMs: number = 5000): Promise<TypeIR | null> {
+    const entry = registry.get(name);
+    if (entry?.args) return Promise.resolve(entry.args);
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (v: TypeIR | null) => {
+            if (done) return;
+            done = true;
+            unsubscribe();
+            clearTimeout(timer);
+            resolve(v);
+        };
+        const timer = setTimeout(() => finish(null), timeoutMs);
+        const unsubscribe = onSchemaLoaded(e => {
+            if (e.name === name && e.args) finish(e.args);
+        });
+    });
 }
 
 // Look up a function for explicit @-prefixed invocation. Returns the
@@ -195,6 +261,27 @@ export function lookupBareJsFunction(name: string): JsPipelineFunction | undefin
 // and the future unifier.
 export function lookupJsFunctionEntry(name: string): Readonly<RegistryEntry> | undefined {
     return registry.get(name);
+}
+
+// Return the TypeIR of arg slot `index` for `@name`, or null if unknown.
+// Walks the function's args IR (TupleIR by index, ArrayIR for variadic).
+// Used by the parser to decide whether a slot should be lexed as a JS
+// expression (FunctionIR slot) or a shell word.
+export function lookupSlotType(name: string, index: number): TypeIR | null {
+    const entry = registry.get(name);
+    if (!entry?.args) return null;
+    return slotAt(entry.args, index);
+}
+
+function slotAt(ir: TypeIR, index: number): TypeIR | null {
+    switch (ir.kind) {
+        case "tuple":
+            return ir.elements[index] ?? null;
+        case "array":
+            return ir.element;
+        default:
+            return null;
+    }
 }
 
 export function listJsFunctions(): string[] {

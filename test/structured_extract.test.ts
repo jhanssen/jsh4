@@ -9,6 +9,10 @@ import assert from "node:assert/strict";
 import { withRcTs } from "./helpers.js";
 import { extractSchemas } from "../src/structured/extract/index.js";
 import { writeFileSync, unlinkSync } from "node:fs";
+import {
+    registerJsFunction, lookupSlotType, onSchemaLoaded, awaitSchema,
+} from "../src/jsfunctions/index.js";
+import { pathToFileURL } from "node:url";
 
 describe("structured pipelines — loader prologue", () => {
     it("should default .ts jshrc registrations to object mode", () => {
@@ -110,5 +114,183 @@ describe("structured pipelines — extractor", () => {
         } finally {
             try { unlinkSync(path); } catch {}
         }
+    });
+
+    it("should extract callable parameter types as FunctionIR", () => {
+        const path = `/tmp/jsh_extract_${Date.now()}_4.ts`;
+        writeFileSync(path, `
+            export async function* myFilter(
+                args: [(row: { x: number }) => boolean],
+                stdin: AsyncIterable<{ x: number }>,
+            ): AsyncGenerator<{ x: number }> {
+                const pred = args[0];
+                for await (const r of stdin) if (pred(r)) yield r;
+            }
+        `);
+        try {
+            const { schemaFile } = extractSchemas(path);
+            const fn = schemaFile.functions["myFilter"]!;
+            assert.strictEqual(fn.args.kind, "tuple");
+            const slot0 = (fn.args as { elements: Array<{ kind: string }> }).elements[0]!;
+            assert.strictEqual(slot0.kind, "function");
+        } finally {
+            try { unlinkSync(path); } catch {}
+        }
+    });
+});
+
+describe("structured pipelines — live registry update + schema events", () => {
+    // Each test writes a unique .ts file with a unique function name to keep
+    // the registry / on-disk schema cache from cross-contaminating.
+    function writeFn(name: string, body: string): { path: string; cleanup: () => void } {
+        const path = `/tmp/jsh_live_${Date.now()}_${Math.random().toString(36).slice(2)}.ts`;
+        writeFileSync(path, body);
+        return { path, cleanup: () => { try { unlinkSync(path); } catch {} } };
+    }
+
+    it("should patch the live registry entry when scheduleExtract completes", async () => {
+        const fnName = `livePatch_${process.pid}_${Date.now()}`;
+        const { path, cleanup } = writeFn(fnName, `
+            export async function* ${fnName}(
+                args: [(row: { v: number }) => boolean],
+                stdin: AsyncIterable<{ v: number }>,
+            ): AsyncGenerator<{ v: number }> {
+                for await (const r of stdin) if (args[0](r)) yield r;
+            }
+        `);
+        try {
+            // Pretend the registration happened from this source file. The
+            // schema is not in the cache (fresh tmp file), so this triggers a
+            // background extract; the registry entry has args=undefined.
+            registerJsFunction(fnName, (() => {}) as any, {
+                mode: "object",
+                source: pathToFileURL(path).href,
+            });
+            assert.strictEqual(lookupSlotType(fnName, 0), null,
+                "registry should start with no slot info before extraction completes");
+
+            // Wait for extraction to land. awaitSchema should resolve when
+            // scheduleExtract patches the entry and emits the event.
+            const args = await awaitSchema(fnName, 10_000);
+            assert.ok(args, "awaitSchema should resolve with the args IR");
+            assert.strictEqual(args!.kind, "tuple");
+
+            // After event arrival, the registry entry is patched in place.
+            const slot = lookupSlotType(fnName, 0);
+            assert.ok(slot, "registry entry should be patched after extraction");
+            assert.strictEqual(slot!.kind, "function");
+        } finally { cleanup(); }
+    });
+
+    it("should fire onSchemaLoaded per function with the source URL", async () => {
+        const fnName = `liveEvent_${process.pid}_${Date.now()}`;
+        const { path, cleanup } = writeFn(fnName, `
+            export async function* ${fnName}(
+                _args: string[],
+                stdin: AsyncIterable<unknown>,
+            ): AsyncGenerator<unknown> {
+                for await (const r of stdin) yield r;
+            }
+        `);
+        try {
+            const events: Array<{ name: string; source: string }> = [];
+            const unsubscribe = onSchemaLoaded(e => {
+                events.push({ name: e.name, source: e.source });
+            });
+            try {
+                registerJsFunction(fnName, (() => {}) as any, {
+                    mode: "object",
+                    source: pathToFileURL(path).href,
+                });
+                await awaitSchema(fnName, 10_000);
+                const seen = events.find(e => e.name === fnName);
+                assert.ok(seen, "expected schemaLoaded event for the registered function");
+                assert.ok(seen!.source.endsWith(".ts"), "event should carry the source URL");
+            } finally {
+                unsubscribe();
+            }
+        } finally { cleanup(); }
+    });
+
+    it("should resolve awaitSchema immediately when the schema is already loaded", async () => {
+        const fnName = `liveAlready_${process.pid}_${Date.now()}`;
+        const { path, cleanup } = writeFn(fnName, `
+            export async function* ${fnName}(
+                args: [(r: { x: number }) => boolean],
+                stdin: AsyncIterable<{ x: number }>,
+            ): AsyncGenerator<{ x: number }> {
+                for await (const r of stdin) if (args[0](r)) yield r;
+            }
+        `);
+        try {
+            registerJsFunction(fnName, (() => {}) as any, {
+                mode: "object",
+                source: pathToFileURL(path).href,
+            });
+            await awaitSchema(fnName, 10_000);
+            // Second call: schema already in registry; should resolve in microtask.
+            const t0 = Date.now();
+            const got = await awaitSchema(fnName, 50);
+            assert.ok(got, "second awaitSchema should resolve from the cached registry entry");
+            assert.ok(Date.now() - t0 < 50, "second awaitSchema should be near-instant");
+        } finally { cleanup(); }
+    });
+
+    it("should time out awaitSchema and resolve to null when no schema arrives", async () => {
+        const t0 = Date.now();
+        const got = await awaitSchema(`__nonexistent_${Date.now()}`, 100);
+        const elapsed = Date.now() - t0;
+        assert.strictEqual(got, null);
+        assert.ok(elapsed >= 90 && elapsed < 500, `expected ~100ms timeout, got ${elapsed}ms`);
+    });
+
+    it("should accept unquoted lambdas in the same session after extraction lands", () => {
+        // Drive a real jsh subprocess: the rc registers a structured @-fn
+        // with a function-typed arg slot, awaits schema arrival, then
+        // re-parses the pipeline via jsh.exec — the unquoted lambda form
+        // should now succeed without an explicit `@{...}` wrapper.
+        const fnName = `liveSession_${process.pid}_${Date.now()}`;
+        const rc = `
+            export async function* ${fnName}(
+                args: [(r: { v: number }) => boolean],
+                stdin: AsyncIterable<{ v: number }>,
+            ): AsyncGenerator<{ v: number }> {
+                const pred = args[0];
+                if (typeof pred !== "function") throw new Error("predicate must be a function");
+                for await (const r of stdin) if (pred(r)) yield r;
+            }
+            export async function* lsrc(): AsyncGenerator<{ v: number }> {
+                yield { v: 1 }; yield { v: 5 }; yield { v: 9 };
+            }
+            jsh.registerJsFunction("${fnName}", ${fnName} as any, { mode: "object" });
+            jsh.registerJsFunction("lsrc", lsrc as any, { mode: "object" });
+            await jsh.awaitSchema("${fnName}", 10000);
+            const r = await jsh.exec("@lsrc | @${fnName} r => r.v > 3 | @count");
+            console.log(r.stdout);
+        `;
+        const out = withRcTs(rc, "");
+        assert.match(out.stdout, /\{"count":2\}/);
+    });
+
+    it("should stop firing onSchemaLoaded after the listener unsubscribes", async () => {
+        let count = 0;
+        const unsubscribe = onSchemaLoaded(() => { count++; });
+        unsubscribe();
+
+        const fnName = `liveUnsub_${process.pid}_${Date.now()}`;
+        const { path, cleanup } = writeFn(fnName, `
+            export async function* ${fnName}(
+                _args: string[],
+                stdin: AsyncIterable<unknown>,
+            ): AsyncGenerator<unknown> { for await (const r of stdin) yield r; }
+        `);
+        try {
+            registerJsFunction(fnName, (() => {}) as any, {
+                mode: "object",
+                source: pathToFileURL(path).href,
+            });
+            await awaitSchema(fnName, 10_000);
+            assert.strictEqual(count, 0, "unsubscribed listener should not fire");
+        } finally { cleanup(); }
     });
 });

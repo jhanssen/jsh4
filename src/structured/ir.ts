@@ -17,6 +17,7 @@ export type TypeIR =
     | LiteralIR
     | TypeVarIR
     | RefIR
+    | FunctionIR
     | UnknownIR;
 
 export interface PrimitiveIR {
@@ -70,6 +71,15 @@ export interface RefIR {
     id: string;
 }
 
+// Function / callable type. Used for arg slots that expect a JS function
+// value (e.g. `@where`'s predicate). The parser consults this to decide
+// whether to lex an arg slot as a shell word or as a JS expression.
+export interface FunctionIR {
+    kind: "function";
+    params: TypeIR[];
+    returns: TypeIR;
+}
+
 export interface UnknownIR {
     kind: "unknown";
 }
@@ -94,4 +104,4 @@ export interface FunctionSchema {
     doc?: string;
 }
 
-export const EXTRACTOR_VERSION = 1;
+export const EXTRACTOR_VERSION = 2;

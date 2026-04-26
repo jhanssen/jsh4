@@ -31,8 +31,8 @@
 // ---- Pipeline functions -----------------------------------------------------
 
 type JsPipelineFunction = (
-    args: string[],
-    stdin: AsyncIterable<string> | string | null
+    args: unknown[],
+    stdin: AsyncIterable<string> | AsyncIterable<unknown> | string | null
 ) => unknown;
 
 interface JsFunctionOptions {
@@ -43,6 +43,33 @@ interface JsFunctionOptions {
      */
     atOnly?: boolean;
 }
+
+/**
+ * Schema-driven argument parsing for `@`-functions.
+ *
+ * When you write a `.ts`/`.mts` jshrc and declare an arg slot with a
+ * function type — for example `args: [(row: T) => boolean]` — the schema
+ * extractor records that slot as function-typed. The parser consults the
+ * registry at parse time and lexes that slot as a JS expression instead
+ * of as a shell word, so users can write the unquoted lambda form:
+ *
+ *     @yourFn r => r.name === "foo"        // unquoted (schema-driven)
+ *     @yourFn @{ r => r.name === "foo" }   // explicit form, always works
+ *
+ * Both produce identical ASTs. The unquoted form is sugar enabled by
+ * the slot's declared type. If the schema isn't available (cache miss
+ * on first run, or the source is .js with no extractable types), the
+ * parser falls back to word-arg mode and users must use `@{ ... }`.
+ *
+ * Termination of the unquoted JS expression at bracket depth 0:
+ *   - `\n`, `;`, `|`, `&`, EOF
+ *   - `>>`, `<<` (bare `>` and `<` stay as JS comparisons)
+ *   - whitespace-preceded numbered redirections (e.g. ` 2>err.log`)
+ *   - `)`, `]`, `}` at depth 0 (outer shell construct boundary)
+ *
+ * Strings (`'…'`, `"…"`) and template literals (` `…` ` with `${}`)
+ * are consumed atomically and respected for bracket tracking.
+ */
 
 // ---- Exec -------------------------------------------------------------------
 

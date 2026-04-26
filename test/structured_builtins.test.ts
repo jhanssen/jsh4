@@ -29,7 +29,47 @@ describe("@where built-in", () => {
             jsh.registerJsFunction("src", () => (async function*() { yield {n:1}; })());
         `;
         const r = withRcTs(rc, "@src | @where");
-        assert.match(r.stderr, /@where: predicate required/);
+        assert.match(r.stderr, /@where: predicate must be a function/);
+    });
+
+    it("should accept an unquoted lambda for the predicate slot", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { n: 1 }; yield { n: 2 }; yield { n: 3 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @where r => r.n >= 2");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ n: 2 }, { n: 3 }]);
+    });
+
+    it("should preserve a downstream pipe past an unquoted lambda body", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { n: 1 }; yield { n: 2 }; yield { n: 3 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @where r => r.n > 1 | @count");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ count: 2 }]);
+    });
+
+    it("should preserve a numbered redirection after the lambda", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { n: 1 }; yield { n: 2 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @where r => r.n > 0 2>/dev/null");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ n: 1 }, { n: 2 }]);
+    });
+
+    it("should accept a parenthesized arrow", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { a: 1, b: 2 }; yield { a: 5, b: 1 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @where (r) => r.a + r.b > 5");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ a: 5, b: 1 }]);
     });
 
     it("should error on non-function predicate", () => {
@@ -180,6 +220,8 @@ describe("built-in schemas loaded at startup", () => {
         assert.ok(schemas.where, "expected `where` in dist schemas");
         const fn = schemas.where.functions["where"];
         assert.ok(fn, "expected `where` function schema");
-        assert.deepStrictEqual(fn.typeVars, []);
+        // @where declares a generic `<T>` so the predicate's row type can
+        // unify with the upstream output type during pipeline construction.
+        assert.deepStrictEqual(fn.typeVars, ["T"]);
     });
 });

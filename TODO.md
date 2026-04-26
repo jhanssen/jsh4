@@ -257,13 +257,14 @@
 
 ### Structured pipelines
 
-The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction + cache, loader prologue auto-mode for `.ts` rcs, `defaultSink`/`isSink`/`hidden`, `@{...}` as inline-JS arg form). Built-ins so far: `@ls`/`@ls-format`, `@ps`, `@where`, `@select`, `@take`, `@count`, `@table`, `@from-jsonl`, `@to-jsonl`. Open work:
+The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction + cache, loader prologue auto-mode for `.ts` rcs, `defaultSink`/`isSink`/`hidden`, `@{...}` as inline-JS arg form, schema-driven unquoted lambdas via `FunctionIR`). Built-ins so far: `@ls`/`@ls-format`, `@ps`, `@where`, `@select`, `@take`, `@count`, `@table`, `@from-jsonl`, `@to-jsonl`. Open work:
 
 #### Ergonomics
 
-- [ ] **Path B — schema-driven unquoted lambda args.** `@where f => f.x > 10` without `@{...}`. Parser consults the registry at parse time; if the arg slot's schema declares a function type, switch lexer mode and read forward as a JS expression until an unbracketed `|`/`;`/`\n`. ~400-500 LOC: schema annotation for lambda arg slots, JS sub-lexer respecting `()`/`[]`/`{}`/strings/template-literals, parser-registry coupling, AST node, executor wiring, backward-compat with `@{...}` form.
+- [x] **Path B — schema-driven unquoted lambda args.** `@where f => f.x > 10` without `@{...}`. Parser consults the registry at parse time; if the arg slot's schema declares `FunctionIR`, lexer switches to JS-expr-with-shell-terminators mode for that arg. The same parser-registry hookup unblocks the two items below.
 - [ ] **Tab completion against schemas** — Tier 0: chain walk (~100 LOC) for `f.foo.<tab>` against the upstream stage's output schema. Argument-name completion (`@select <tab>` → field names from upstream). Defer nested-expression support (`f => arr.find(x => x.|)`) until TS 7's Go port lands and we can use live `getQuickInfoAtPosition`.
-- [ ] **Pipeline construction-time validation** — Catch `@select cput` typos before the pipeline runs. The unifier already has the data; nothing reads it yet. Built on the same parser-registry coupling as Path B.
+- [ ] **Pipeline construction-time validation** — Catch `@select cput` typos before the pipeline runs. The unifier already has the data; nothing reads it yet. Same parser-registry hookup as Path B.
+- [ ] **Synchronous schema extraction on cache miss** — Today extraction is fire-and-forget for user `.ts` rcs; first-run users fall back to word-arg mode for unquoted lambdas until the cache populates. Optional sync path (`JSH_SYNC_SCHEMA_EXTRACT=1`?) at ~1s tsc cold-start cost.
 
 #### Operator stdlib gaps
 
@@ -293,7 +294,6 @@ The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction
 
 - [ ] **AbortSignal for cancellation** — Plumb through the IO context so buffered ops (`@sort`, `@group`) bail mid-run on Ctrl-C instead of running to completion before honoring it.
 - [ ] **Per-row error policy** — `--on-error=fail|skip` flag on operators. Today a lambda throw kills the stage.
-- [ ] **Synchronous schema extraction on cache miss** — Today extraction is fire-and-forget; the schema lands on the *next* shell run. Optionally await the extraction so first-run users get completion + validation immediately. Cost is the ~1s tsc cold start the first time the rc loads.
 
 #### Polish
 
@@ -457,12 +457,9 @@ Texture-model details to settle:
 
 Interaction model with the pane refactor: NORMAL state scroll-wheel = host scrollback as today (moves past widgets like normal text); FOCUSED state with scrollable surface = surface's internal scroll; FOCUSED state with bounded surface = applet's keymap. Nested: focused level wins, same as keyboard.
 
-**Dependency: this entire applet host work depends on the MB pane / overlay refactor.** Sub-terminal surfaces are most cleanly built as instances of the unified pane component (which provides scroll, focus, sizing, etc. as built-in capabilities). Sequencing assumes that refactor lands first; without it, every per-anchor surface needs ad-hoc plumbing.
-
-Side benefit of doing the refactor right: **popups also gain independent scroll** for free (completion menu, search results popup, help overlay, command palette, etc.) — every bounded surface in MB becomes a uniformly-behaving pane. Same focus/selection/clipboard semantics apply to all of them, no special cases.
+**Prerequisite (MB side): pane / overlay refactor — DONE.** Applets can now create a subterminal in the scrollback of another terminal; the unified pane component provides scroll, focus, and sizing as built-in capabilities. Side benefit: popups (completion menu, search results, help overlay, command palette, etc.) inherit independent scroll for free, with uniform focus/selection/clipboard semantics.
 
 **Sequencing:**
-0. *(MB side, prerequisite)* Land the pane / overlay refactor — sub-terminal surfaces become instances of the unified pane component.
 1. Settle the protocol (OSC shape, applet contract, WS framing, interaction state machine).
 2. Build the MB-side applet host + loader + per-anchor TerminalEmulator surface + selection/focus integration with existing OSC 133 nav.
 3. Build jsh's `@table` applet against the contract (the existing `mb-applet/` package).

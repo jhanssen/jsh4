@@ -6,6 +6,7 @@ import type {
 } from "./ast.js";
 import { Lexer, TokenType } from "./lexer.js";
 import type { Token } from "./lexer.js";
+import type { TypeIR } from "../structured/ir.js";
 
 export { ParseError, IncompleteInputError } from "./errors.js";
 import { ParseError, IncompleteInputError } from "./errors.js";
@@ -14,11 +15,33 @@ import type { JsFunction, JsArg } from "./ast.js";
 // Keywords that terminate a compound command body.
 const COMPOUND_TERMINATORS = new Set(["then", "elif", "else", "fi", "do", "done", "esac", "in"]);
 
+// True if the IR represents a function-typed slot. Recognized cases:
+//   FunctionIR directly
+//   UnionIR with at least one FunctionIR member (e.g. `string | (x: T) => U`)
+//     — but only when *every* non-Function member is also a callable, since
+//     mixed shapes (union of word-style and lambda-style) need explicit
+//     `@{...}` to disambiguate. v1: only the pure-function case triggers.
+function isFunctionSlot(ir: TypeIR): boolean {
+    return ir.kind === "function";
+}
+
+// Resolves an @-fn arg slot's expected type. Used by parseJsFunction to
+// decide whether to lex a slot as a shell word or a JS expression.
+// Decoupled from the registry import so the parser stays unit-testable
+// and the parser-package doesn't depend on the registry package.
+export type SlotTypeLookup = (name: string, slotIndex: number) => TypeIR | null;
+
+export interface ParserOptions {
+    lookupSlotType?: SlotTypeLookup;
+}
+
 export class Parser {
     private lexer: Lexer;
+    private lookupSlotType: SlotTypeLookup;
 
-    constructor(input: string) {
+    constructor(input: string, options: ParserOptions = {}) {
         this.lexer = new Lexer(input);
+        this.lookupSlotType = options.lookupSlotType ?? (() => null);
     }
 
     parse(): ASTNode | null {
@@ -234,6 +257,30 @@ export class Parser {
                 redirections.push(this.parseOneRedirection());
                 continue;
             }
+
+            // Schema-driven JS arg slot. If the registry says this slot is
+            // function-typed, drive the lexer into JS-expr-with-shell-terminators
+            // mode and consume one arg as a JS expression. Lets users write
+            // `@where f => f.x > 10` without the explicit `@{ ... }` wrapper.
+            //
+            // Word and JsInline tokens are still possible in this slot:
+            // - Word: a bare identifier could be an in-scope function name
+            //   (e.g. `@where myPred`), so we still allow word args. The
+            //   schema-driven JS path only fires when the upcoming token is
+            //   *not* already a JsInline (the explicit wrapper handles itself)
+            //   and the next byte position can plausibly start a JS expression.
+            //   Heuristic: if it's a Word that doesn't span any shell-special
+            //   syntax, treat it as a JS expression — lex consumes from its
+            //   start offset until a shell terminator.
+            if (tok.type === TokenType.Word || tok.type === TokenType.LParen) {
+                const slot = this.lookupSlotType(name, args.length);
+                if (slot && isFunctionSlot(slot)) {
+                    const body = this.lexer.consumeJsArg();
+                    args.push({ kind: "js", body });
+                    continue;
+                }
+            }
+
             if (tok.type === TokenType.Word) {
                 args.push({ kind: "word", word: tok.word! });
                 this.lexer.next();

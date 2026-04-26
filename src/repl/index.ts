@@ -8,7 +8,7 @@ import { execute, executeString, setCommandText, reapJobs, hasShellFunction } fr
 import { $ } from "../variables/index.js";
 import {
     setColorize, getColorize, setTheme, getAlias,
-    alias, unalias, registerJsFunction, exec, registerCompletion,
+    alias, unalias, registerJsFunction, onSchemaLoaded, awaitSchema, exec, registerCompletion,
     stdin as jshStdin, stdout as jshStdout, stderr as jshStderr,
 } from "../api/index.js";
 import { writeStdout as _writeStdout, writeStderr as _writeStderr } from "../executor/index.js";
@@ -279,7 +279,7 @@ async function loadRc(customPath: string | undefined): Promise<void> {
 
     const jshApi: Record<string, unknown> = {
         $, setColorize, setTheme,
-        alias, unalias, registerJsFunction, exec,
+        alias, unalias, registerJsFunction, onSchemaLoaded, awaitSchema, exec,
         // Mark an exported JS function as callable only via the @-prefixed
         // form (@name). Bare-name resolution skips it, so a same-named
         // command on PATH (e.g. the real `claude` CLI) remains accessible.
