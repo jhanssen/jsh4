@@ -10,8 +10,9 @@ import { withRcTs } from "./helpers.js";
 import { extractSchemas } from "../src/structured/extract/index.js";
 import { writeFileSync, unlinkSync } from "node:fs";
 import {
-    registerJsFunction, lookupSlotType, onSchemaLoaded, awaitSchema,
+    registerJsFunction, lookupSlotType, onRegistryChange, awaitSchema,
 } from "../src/jsfunctions/index.js";
+import type { RegistryChange } from "../src/jsfunctions/index.js";
 import { pathToFileURL } from "node:url";
 
 describe("structured pipelines — loader prologue", () => {
@@ -182,7 +183,7 @@ describe("structured pipelines — live registry update + schema events", () => 
         } finally { cleanup(); }
     });
 
-    it("should fire onSchemaLoaded per function with the source URL", async () => {
+    it("should fire a schemaLoaded RegistryChange event with the source URL", async () => {
         const fnName = `liveEvent_${process.pid}_${Date.now()}`;
         const { path, cleanup } = writeFn(fnName, `
             export async function* ${fnName}(
@@ -193,23 +194,52 @@ describe("structured pipelines — live registry update + schema events", () => 
             }
         `);
         try {
-            const events: Array<{ name: string; source: string }> = [];
-            const unsubscribe = onSchemaLoaded(e => {
-                events.push({ name: e.name, source: e.source });
-            });
+            const events: RegistryChange[] = [];
+            const unsubscribe = onRegistryChange(e => { events.push(e); });
             try {
                 registerJsFunction(fnName, (() => {}) as any, {
                     mode: "object",
                     source: pathToFileURL(path).href,
                 });
                 await awaitSchema(fnName, 10_000);
-                const seen = events.find(e => e.name === fnName);
-                assert.ok(seen, "expected schemaLoaded event for the registered function");
-                assert.ok(seen!.source.endsWith(".ts"), "event should carry the source URL");
-            } finally {
-                unsubscribe();
-            }
+                const schemaEvent = events.find(e => e.kind === "schemaLoaded" && e.name === fnName);
+                assert.ok(schemaEvent, "expected schemaLoaded event for the registered function");
+                assert.strictEqual(schemaEvent!.kind, "schemaLoaded");
+                if (schemaEvent!.kind === "schemaLoaded") {
+                    assert.ok(schemaEvent!.source.endsWith(".ts"), "event should carry the source URL");
+                }
+            } finally { unsubscribe(); }
         } finally { cleanup(); }
+    });
+
+    it("should fire a registered RegistryChange event on first registration", () => {
+        const fnName = `regNew_${process.pid}_${Date.now()}`;
+        const events: RegistryChange[] = [];
+        const unsubscribe = onRegistryChange(e => { events.push(e); });
+        try {
+            registerJsFunction(fnName, (() => {}) as any, { mode: "byte" });
+            const reg = events.find(e => e.name === fnName);
+            assert.ok(reg, "expected an event for the new registration");
+            assert.strictEqual(reg!.kind, "registered");
+        } finally { unsubscribe(); }
+    });
+
+    it("should fire a reregistered event with previous entry when overwriting", () => {
+        const fnName = `regOver_${process.pid}_${Date.now()}`;
+        registerJsFunction(fnName, (() => {}) as any, { mode: "byte" });
+
+        const events: RegistryChange[] = [];
+        const unsubscribe = onRegistryChange(e => { events.push(e); });
+        try {
+            registerJsFunction(fnName, (() => {}) as any, { mode: "object" });
+            const e = events.find(ev => ev.name === fnName);
+            assert.ok(e, "expected a registry-change event for the re-registration");
+            assert.strictEqual(e!.kind, "reregistered");
+            if (e!.kind === "reregistered") {
+                assert.strictEqual(e!.previous.mode, "byte");
+                assert.strictEqual(e!.entry.mode, "object");
+            }
+        } finally { unsubscribe(); }
     });
 
     it("should resolve awaitSchema immediately when the schema is already loaded", async () => {
@@ -272,9 +302,9 @@ describe("structured pipelines — live registry update + schema events", () => 
         assert.match(out.stdout, /\{"count":2\}/);
     });
 
-    it("should stop firing onSchemaLoaded after the listener unsubscribes", async () => {
+    it("should stop firing onRegistryChange after the listener unsubscribes", async () => {
         let count = 0;
-        const unsubscribe = onSchemaLoaded(() => { count++; });
+        const unsubscribe = onRegistryChange(() => { count++; });
         unsubscribe();
 
         const fnName = `liveUnsub_${process.pid}_${Date.now()}`;

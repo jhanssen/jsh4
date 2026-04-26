@@ -137,7 +137,8 @@ export function registerJsFunction(
 
     const isSink = opts.isSink === true;
     const hidden = opts.hidden === true;
-    registry.set(name, {
+    const previous = registry.get(name);
+    const entry: RegistryEntry = {
         fn,
         atOnly: opts.atOnly === true,
         mode,
@@ -146,7 +147,13 @@ export function registerJsFunction(
         defaultSink: opts.defaultSink,
         isSink,
         hidden,
-    });
+    };
+    registry.set(name, entry);
+    if (previous) {
+        emitRegistryChange({ kind: "reregistered", name, previous, entry });
+    } else {
+        emitRegistryChange({ kind: "registered", name, entry });
+    }
 }
 
 function isExtractable(source: string): boolean {
@@ -180,7 +187,8 @@ async function scheduleExtract(absPath: string): Promise<void> {
             entry.input  = entry.input  ?? fnSchema.input;
             entry.output = entry.output ?? fnSchema.output;
             entry.args   = entry.args   ?? fnSchema.args;
-            emitSchemaLoaded({
+            emitRegistryChange({
+                kind: "schemaLoaded",
                 name: fnName,
                 source: entry.source,
                 args: entry.args,
@@ -195,26 +203,38 @@ async function scheduleExtract(absPath: string): Promise<void> {
     }
 }
 
-// Schema-loaded event. Fires after `scheduleExtract` populates a registry
-// entry's schemas. Listeners can react to schema arrival mid-session
-// (e.g. refresh a status widget, awaitSchema-style gating).
-export interface SchemaLoadedEvent {
-    name: string;
-    source: string;
-    args?: TypeIR;
-    input?: TypeIR;
-    output?: TypeIR;
+// Registry change events. One channel covers every observable mutation:
+//
+//   - "registered"   — a name appeared in the registry for the first time.
+//   - "reregistered" — an existing entry was replaced (same name, new fn /
+//                      schemas / options). `previous` carries the prior entry.
+//   - "schemaLoaded" — async extraction completed and the live entry was
+//                      patched in place with `args` / `input` / `output`.
+//                      Fires once per function whose schema lands.
+//
+// Listener errors are caught and dropped so one bad listener can't take out
+// the rest. Returns an unsubscribe function.
+export type RegistryChange =
+    | { kind: "registered";   name: string; entry: Readonly<RegistryEntry> }
+    | { kind: "reregistered"; name: string; previous: Readonly<RegistryEntry>; entry: Readonly<RegistryEntry> }
+    | {
+          kind: "schemaLoaded";
+          name: string;
+          source: string;
+          args?: TypeIR;
+          input?: TypeIR;
+          output?: TypeIR;
+      };
+
+const registryListeners = new Set<(e: RegistryChange) => void>();
+
+export function onRegistryChange(listener: (e: RegistryChange) => void): () => void {
+    registryListeners.add(listener);
+    return () => { registryListeners.delete(listener); };
 }
 
-const schemaListeners = new Set<(e: SchemaLoadedEvent) => void>();
-
-export function onSchemaLoaded(listener: (e: SchemaLoadedEvent) => void): () => void {
-    schemaListeners.add(listener);
-    return () => { schemaListeners.delete(listener); };
-}
-
-function emitSchemaLoaded(e: SchemaLoadedEvent): void {
-    for (const l of schemaListeners) {
+function emitRegistryChange(e: RegistryChange): void {
+    for (const l of registryListeners) {
         try { l(e); } catch { /* listener errors are non-fatal */ }
     }
 }
@@ -236,7 +256,8 @@ export function awaitSchema(name: string, timeoutMs: number = 5000): Promise<Typ
             resolve(v);
         };
         const timer = setTimeout(() => finish(null), timeoutMs);
-        const unsubscribe = onSchemaLoaded(e => {
+        const unsubscribe = onRegistryChange(e => {
+            if (e.kind !== "schemaLoaded") return;
             if (e.name === name && e.args) finish(e.args);
         });
     });
