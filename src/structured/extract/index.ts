@@ -19,7 +19,7 @@
 //     built-ins (output bundled into dist/structured/schemas.json).
 //   - The runtime registry on cache miss for user-registered functions.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import * as ts from "typescript";
 import {
@@ -38,11 +38,24 @@ interface ExtractCtx {
 
 export interface ExtractResult {
     schemaFile: SchemaFile;
+    // Source mtime captured at extraction entry, before TS reads the file.
+    // Plumbed to cacheStore so the stamp matches the content the extractor
+    // actually saw — avoids a TOCTOU where statSync at write time picks up
+    // a newer mtime than what the schema reflects.
+    sourceMtimeMs: number;
     diagnostics: string[];
+}
+
+function readMtime(absSourcePath: string): number {
+    try { return statSync(absSourcePath).mtimeMs; } catch { return 0; }
 }
 
 /** Extract schemas from a single TS source file. */
 export function extractSchemas(absSourcePath: string): ExtractResult {
+    // Snapshot mtime FIRST so the cache stamp matches the content the
+    // extractor reads below (rather than statting at write time, which can
+    // pick up a newer mtime if the file is edited mid-extraction).
+    const sourceMtimeMs = readMtime(absSourcePath);
     const program = ts.createProgram([absSourcePath], {
         target: ts.ScriptTarget.ES2022,
         module: ts.ModuleKind.ESNext,
@@ -63,7 +76,7 @@ export function extractSchemas(absSourcePath: string): ExtractResult {
     };
     if (!sourceFile) {
         diagnostics.push(`extractor: source file not found: ${absSourcePath}`);
-        return { schemaFile: empty, diagnostics };
+        return { schemaFile: empty, sourceMtimeMs, diagnostics };
     }
 
     const checker = program.getTypeChecker();
@@ -96,6 +109,7 @@ export function extractSchemas(absSourcePath: string): ExtractResult {
             functions,
             types: ctx.types,
         },
+        sourceMtimeMs,
         diagnostics,
     };
 }

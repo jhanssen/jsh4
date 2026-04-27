@@ -69,6 +69,13 @@ interface JsFunctionOptions {
  *
  * Strings (`'…'`, `"…"`) and template literals (` `…` ` with `${}`)
  * are consumed atomically and respected for bracket tracking.
+ *
+ * **Known limitation: regex literals are not tracked.** A `/.../` containing
+ * `|`, `&`, `;`, or `\n` will terminate the unquoted expression at the
+ * inner character, breaking lambdas like `r => /foo|bar/.test(r.x)`.
+ * Distinguishing `/` (regex) from `/` (division) requires expression-position
+ * tracking that the lexer doesn't perform. Workaround: wrap regex-containing
+ * lambdas in `@{...}`, where the lexer respects only outer brace nesting.
  */
 
 // ---- Exec -------------------------------------------------------------------

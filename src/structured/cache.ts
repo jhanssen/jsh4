@@ -61,12 +61,21 @@ export function cacheLookup(absSourcePath: string): SchemaFile | null {
     return null;
 }
 
-/** Store SchemaFile via atomic rename. Caller must have produced it via the extractor. */
-export async function cacheStore(absSourcePath: string, schema: SchemaFile): Promise<void> {
+/**
+ * Store SchemaFile via atomic rename. Caller must have produced it via the
+ * extractor and supply the mtime *captured at extraction time* — not
+ * stat'd at write time, which would TOCTOU: a stat after extraction could
+ * pick up a newer mtime than what the schema content reflects, and then
+ * cacheLookup's mtime fast-path would trust the cache when it shouldn't.
+ *
+ * `sourceMtimeMs === 0` is treated as "unknown" — the lookup will skip the
+ * mtime fast-path and fall through to the content-hash check. Safe but
+ * slower.
+ */
+export async function cacheStore(absSourcePath: string, schema: SchemaFile, sourceMtimeMs: number): Promise<void> {
     const cachePath = fileNameFor(absSourcePath);
     await fsp.mkdir(dirname(cachePath), { recursive: true });
-    const stamped = { ...schema, sourceMtime: 0 } as SchemaFile & { sourceMtime: number };
-    try { stamped.sourceMtime = statSync(absSourcePath).mtimeMs; } catch {}
+    const stamped = { ...schema, sourceMtime: sourceMtimeMs } as SchemaFile & { sourceMtime: number };
     const tmp = `${cachePath}.tmp.${process.pid}`;
     await fsp.writeFile(tmp, JSON.stringify(stamped));
     await fsp.rename(tmp, cachePath);

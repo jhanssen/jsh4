@@ -607,8 +607,12 @@ static bool spawnPipelineInline(PipelineReq& req, SpawnCtx* ctx) {
                 for (pid_t p : pids) {
                     int st = 0; pid_t w;
                     do { w = waitpid(p, &st, 0); } while (w == -1 && errno == EINTR);
-                    // Drop from g_pending (they won't re-report).
-                    g_pending.erase(p);
+                    // Use erasePending (not raw erase) so the per-pid sigchld
+                    // refcount is released. Bare g_pending.erase leaks a ref,
+                    // keeping the SIGCHLD watcher alive after the loop should
+                    // have drained — visible as the shell's event loop refusing
+                    // to exit cleanly after a pipeline-spawn failure.
+                    erasePending(p);
                 }
                 ctx->exitCode = 127;
                 resolveCtxPromise(ctx);
@@ -688,7 +692,7 @@ static bool spawnPipelineInline(PipelineReq& req, SpawnCtx* ctx) {
                 for (pid_t p : pids) {
                     int st = 0; pid_t w;
                     do { w = waitpid(p, &st, 0); } while (w == -1 && errno == EINTR);
-                    g_pending.erase(p);
+                    erasePending(p);
                 }
                 ctx->exitCode = 1;
                 resolveCtxPromise(ctx);

@@ -329,6 +329,19 @@ describe("@uniq-by built-in", () => {
             { name: "Foo" }, { name: "bar" },
         ]);
     });
+
+    it("should treat structurally-equal objects as the same key regardless of property order", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { tag: "x", meta: { a: 1, b: 2 } };
+                yield { tag: "y", meta: { b: 2, a: 1 } };  // same meta, different key order
+                yield { tag: "z", meta: { a: 1, b: 3 } };  // genuinely different
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @uniq-by r => r.meta");
+        const rows = jsonLines(r.stdout);
+        assert.strictEqual(rows.length, 2, "duplicate meta should dedupe");
+    });
 });
 
 describe("@drop built-in", () => {

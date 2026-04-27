@@ -221,34 +221,40 @@ registerCaptureImpl(async (body: string): Promise<string> => {
 const processSubstFds: number[] = [];
 
 // Register process substitution handler with the expander.
+//
+// Parse failures (empty body, syntax error, non-SimpleCommand AST, empty
+// command) raise a clear error rather than silently producing an empty
+// /dev/fd/<n> stream — the previous behavior left consumers blocking on a
+// pipe with no writer / reader, manifesting as "the command hangs" with
+// no diagnostic.
 registerProcessSubstImpl((body: string, direction: "<" | ">"): string => {
+    const trimmed = body.trim();
+    const ast = trimmed ? parse(trimmed) : null;
+    if (!ast) {
+        throw new Error(`process substitution: empty or unparseable command: ${body}`);
+    }
+    if (ast.type !== "SimpleCommand") {
+        throw new Error(`process substitution: only simple commands supported, got ${ast.type}`);
+    }
+    const sc = ast as SimpleCommand;
+    const words = sc.words
+        .map(w => w.segments.map(s => "value" in s ? (s as { value: string }).value : "").join(""))
+        .filter(Boolean);
+    if (words.length === 0) {
+        throw new Error(`process substitution: empty command: ${body}`);
+    }
+
     const [readFd, writeFd] = native.createCloexecPipe();
     if (direction === "<") {
         // <(cmd): command writes to pipe, caller reads from pipe.
-        // Fork command with stdout → writeFd.
-        const ast = parse(body.trim());
-        if (ast && ast.type === "SimpleCommand") {
-            // Use forkExec for simple commands.
-            const sc = ast as SimpleCommand;
-            const words = sc.words.map(w => w.segments.map(s => "value" in s ? (s as { value: string }).value : "").join("")).filter(Boolean);
-            if (words.length > 0) {
-                native.forkExec(words[0]!, words.slice(1), -1, writeFd, -1, 0);
-            }
-        }
+        native.forkExec(words[0]!, words.slice(1), -1, writeFd, -1, 0);
         native.closeFd(writeFd);
         native.clearCloexec(readFd);
         processSubstFds.push(readFd);
         return `/dev/fd/${readFd}`;
     } else {
         // >(cmd): caller writes to pipe, command reads from pipe.
-        const ast = parse(body.trim());
-        if (ast && ast.type === "SimpleCommand") {
-            const sc = ast as SimpleCommand;
-            const words = sc.words.map(w => w.segments.map(s => "value" in s ? (s as { value: string }).value : "").join("")).filter(Boolean);
-            if (words.length > 0) {
-                native.forkExec(words[0]!, words.slice(1), readFd, -1, -1, 0);
-            }
-        }
+        native.forkExec(words[0]!, words.slice(1), readFd, -1, -1, 0);
         native.closeFd(readFd);
         native.clearCloexec(writeFd);
         processSubstFds.push(writeFd);

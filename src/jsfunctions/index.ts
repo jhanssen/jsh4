@@ -174,8 +174,8 @@ async function scheduleExtract(absPath: string): Promise<void> {
     extractInFlight.add(absPath);
     try {
         const { extractSchemas } = await import("../structured/extract/index.js");
-        const { schemaFile } = extractSchemas(absPath);
-        await cacheStore(absPath, schemaFile);
+        const { schemaFile, sourceMtimeMs } = extractSchemas(absPath);
+        await cacheStore(absPath, schemaFile, sourceMtimeMs);
         // Patch any registry entries that were registered against this source
         // before the schema was available. Without this, async extraction only
         // takes effect on the *next* jsh start (when registerJsFunction reads
