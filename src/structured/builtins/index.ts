@@ -21,11 +21,23 @@ import { ps } from "./ps.js";
 import { count } from "./count.js";
 import { fromJsonl } from "./from_jsonl.js";
 import { toJsonl } from "./to_jsonl.js";
+import { map } from "./map.js";
+import { sort } from "./sort.js";
+import { sortBy } from "./sort_by.js";
+import { uniq } from "./uniq.js";
+import { uniqBy } from "./uniq_by.js";
+import { drop } from "./drop.js";
+import { tail } from "./tail.js";
 
 interface BuiltinSpec {
     name: string;
     fn: JsPipelineFunction;
     schemaKey: string;        // matches the basename used by the build CLI
+    // Function identifier inside the source file (the export name). Defaults
+    // to `name` but must be set when the registry name differs from the TS
+    // identifier — e.g. `from-jsonl` (registry) vs `fromJsonl` (TS export),
+    // since hyphenated names can't be JS identifiers.
+    schemaFnName?: string;
     atOnly?: boolean;
     defaultSink?: string;
     isSink?: boolean;
@@ -39,6 +51,8 @@ const BUILTINS: BuiltinSpec[] = [
     { name: "where",  fn: where  as unknown as JsPipelineFunction, schemaKey: "where",  atOnly: true },
     { name: "select", fn: select as unknown as JsPipelineFunction, schemaKey: "select", atOnly: true },
     { name: "take",   fn: take   as unknown as JsPipelineFunction, schemaKey: "take",   atOnly: true },
+    // @head is a POSIX-shaped synonym for @take. Same fn, same schema.
+    { name: "head",   fn: take   as unknown as JsPipelineFunction, schemaKey: "take",   atOnly: true },
     { name: "table",  fn: table  as unknown as JsPipelineFunction, schemaKey: "table",  atOnly: true, isSink: true },
     { name: "ls",     fn: ls     as unknown as JsPipelineFunction, schemaKey: "ls",     atOnly: true,
                                                                    defaultSink: "ls-format" },
@@ -46,8 +60,15 @@ const BUILTINS: BuiltinSpec[] = [
                                                                    atOnly: true, isSink: true, hidden: true },
     { name: "ps",     fn: ps     as unknown as JsPipelineFunction, schemaKey: "ps",     atOnly: true },
     { name: "count",  fn: count  as unknown as JsPipelineFunction, schemaKey: "count",  atOnly: true },
-    { name: "from-jsonl", fn: fromJsonl as unknown as JsPipelineFunction, schemaKey: "from_jsonl", atOnly: true },
-    { name: "to-jsonl",   fn: toJsonl   as unknown as JsPipelineFunction, schemaKey: "to_jsonl",   atOnly: true, isSink: true },
+    { name: "from-jsonl", fn: fromJsonl as unknown as JsPipelineFunction, schemaKey: "from_jsonl", schemaFnName: "fromJsonl", atOnly: true },
+    { name: "to-jsonl",   fn: toJsonl   as unknown as JsPipelineFunction, schemaKey: "to_jsonl",   schemaFnName: "toJsonl",   atOnly: true, isSink: true },
+    { name: "map",        fn: map       as unknown as JsPipelineFunction, schemaKey: "map",        atOnly: true },
+    { name: "sort",       fn: sort      as unknown as JsPipelineFunction, schemaKey: "sort",       atOnly: true },
+    { name: "sort-by",    fn: sortBy    as unknown as JsPipelineFunction, schemaKey: "sort_by",    schemaFnName: "sortBy",    atOnly: true },
+    { name: "uniq",       fn: uniq      as unknown as JsPipelineFunction, schemaKey: "uniq",       atOnly: true },
+    { name: "uniq-by",    fn: uniqBy    as unknown as JsPipelineFunction, schemaKey: "uniq_by",    schemaFnName: "uniqBy",    atOnly: true },
+    { name: "drop",       fn: drop      as unknown as JsPipelineFunction, schemaKey: "drop",       atOnly: true },
+    { name: "tail",       fn: tail      as unknown as JsPipelineFunction, schemaKey: "tail",       atOnly: true },
 ];
 
 let registered = false;
@@ -69,7 +90,7 @@ export function registerStructuredBuiltins(): void {
     const schemas = loadSchemas();
     for (const b of BUILTINS) {
         const file = schemas[b.schemaKey];
-        const fnSchema = file?.functions[b.name];
+        const fnSchema = file?.functions[b.schemaFnName ?? b.name];
         registerJsFunction(b.name, b.fn, {
             mode: "object",
             atOnly: b.atOnly,

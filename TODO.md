@@ -268,14 +268,19 @@ The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction
 
 #### Operator stdlib gaps
 
-- [ ] `@sort` (buffered) — by key or lambda
+- [x] `@map` — generic T→U transform via lambda (FunctionIR slot 0; unquoted lambda works)
+- [x] `@sort` (buffered) — by comma-separated key paths
+- [x] `@sort-by` (buffered) — by lambda key
+- [x] `@uniq` — by full row or string key path
+- [x] `@uniq-by` — streaming dedup by lambda key
+- [x] `@drop` — skip first N rows (streaming)
+- [x] `@tail` — last N rows (buffered; POSIX-shaped)
+- [x] `@head` — first N rows (POSIX-shaped synonym for `@take`)
 - [ ] `@group` / `@group-by` — buffered aggregation
-- [ ] `@uniq` (with optional key)
-- [ ] `@map` — generic T→U transform via lambda
-- [ ] `@drop`, `@first`, `@last`
 - [ ] `@sum` / `@avg` / `@min` / `@max`
 - [ ] `@find` — recursive walk
 - [ ] `@du`, `@env`, `@hist`, `@stat`
+- [ ] **Auto-sink for string-yielding final stages** — today, an object-mode pipeline whose last stage yields plain strings (e.g. `@ls | @map f => f.name`) bypasses the default sink and writes the strings raw, with no separator. Either treat string-yielding final stages as already-serialized (status quo, but emit one row per yield with a newline join) or wrap them through `@to-jsonl` like the object case. Pick a model and apply consistently.
 
 #### Visual / formatter parity
 

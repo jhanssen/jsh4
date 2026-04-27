@@ -197,6 +197,204 @@ describe("@table built-in", () => {
     });
 });
 
+describe("@map built-in", () => {
+    it("should transform each row through a lambda", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { x: 1 }; yield { x: 2 }; yield { x: 3 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @map r => r.x * 10");
+        assert.deepStrictEqual(jsonLines(r.stdout), [10, 20, 30]);
+    });
+
+    it("should support unquoted lambdas via the schema-driven slot", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { name: "a", n: 1 }; yield { name: "b", n: 2 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @map r => ({ doubled: r.n * 2 })");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ doubled: 2 }, { doubled: 4 }]);
+    });
+
+    it("should error when arg is not a function", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() { yield {x:1}; })());
+        `;
+        const r = withRcTs(rc, "@src | @map @{ 42 }");
+        assert.match(r.stderr, /@map: transform must be a function/);
+    });
+});
+
+describe("@sort built-in", () => {
+    it("should sort by a single key ascending", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { n: 3 }; yield { n: 1 }; yield { n: 2 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @sort n");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ n: 1 }, { n: 2 }, { n: 3 }]);
+    });
+
+    it("should sort by multiple keys with tiebreakers", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { a: 1, b: 2 }; yield { a: 1, b: 1 }; yield { a: 0, b: 5 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @sort a,b");
+        assert.deepStrictEqual(jsonLines(r.stdout), [
+            { a: 0, b: 5 }, { a: 1, b: 1 }, { a: 1, b: 2 },
+        ]);
+    });
+
+    it("should sort primitives naturally without args", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield 3; yield 1; yield 2;
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @sort");
+        assert.deepStrictEqual(jsonLines(r.stdout), [1, 2, 3]);
+    });
+});
+
+describe("@sort-by built-in", () => {
+    it("should sort by computed key via unquoted lambda", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { name: "Cab" }; yield { name: "abc" }; yield { name: "BAC" };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @sort-by r => r.name.toLowerCase()");
+        assert.deepStrictEqual(jsonLines(r.stdout), [
+            { name: "abc" }, { name: "BAC" }, { name: "Cab" },
+        ]);
+    });
+
+    it("should error when arg is not a function", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() { yield {x:1}; })());
+        `;
+        const r = withRcTs(rc, "@src | @sort-by @{ 42 }");
+        assert.match(r.stderr, /@sort-by: key extractor must be a function/);
+    });
+});
+
+describe("@uniq built-in", () => {
+    it("should dedupe by full row", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield 1; yield 2; yield 1; yield 3; yield 2;
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @uniq");
+        assert.deepStrictEqual(jsonLines(r.stdout), [1, 2, 3]);
+    });
+
+    it("should dedupe by a key path", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { id: 1, t: 0 }; yield { id: 2, t: 1 }; yield { id: 1, t: 5 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @uniq id");
+        assert.deepStrictEqual(jsonLines(r.stdout), [
+            { id: 1, t: 0 }, { id: 2, t: 1 },
+        ]);
+    });
+});
+
+describe("@uniq-by built-in", () => {
+    it("should dedupe by computed key via unquoted lambda", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { name: "Foo" }; yield { name: "foo" }; yield { name: "bar" };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @uniq-by r => r.name.toLowerCase()");
+        assert.deepStrictEqual(jsonLines(r.stdout), [
+            { name: "Foo" }, { name: "bar" },
+        ]);
+    });
+});
+
+describe("@drop built-in", () => {
+    it("should skip the first N rows", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                for (let i = 1; i <= 5; i++) yield { i };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @drop 2");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ i: 3 }, { i: 4 }, { i: 5 }]);
+    });
+
+    it("should default to dropping 1 row", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield 1; yield 2; yield 3;
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @drop");
+        assert.deepStrictEqual(jsonLines(r.stdout), [2, 3]);
+    });
+
+    it("should error on invalid count", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() { yield 1; })());
+        `;
+        const r = withRcTs(rc, "@src | @drop abc");
+        assert.match(r.stderr, /@drop: invalid count/);
+    });
+});
+
+describe("@tail built-in", () => {
+    it("should yield the last N rows", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                for (let i = 1; i <= 5; i++) yield { i };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @tail 2");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ i: 4 }, { i: 5 }]);
+    });
+
+    it("should yield zero rows for @tail 0", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield 1; yield 2;
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @tail 0");
+        assert.strictEqual(r.stdout.trim(), "");
+    });
+
+    it("should yield all rows when N exceeds source size", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield 1; yield 2;
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @tail 10");
+        assert.deepStrictEqual(jsonLines(r.stdout), [1, 2]);
+    });
+});
+
+describe("@head built-in", () => {
+    it("should behave identically to @take (POSIX-shaped synonym)", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                for (let i = 1; i <= 100; i++) yield { i };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @head 3");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ i: 1 }, { i: 2 }, { i: 3 }]);
+    });
+});
+
 describe("composed pipelines", () => {
     it("should chain @where | @select | @take", () => {
         const rc = `
