@@ -28,6 +28,14 @@ import { uniq } from "./uniq.js";
 import { uniqBy } from "./uniq_by.js";
 import { drop } from "./drop.js";
 import { tail } from "./tail.js";
+import { sum } from "./sum.js";
+import { sumBy } from "./sum_by.js";
+import { avg } from "./avg.js";
+import { avgBy } from "./avg_by.js";
+import { min } from "./min.js";
+import { minBy } from "./min_by.js";
+import { max } from "./max.js";
+import { maxBy } from "./max_by.js";
 
 interface BuiltinSpec {
     name: string;
@@ -69,6 +77,14 @@ const BUILTINS: BuiltinSpec[] = [
     { name: "uniq-by",    fn: uniqBy    as unknown as JsPipelineFunction, schemaKey: "uniq_by",    schemaFnName: "uniqBy",    atOnly: true },
     { name: "drop",       fn: drop      as unknown as JsPipelineFunction, schemaKey: "drop",       atOnly: true },
     { name: "tail",       fn: tail      as unknown as JsPipelineFunction, schemaKey: "tail",       atOnly: true },
+    { name: "sum",        fn: sum       as unknown as JsPipelineFunction, schemaKey: "sum",        atOnly: true },
+    { name: "sum-by",     fn: sumBy     as unknown as JsPipelineFunction, schemaKey: "sum_by",     schemaFnName: "sumBy", atOnly: true },
+    { name: "avg",        fn: avg       as unknown as JsPipelineFunction, schemaKey: "avg",        atOnly: true },
+    { name: "avg-by",     fn: avgBy     as unknown as JsPipelineFunction, schemaKey: "avg_by",     schemaFnName: "avgBy", atOnly: true },
+    { name: "min",        fn: min       as unknown as JsPipelineFunction, schemaKey: "min",        atOnly: true },
+    { name: "min-by",     fn: minBy     as unknown as JsPipelineFunction, schemaKey: "min_by",     schemaFnName: "minBy", atOnly: true },
+    { name: "max",        fn: max       as unknown as JsPipelineFunction, schemaKey: "max",        atOnly: true },
+    { name: "max-by",     fn: maxBy     as unknown as JsPipelineFunction, schemaKey: "max_by",     schemaFnName: "maxBy", atOnly: true },
 ];
 
 let registered = false;

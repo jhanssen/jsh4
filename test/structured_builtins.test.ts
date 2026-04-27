@@ -395,6 +395,126 @@ describe("@head built-in", () => {
     });
 });
 
+describe("@sum / @sum-by built-ins", () => {
+    const numericRowsRc = `
+        jsh.registerJsFunction("src", () => (async function*() {
+            yield { v: 1 }; yield { v: 5 }; yield { v: 9 }; yield { v: 3 };
+        })());
+    `;
+
+    it("should sum a numeric field", () => {
+        const r = withRcTs(numericRowsRc, "@src | @sum v");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ sum: 18 }]);
+    });
+
+    it("should skip non-finite values silently", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { v: 1 }; yield { v: "nope" }; yield { v: 4 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @sum v");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ sum: 5 }]);
+    });
+
+    it("should yield 0 for an empty stream", () => {
+        const rc = `jsh.registerJsFunction("src", () => (async function*() {})());`;
+        const r = withRcTs(rc, "@src | @sum v");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ sum: 0 }]);
+    });
+
+    it("should sum via @sum-by lambda (unquoted)", () => {
+        const r = withRcTs(numericRowsRc, "@src | @sum-by r => r.v * 2");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ sum: 36 }]);
+    });
+
+    it("should error when @sum-by arg is not a function", () => {
+        const r = withRcTs(numericRowsRc, "@src | @sum-by @{ 42 }");
+        assert.match(r.stderr, /@sum-by: extractor must be a function/);
+    });
+});
+
+describe("@avg / @avg-by built-ins", () => {
+    it("should compute the mean of a numeric field", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { v: 2 }; yield { v: 4 }; yield { v: 6 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @avg v");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ avg: 4 }]);
+    });
+
+    it("should yield null for an empty stream", () => {
+        const rc = `jsh.registerJsFunction("src", () => (async function*() {})());`;
+        const r = withRcTs(rc, "@src | @avg v");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ avg: null }]);
+    });
+
+    it("should compute mean via @avg-by lambda", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { v: 2 }; yield { v: 4 };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @avg-by r => r.v + 10");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ avg: 13 }]);
+    });
+});
+
+describe("@min / @min-by built-ins", () => {
+    const rc = `
+        jsh.registerJsFunction("src", () => (async function*() {
+            yield { v: 5 }; yield { v: 1 }; yield { v: 9 };
+        })());
+    `;
+
+    it("should pick the smallest field value", () => {
+        const r = withRcTs(rc, "@src | @min v");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ min: 1 }]);
+    });
+
+    it("should yield null for an empty stream", () => {
+        const empty = `jsh.registerJsFunction("src", () => (async function*() {})());`;
+        const r = withRcTs(empty, "@src | @min v");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ min: null }]);
+    });
+
+    it("should pick the smallest via @min-by lambda", () => {
+        const r = withRcTs(rc, "@src | @min-by r => -r.v");
+        // negated: smallest -v = largest v = 9 → min: -9
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ min: -9 }]);
+    });
+});
+
+describe("@max / @max-by built-ins", () => {
+    const rc = `
+        jsh.registerJsFunction("src", () => (async function*() {
+            yield { v: 5 }; yield { v: 1 }; yield { v: 9 };
+        })());
+    `;
+
+    it("should pick the largest field value", () => {
+        const r = withRcTs(rc, "@src | @max v");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ max: 9 }]);
+    });
+
+    it("should pick the largest via @max-by lambda", () => {
+        const r = withRcTs(rc, "@src | @max-by r => r.v");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ max: 9 }]);
+    });
+
+    it("should compare strings with localeCompare", () => {
+        const stringRowsRc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield "banana"; yield "apple"; yield "cherry";
+            })());
+        `;
+        const r = withRcTs(stringRowsRc, "@src | @max");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ max: "cherry" }]);
+    });
+});
+
 describe("composed pipelines", () => {
     it("should chain @where | @select | @take", () => {
         const rc = `

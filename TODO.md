@@ -277,7 +277,10 @@ The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction
 - [x] `@tail` — last N rows (buffered; POSIX-shaped)
 - [x] `@head` — first N rows (POSIX-shaped synonym for `@take`)
 - [ ] `@group` / `@group-by` — buffered aggregation
-- [ ] `@sum` / `@avg` / `@min` / `@max`
+- [x] `@sum` / `@sum-by` — sum a field or lambda result
+- [x] `@avg` / `@avg-by` — arithmetic mean
+- [x] `@min` / `@min-by` — minimum value
+- [x] `@max` / `@max-by` — maximum value
 - [ ] `@find` — recursive walk
 - [ ] `@du`, `@env`, `@hist`, `@stat`
 - [ ] **Auto-sink for string-yielding final stages** — today, an object-mode pipeline whose last stage yields plain strings (e.g. `@ls | @map f => f.name`) bypasses the default sink and writes the strings raw, with no separator. Either treat string-yielding final stages as already-serialized (status quo, but emit one row per yield with a newline join) or wrap them through `@to-jsonl` like the object case. Pick a model and apply consistently.
