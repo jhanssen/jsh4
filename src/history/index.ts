@@ -3,6 +3,7 @@
 // (history expansion, jsh.history(), etc.) decoupled from N-API details.
 
 import { createRequire } from "node:module";
+import { $ } from "../variables/index.js";
 const require = createRequire(import.meta.url);
 const native = require("../../build/Release/jsh_native.node") as {
     inputHistoryAdd: (line: string) => void;
@@ -14,6 +15,75 @@ const native = require("../../build/Release/jsh_native.node") as {
 
 export function addHistoryEntry(line: string): void {
     native.inputHistoryAdd(line);
+}
+
+// History dedup / ignore rules. Honors the same env-var conventions as
+// bash/zsh:
+//
+//   HISTCONTROL    colon-separated list of:
+//                    ignoredups    drop a line equal to the previous entry
+//                    ignorespace   drop a line starting with a space
+//                    ignoreboth    both of the above
+//   HISTIGNORE     colon-separated list of glob-style patterns; lines
+//                  matching any pattern are not recorded
+//
+// Examples (in jshrc):
+//   jsh.$.HISTCONTROL = "ignoreboth";
+//   jsh.$.HISTIGNORE  = "ls:cd:exit:clear:pwd";
+//
+// Default: empty / no filtering. Users opt in.
+//
+// Note: the bash `erasedups` option (remove all prior matches) needs a
+// native delete primitive that doesn't exist yet; not implemented in v1.
+
+interface HistControl {
+    ignoreDups: boolean;
+    ignoreSpace: boolean;
+}
+
+function parseHistControl(): HistControl {
+    const raw = $["HISTCONTROL"];
+    if (typeof raw !== "string" || raw.length === 0) {
+        return { ignoreDups: false, ignoreSpace: false };
+    }
+    const opts = raw.split(":").map(s => s.trim());
+    const has = (s: string) => opts.includes(s);
+    const both = has("ignoreboth");
+    return {
+        ignoreDups:  both || has("ignoredups"),
+        ignoreSpace: both || has("ignorespace"),
+    };
+}
+
+// Compile each colon-separated HISTIGNORE entry as a glob → regex.
+// `*` and `?` are the only metacharacters, matching bash semantics.
+function parseHistIgnore(): RegExp[] {
+    const raw = $["HISTIGNORE"];
+    if (typeof raw !== "string" || raw.length === 0) return [];
+    return raw.split(":").filter(Boolean).map(p => {
+        const escaped = p
+            .replace(/[.+^$(){}|\\[\]]/g, "\\$&")
+            .replace(/\*/g, ".*")
+            .replace(/\?/g, ".");
+        return new RegExp("^" + escaped + "$");
+    });
+}
+
+// Whether the given (post-history-expansion) input line should be
+// recorded. Consulted by the repl at history-append time. Lines that
+// fail any rule are silently dropped — the same model as bash / zsh.
+export function shouldRecordHistory(line: string): boolean {
+    const { ignoreDups, ignoreSpace } = parseHistControl();
+    if (ignoreSpace && line.length > 0 && (line[0] === " " || line[0] === "\t")) {
+        return false;
+    }
+    if (ignoreDups && line === getLastEntry()) {
+        return false;
+    }
+    for (const re of parseHistIgnore()) {
+        if (re.test(line)) return false;
+    }
+    return true;
 }
 
 export function getHistoryEntry(n: number): string | undefined {

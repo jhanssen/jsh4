@@ -40,6 +40,7 @@ import { env } from "./env.js";
 import { stat } from "./stat.js";
 import { find } from "./find.js";
 import { du } from "./du.js";
+import { importMod } from "./import.js";
 
 interface BuiltinSpec {
     name: string;
@@ -93,6 +94,7 @@ const BUILTINS: BuiltinSpec[] = [
     { name: "stat",       fn: stat      as unknown as JsPipelineFunction, schemaKey: "stat",       atOnly: true },
     { name: "find",       fn: find      as unknown as JsPipelineFunction, schemaKey: "find",       atOnly: true },
     { name: "du",         fn: du        as unknown as JsPipelineFunction, schemaKey: "du",         atOnly: true },
+    { name: "import",     fn: importMod as unknown as JsPipelineFunction, schemaKey: "import",     schemaFnName: "importMod", atOnly: true },
 ];
 
 let registered = false;

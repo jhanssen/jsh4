@@ -18,7 +18,7 @@ import { colorize, getCurrentTheme, registerCommandExists, getResolvedColor, onT
 import { commandExists } from "../completion/index.js";
 import { lookupJsFunction, lookupBareJsFunction } from "../jsfunctions/index.js";
 import { runTrap } from "../trap/index.js";
-import { expandHistory, getAllEntries } from "../history/index.js";
+import { expandHistory, getAllEntries, shouldRecordHistory } from "../history/index.js";
 import { TerminalUI } from "../terminal/index.js";
 import type { WidgetHandle, WidgetZone, WidgetOptions } from "../terminal/index.js";
 import { colors, makeFgColor, makeBgColor, makeUlColor, style } from "../terminal/colors.js";
@@ -472,7 +472,7 @@ async function promptLoop(buffer: string): Promise<void> {
             if (ast) {
                 // Successful parse — clear frame before executing.
                 ui!.clearFrame();
-                ui!.historyAdd(finalInput);
+                if (shouldRecordHistory(finalInput)) ui!.historyAdd(finalInput);
                 setCommandText(finalInput);
                 if (finalInput !== trimmed) {
                     process.stdout.write(finalInput + "\n");
