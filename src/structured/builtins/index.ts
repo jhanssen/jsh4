@@ -36,6 +36,10 @@ import { min } from "./min.js";
 import { minBy } from "./min_by.js";
 import { max } from "./max.js";
 import { maxBy } from "./max_by.js";
+import { env } from "./env.js";
+import { stat } from "./stat.js";
+import { find } from "./find.js";
+import { du } from "./du.js";
 
 interface BuiltinSpec {
     name: string;
@@ -85,6 +89,10 @@ const BUILTINS: BuiltinSpec[] = [
     { name: "min-by",     fn: minBy     as unknown as JsPipelineFunction, schemaKey: "min_by",     schemaFnName: "minBy", atOnly: true },
     { name: "max",        fn: max       as unknown as JsPipelineFunction, schemaKey: "max",        atOnly: true },
     { name: "max-by",     fn: maxBy     as unknown as JsPipelineFunction, schemaKey: "max_by",     schemaFnName: "maxBy", atOnly: true },
+    { name: "env",        fn: env       as unknown as JsPipelineFunction, schemaKey: "env",        atOnly: true },
+    { name: "stat",       fn: stat      as unknown as JsPipelineFunction, schemaKey: "stat",       atOnly: true },
+    { name: "find",       fn: find      as unknown as JsPipelineFunction, schemaKey: "find",       atOnly: true },
+    { name: "du",         fn: du        as unknown as JsPipelineFunction, schemaKey: "du",         atOnly: true },
 ];
 
 let registered = false;

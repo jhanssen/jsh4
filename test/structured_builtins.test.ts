@@ -218,6 +218,16 @@ describe("@map built-in", () => {
         assert.deepStrictEqual(jsonLines(r.stdout), [{ doubled: 2 }, { doubled: 4 }]);
     });
 
+    it("should newline-separate string-yielding rows in the drain", () => {
+        const rc = `
+            jsh.registerJsFunction("src", () => (async function*() {
+                yield { name: "alpha" }; yield { name: "beta" }; yield { name: "gamma" };
+            })());
+        `;
+        const r = withRcTs(rc, "@src | @map r => r.name");
+        assert.deepStrictEqual(r.stdout.split("\n").filter(Boolean), ["alpha", "beta", "gamma"]);
+    });
+
     it("should error when arg is not a function", () => {
         const rc = `
             jsh.registerJsFunction("src", () => (async function*() { yield {x:1}; })());
@@ -512,6 +522,87 @@ describe("@max / @max-by built-ins", () => {
         `;
         const r = withRcTs(stringRowsRc, "@src | @max");
         assert.deepStrictEqual(jsonLines(r.stdout), [{ max: "cherry" }]);
+    });
+});
+
+describe("@env built-in", () => {
+    it("should yield the process environment as {name, value} rows", () => {
+        const r = withRcTs(``, "@env | @where v => v.name === \"PATH\"");
+        const rows = jsonLines(r.stdout);
+        assert.strictEqual(rows.length, 1);
+        const row = rows[0] as { name: string; value: string };
+        assert.strictEqual(row.name, "PATH");
+        assert.ok(row.value.length > 0, "PATH should not be empty");
+    });
+
+    it("should sort entries by name", () => {
+        const r = withRcTs(``, "@env | @select name | @head 5");
+        const lines = r.stdout.split("\n").filter(Boolean);
+        const sorted = [...lines].sort();
+        assert.deepStrictEqual(lines, sorted);
+    });
+});
+
+describe("@stat built-in", () => {
+    it("should stat each path arg into a File row", () => {
+        const r = withRcTs(``, "@stat /etc/passwd | @select name,isFile");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ name: "/etc/passwd", isFile: true }]);
+    });
+
+    it("should handle multiple path args", () => {
+        // /usr is a real directory on both Linux and macOS (whereas /tmp
+        // and /etc are symlinks on macOS and would lstat as symlinks, not
+        // directories).
+        const r = withRcTs(``, "@stat /etc/passwd /usr | @select name,isFile,isDir");
+        const rows = jsonLines(r.stdout);
+        assert.strictEqual(rows.length, 2);
+        assert.deepStrictEqual(rows[0], { name: "/etc/passwd", isFile: true, isDir: false });
+        assert.deepStrictEqual(rows[1], { name: "/usr", isFile: false, isDir: true });
+    });
+
+    it("should silently skip missing paths", () => {
+        const r = withRcTs(``, "@stat /etc/passwd /nonexistent_xyz_12345 | @count");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ count: 1 }]);
+    });
+});
+
+describe("@find built-in", () => {
+    it("should walk a directory recursively", () => {
+        const r = withRcTs(``, "@find src/structured/builtins | @where r => r.isFile | @count");
+        const rows = jsonLines(r.stdout);
+        assert.ok(rows.length === 1, "expected one count row");
+        const count = (rows[0] as { count: number }).count;
+        // We just shipped 30 schema files; ballpark sanity check.
+        assert.ok(count > 20, `expected >20 files, got ${count}`);
+    });
+
+    it("should compose with @where and @sort-by", () => {
+        const r = withRcTs(``, "@find src/structured/builtins | @where r => r.isFile | @sort-by f => f.size | @head 1 | @select name");
+        const rows = jsonLines(r.stdout);
+        assert.strictEqual(rows.length, 1);
+        const name = (rows[0] as { name: string }).name;
+        assert.ok(name.endsWith(".ts"), `expected a .ts file, got ${name}`);
+    });
+});
+
+describe("@du built-in", () => {
+    it("should yield {path, size} per path arg", () => {
+        const r = withRcTs(``, "@du src/structured/builtins");
+        const rows = jsonLines(r.stdout);
+        assert.strictEqual(rows.length, 1);
+        const row = rows[0] as { path: string; size: number };
+        assert.strictEqual(row.path, "src/structured/builtins");
+        assert.ok(row.size > 0, `expected size > 0, got ${row.size}`);
+    });
+
+    it("should default to '.' when no args are given", () => {
+        const r = withRcTs(``, "@du | @select path");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ path: "." }]);
+    });
+
+    it("should handle multiple path args", () => {
+        const r = withRcTs(``, "@du src/structured/builtins src/parser | @count");
+        assert.deepStrictEqual(jsonLines(r.stdout), [{ count: 2 }]);
     });
 });
 

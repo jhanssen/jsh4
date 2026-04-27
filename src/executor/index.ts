@@ -1303,13 +1303,18 @@ async function runObjectPipeline(
     }
 
     // Drain the terminal iterable.
-    //   - string row → write raw (formatted output from @table / serializer)
-    //   - Buffer row → write raw
-    //   - other     → JSON-serialize one per line (placeholder when no sink)
+    //   - string row → write raw, auto-appending "\n" if absent. Sink
+    //     stages (@table, @to-jsonl, @ls-format) yield strings that already
+    //     end with their own newline and pass through verbatim. Non-sink
+    //     operators that yield bare strings (e.g. `@map f => f.name`)
+    //     get a per-row newline so adjacent rows don't concatenate.
+    //   - Buffer row → write raw (binary; caller's responsibility).
+    //   - other      → JSON-serialize one per line (placeholder sink when
+    //     no isSink in the pipeline; mirrors `@to-jsonl`'s behavior).
     try {
         for await (const row of current) {
             if (typeof row === "string") {
-                await writeAll(stdoutFd, row);
+                await writeAll(stdoutFd, row.endsWith("\n") ? row : row + "\n");
             } else if (Buffer.isBuffer(row) || row instanceof Uint8Array) {
                 await writeAll(stdoutFd, Buffer.isBuffer(row) ? row : Buffer.from(row));
             } else {

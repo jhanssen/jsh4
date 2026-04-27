@@ -281,9 +281,12 @@ The object-mode `@`-fn pipeline framework is shipped (channel, schema extraction
 - [x] `@avg` / `@avg-by` — arithmetic mean
 - [x] `@min` / `@min-by` — minimum value
 - [x] `@max` / `@max-by` — maximum value
-- [ ] `@find` — recursive walk
-- [ ] `@du`, `@env`, `@hist`, `@stat`
-- [ ] **Auto-sink for string-yielding final stages** — today, an object-mode pipeline whose last stage yields plain strings (e.g. `@ls | @map f => f.name`) bypasses the default sink and writes the strings raw, with no separator. Either treat string-yielding final stages as already-serialized (status quo, but emit one row per yield with a newline join) or wrap them through `@to-jsonl` like the object case. Pick a model and apply consistently.
+- [x] `@find` — recursive walk (yields File-shaped rows)
+- [x] `@du` — disk usage per arg (recursive, doesn't follow symlinks)
+- [x] `@env` — process environment as `{name, value}` rows
+- [x] `@stat` — stat path args or upstream rows into File rows
+- [ ] `@hist` — shell history
+- [x] **Auto-newline for string-yielding final stages** — drain auto-appends `\n` to string rows that don't already end with one, so `@ls | @map f => f.name` produces one name per line instead of concatenating. Sink stages (`@table`, `@to-jsonl`, `@ls-format`) yield strings that already terminate their lines and pass through verbatim.
 
 #### Visual / formatter parity
 
