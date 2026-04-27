@@ -57,16 +57,30 @@ function parseHistControl(): HistControl {
 
 // Compile each colon-separated HISTIGNORE entry as a glob → regex.
 // `*` and `?` are the only metacharacters, matching bash semantics.
+//
+// Memoized by raw env-var string. The variable is set rarely (typically
+// once in jshrc) but parseHistIgnore is called on every prompt
+// submission; rebuilding the RegExp array each time would be wasteful.
+let histIgnoreCacheKey: string | null = null;
+let histIgnoreCacheVal: RegExp[] = [];
+
 function parseHistIgnore(): RegExp[] {
     const raw = $["HISTIGNORE"];
-    if (typeof raw !== "string" || raw.length === 0) return [];
-    return raw.split(":").filter(Boolean).map(p => {
+    const key = typeof raw === "string" ? raw : "";
+    if (key === histIgnoreCacheKey) return histIgnoreCacheVal;
+    histIgnoreCacheKey = key;
+    if (key.length === 0) {
+        histIgnoreCacheVal = [];
+        return histIgnoreCacheVal;
+    }
+    histIgnoreCacheVal = key.split(":").filter(Boolean).map(p => {
         const escaped = p
             .replace(/[.+^$(){}|\\[\]]/g, "\\$&")
             .replace(/\*/g, ".*")
             .replace(/\?/g, ".");
         return new RegExp("^" + escaped + "$");
     });
+    return histIgnoreCacheVal;
 }
 
 // Whether the given (post-history-expansion) input line should be
