@@ -261,13 +261,21 @@ static void handleStopped(SpawnCtx* ctx, int status) {
     ctx->exitCode = 128 + WSTOPSIG(status);
 
     // Gather remaining pids for this ctx (so JS can track them in the job
-    // table) and remove them from our pending map.
+    // table) and remove them from our pending map. Re-park each one as an
+    // orphan with reaped=false so a SIGCHLD that arrives before the next
+    // waitForPids (e.g. an external SIGCONT racing the user's `fg`) can
+    // park the new status. Without this, the second-state-change SIGCHLD
+    // finds the pid in neither g_pending nor g_orphans, and the JS side
+    // never sees the exit — the eventual `fg` then waits forever for an
+    // already-gone pid.
     std::vector<pid_t> remaining;
     for (auto it = g_pending.begin(); it != g_pending.end(); ) {
         if (it->second.ctx == ctx) {
-            remaining.push_back(it->first);
+            pid_t p = it->first;
+            remaining.push_back(p);
             it = g_pending.erase(it);
             sigchldRefRelease();
+            g_orphans[p] = OrphanStatus { 0, false };
         } else {
             ++it;
         }

@@ -179,3 +179,63 @@ describe("jsh.exec() — compound commands", () => {
         assert.deepStrictEqual(lines, ["x", "y"]);
     });
 });
+
+describe("jsh.exec() — stderr iteration", () => {
+    it("should leave default iter as stdout-only (backward compat)", async () => {
+        const lines: string[] = [];
+        const h = exec("sh -c 'echo OUT; echo ERR >&2'", { stderr: "pipe" });
+        for await (const line of h) lines.push(line);
+        assert.deepStrictEqual(lines, ["OUT"]);
+    });
+
+    it("should yield stderr lines via iterStderr()", async () => {
+        const out: string[] = [];
+        const err: string[] = [];
+        const h = exec("sh -c 'echo A; echo X >&2; echo B; echo Y >&2'", { stderr: "pipe" });
+        const stdoutTask = (async () => { for await (const l of h) out.push(l); })();
+        const stderrTask = (async () => { for await (const l of h.iterStderr()) err.push(l); })();
+        await Promise.all([stdoutTask, stderrTask, h]);
+        assert.deepStrictEqual(out, ["A", "B"]);
+        assert.deepStrictEqual(err, ["X", "Y"]);
+    });
+
+    it("should yield interleaved tagged records via iterAll()", async () => {
+        const recs: Array<{ stream: string; line: string }> = [];
+        const h = exec("sh -c 'echo A; echo B >&2; echo C'", { stderr: "pipe" });
+        for await (const r of h.iterAll()) recs.push(r);
+        // Order across separate fds isn't strictly deterministic, but the
+        // contents should be exactly these three records.
+        const sorted = [...recs].sort((a, b) => (a.stream + a.line).localeCompare(b.stream + b.line));
+        assert.deepStrictEqual(sorted, [
+            { stream: "stderr", line: "B" },
+            { stream: "stdout", line: "A" },
+            { stream: "stdout", line: "C" },
+        ]);
+    });
+
+    it("should still buffer stderr into the awaited result", async () => {
+        const h = exec("sh -c 'echo OUT; echo ERR >&2'", { stderr: "pipe" });
+        // Don't iterate — just await.
+        const r = await h;
+        assert.strictEqual(r.stdout, "OUT");
+        assert.strictEqual(r.stderr, "ERR");
+    });
+
+    it("should produce empty iterStderr() when stderr is inherit (default)", async () => {
+        const err: string[] = [];
+        const h = exec("echo hello");
+        for await (const l of h.iterStderr()) err.push(l);
+        assert.deepStrictEqual(err, []);
+    });
+
+    it("should mix stderr into stdout under the merge mode", async () => {
+        // When stderr === "merge", stderr lines are written to the stdout fd
+        // by the kernel, so they appear under the "stdout" tag in iterAll
+        // (and in the default iterator).
+        const out: string[] = [];
+        const h = exec("sh -c 'echo OUT; echo ERR >&2'", { stderr: "merge" });
+        for await (const line of h) out.push(line);
+        const sorted = [...out].sort();
+        assert.deepStrictEqual(sorted, ["ERR", "OUT"]);
+    });
+});

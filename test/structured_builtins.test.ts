@@ -5,7 +5,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import { withRcTs } from "./helpers.js";
 
@@ -603,6 +603,83 @@ describe("@du built-in", () => {
     it("should handle multiple path args", () => {
         const r = withRcTs(``, "@du src/structured/builtins src/parser | @count");
         assert.deepStrictEqual(jsonLines(r.stdout), [{ count: 2 }]);
+    });
+});
+
+describe("@import built-in", () => {
+    function writeMod(body: string): { path: string; cleanup: () => void } {
+        const path = `/tmp/jsh_import_${Date.now()}_${Math.random().toString(36).slice(2)}.ts`;
+        writeFileSync(path, body);
+        return { path, cleanup: () => { try { unlinkSync(path); } catch {} } };
+    }
+
+    it("should yield {from, loaded} per imported path", () => {
+        const { path, cleanup } = writeMod(`
+            export async function* myFn1() { yield { x: 1 }; }
+            export async function* myFn2() { yield { y: 2 }; }
+        `);
+        try {
+            const r = withRcTs("", `@import ${path}`);
+            const rows = jsonLines(r.stdout) as Array<{ from: string; loaded: string[] }>;
+            assert.strictEqual(rows.length, 1);
+            assert.strictEqual(rows[0]!.from, path);
+            assert.deepStrictEqual([...rows[0]!.loaded].sort(), ["myFn1", "myFn2"]);
+        } finally { cleanup(); }
+    });
+
+    it("should register imported functions for use in subsequent pipelines", () => {
+        const { path, cleanup } = writeMod(`
+            export async function* mySource() {
+                yield { v: 1 }; yield { v: 5 };
+            }
+        `);
+        try {
+            // Two separate parses via top-level await + jsh.exec — the
+            // jsh.exec reparses after the @import has fully executed.
+            const rc = `
+                const r1 = await jsh.exec("@import ${path}");
+                console.log(r1.stdout);
+                const r2 = await jsh.exec("@mySource | @count");
+                console.log(r2.stdout);
+            `;
+            const r = withRcTs(rc, "");
+            assert.match(r.stdout, /"loaded":\["mySource"\]/);
+            assert.match(r.stdout, /"count":2/);
+        } finally { cleanup(); }
+    });
+
+    it("should error on missing path arg", () => {
+        const r = withRcTs("", "@import");
+        assert.match(r.stderr, /@import: at least one path required/);
+    });
+
+    it("should error with a useful message on a missing module", () => {
+        const r = withRcTs("", "@import /nonexistent_xyz_12345.ts");
+        assert.match(r.stderr, /@import:.*nonexistent_xyz_12345/);
+    });
+
+    it("should accept multiple path args", () => {
+        const a = writeMod(`export async function* aFn() { yield 1; }`);
+        const b = writeMod(`export async function* bFn() { yield 2; }`);
+        try {
+            const r = withRcTs("", `@import ${a.path} ${b.path}`);
+            const rows = jsonLines(r.stdout) as Array<{ loaded: string[] }>;
+            assert.strictEqual(rows.length, 2);
+            assert.deepStrictEqual(rows[0]!.loaded, ["aFn"]);
+            assert.deepStrictEqual(rows[1]!.loaded, ["bFn"]);
+        } finally { a.cleanup(); b.cleanup(); }
+    });
+
+    it("should skip non-function exports", () => {
+        const { path, cleanup } = writeMod(`
+            export const config = { foo: 1 };
+            export async function* fnA() { yield 1; }
+        `);
+        try {
+            const r = withRcTs("", `@import ${path}`);
+            const rows = jsonLines(r.stdout) as Array<{ loaded: string[] }>;
+            assert.deepStrictEqual(rows[0]!.loaded, ["fnA"]);
+        } finally { cleanup(); }
     });
 });
 

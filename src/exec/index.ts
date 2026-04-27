@@ -108,8 +108,18 @@ async function buildStages(ast: ASTNode): Promise<Stage[] | null> {
 
 // ---- ExecHandle -------------------------------------------------------------
 
+// One line of output from the command, tagged with the stream it came from.
+// Order is preserved across the merged record array — interleaved as the
+// kernel delivered them — so consumers using `iterAll()` see stdout and
+// stderr in the order the command actually produced them (modulo per-fd
+// line buffering, which is a property of the command, not jsh).
+export interface ExecLine {
+    stream: "stdout" | "stderr";
+    line: string;
+}
+
 export class ExecHandle implements PromiseLike<ExecResult> {
-    private _lines: string[] = [];
+    private _records: ExecLine[] = [];
     private _done = false;
     private _waiters: Array<() => void> = [];
     private _resultPromise: Promise<ExecResult>;
@@ -118,10 +128,15 @@ export class ExecHandle implements PromiseLike<ExecResult> {
         this._resultPromise = this._run(cmd, options);
     }
 
-    private _pushLine(line: string): void {
-        this._lines.push(line);
+    private _pushRecord(stream: "stdout" | "stderr", line: string): void {
+        this._records.push({ stream, line });
         const waiters = this._waiters.splice(0);
         for (const w of waiters) w();
+    }
+
+    // Backward-compat wrapper — stdout-only enqueue.
+    private _pushLine(line: string): void {
+        this._pushRecord("stdout", line);
     }
 
     private _finish(): void {
@@ -248,10 +263,14 @@ export class ExecHandle implements PromiseLike<ExecResult> {
             this._finish();
         })();
 
-        // Read stderr if piped.
+        // Read stderr if piped — feed lines to the queue (so iterAll()
+        // streams them) and accumulate for the awaited result.
         let stderrStr = "";
         const readStderr = stderrR !== -1 ? (async () => {
-            for await (const raw of fdLineReader(stderrR)) stderrStr += raw + "\n";
+            for await (const raw of fdLineReader(stderrR)) {
+                stderrStr += raw + "\n";
+                this._pushRecord("stderr", raw);
+            }
             native.closeFd(stderrR);
         })() : Promise.resolve();
 
@@ -297,10 +316,14 @@ export class ExecHandle implements PromiseLike<ExecResult> {
             this._finish();
         })();
 
-        // Read stderr if piped.
+        // Read stderr if piped — feed lines to the queue (so iterAll()
+        // streams them) and accumulate for the awaited result.
         let stderrStr = "";
         const readStderr = stderrR !== -1 ? (async () => {
-            for await (const raw of fdLineReader(stderrR)) stderrStr += raw + "\n";
+            for await (const raw of fdLineReader(stderrR)) {
+                stderrStr += raw + "\n";
+                this._pushRecord("stderr", raw);
+            }
             native.closeFd(stderrR);
         })() : Promise.resolve();
 
@@ -343,17 +366,48 @@ export class ExecHandle implements PromiseLike<ExecResult> {
         return this._resultPromise.then(onfulfilled, onrejected) as Promise<T | U>;
     }
 
-    // AsyncIterable — yields stdout lines as they arrive.
+    // Default AsyncIterable — yields stdout lines as plain strings. Stderr
+    // lines (when `options.stderr === "pipe"`) are recorded but not yielded
+    // here, preserving the historical "iterate stdout" contract. Use
+    // iterStderr() for stderr only, or iterAll() for an interleaved tagged
+    // stream of both.
     async *[Symbol.asyncIterator](): AsyncGenerator<string> {
         let i = 0;
         while (true) {
-            if (i < this._lines.length) {
-                yield this._lines[i++]!;
-            } else if (this._done) {
-                break;
-            } else {
-                await new Promise<void>(resolve => this._waiters.push(resolve));
+            while (i < this._records.length) {
+                const r = this._records[i++]!;
+                if (r.stream === "stdout") yield r.line;
             }
+            if (this._done) break;
+            await new Promise<void>(resolve => this._waiters.push(resolve));
+        }
+    }
+
+    // Yield stderr lines as plain strings. Empty unless options.stderr was
+    // "pipe" — `inherit` lines go to fd 2 directly and are never seen by
+    // this side; `merge` mixes them into stdout under the "stdout" tag.
+    async *iterStderr(): AsyncGenerator<string> {
+        let i = 0;
+        while (true) {
+            while (i < this._records.length) {
+                const r = this._records[i++]!;
+                if (r.stream === "stderr") yield r.line;
+            }
+            if (this._done) break;
+            await new Promise<void>(resolve => this._waiters.push(resolve));
+        }
+    }
+
+    // Yield every recorded line as `{ stream, line }`, in arrival order.
+    // Useful when callers want to react to both streams with one loop.
+    async *iterAll(): AsyncGenerator<ExecLine> {
+        let i = 0;
+        while (true) {
+            while (i < this._records.length) {
+                yield this._records[i++]!;
+            }
+            if (this._done) break;
+            await new Promise<void>(resolve => this._waiters.push(resolve));
         }
     }
 }
